@@ -1,0 +1,29 @@
+# Build artifacts
+app/.build/
+app/dist.noindex/
+.build/
+dist.noindex/
+*.o
+*.swiftmodule
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Credentials & runtime state — MUST never be committed.
+# QuotaBar's own runtime data lives OUTSIDE this repo (~/.local/share/quotabar,
+# ~/Library/Logs/QuotaBar.log). These patterns are belt-and-suspenders in case a
+# runtime dir is ever created or symlinked inside the tree.
+accounts/
+**/accounts/*.json
+*.credentials.json
+.credentials.json
+.config.json
+.usage-cache.json
+.swap-journal.json
+.autoping.log
+.keychain-snapshots/
+*.pid
+
+# macOS
+.DS_Store
