@@ -205,6 +205,14 @@ def active_email():
         return ""
 
 
+def active_oauth_account():
+    try:
+        d = json.load(open(CLAUDE_JSON)).get("oauthAccount")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
 class NetError(Exception):
     """network-level failure (timeout / DNS / refused) — counts toward backoff."""
 
@@ -295,11 +303,24 @@ def set_bank_status(bank_path, status):
 
 
 # ---------- per-account: CLAUDE ----------
-def process_claude(email, oauth, is_active, bank_path, status):
+def _plan_from_org_type(org_type):
+    """Map oauthAccount.organizationType (e.g. "claude_max") to the max|pro|free
+    tier strings autopick expects. Preferred over claudeAiOauth.subscriptionType:
+    the latter is a field cached inside the Keychain OAuth blob at last
+    login/refresh and can go stale after a plan upgrade until the next refresh,
+    while organizationType is refreshed from ~/.claude.json each session."""
+    if not isinstance(org_type, str) or not org_type.startswith("claude_"):
+        return None
+    return org_type[len("claude_"):] or None
+
+
+def process_claude(email, oauth, is_active, bank_path, status, oauth_account=None):
+    plan = _plan_from_org_type((oauth_account or {}).get("organizationType")) \
+        or (oauth or {}).get("subscriptionType")
     res = {"provider": "claude", "email": email, "active": is_active,
            "five_hour": None, "seven_day": None, "worst_limit": None, "model_cap": None,
            "status": status, "fetched_at": now(),
-           "plan": (oauth or {}).get("subscriptionType")}  # max|pro, drives auto-pick
+           "plan": plan}  # max|pro|free, drives auto-pick
     if status == "needs-relogin" and not is_active:
         res["error"] = "needs-relogin"
         return res, False
@@ -799,7 +820,7 @@ def main():
         kc = read_keychain_blob()
 
         # assemble claude accounts: bank files + active keychain (live token wins)
-        claude_accts = {}   # email -> (oauth, bank_path, status)
+        claude_accts = {}   # email -> (oauth, bank_path, status, oauth_account)
         for f in sorted(glob.glob(os.path.join(BANK_DIR, "*.json"))):
             try:
                 rec = json.load(open(f))
@@ -809,20 +830,22 @@ def main():
                 continue
             em = rec.get("email") or os.path.basename(f)[:-5]
             oauth = rec.get("claudeAiOauth")
+            oauth_account = rec.get("oauthAccount")
             claude_accts[em] = (oauth if isinstance(oauth, dict) else {}, f,
-                                rec.get("status", "ok"))
+                                rec.get("status", "ok"),
+                                oauth_account if isinstance(oauth_account, dict) else {})
         if act and kc:
-            bp = claude_accts.get(act, (None, None, "ok"))[1]
-            claude_accts[act] = (kc, bp, "ok")   # active is always live/ok
+            bp = claude_accts.get(act, (None, None, "ok", None))[1]
+            claude_accts[act] = (kc, bp, "ok", active_oauth_account())   # active is always live/ok
         elif kc and not act:
-            claude_accts["(active/unknown)"] = (kc, None, "ok")
+            claude_accts["(active/unknown)"] = (kc, None, "ok", active_oauth_account())
 
         results = []
         net_failures = 0
         attempted = 0
 
         # --- claude accounts, tiered polling ---
-        for email, (oauth, bank_path, status) in claude_accts.items():
+        for email, (oauth, bank_path, status, oauth_account) in claude_accts.items():
             is_active = (email == act) or email == "(active/unknown)"
             key = f"claude|{email}"
             reuse = prev_by_key.get(key)
@@ -857,7 +880,7 @@ def main():
                 continue
             attempted += 1
             try:
-                r, netfail = process_claude(email, oauth, is_active, bank_path, status)
+                r, netfail = process_claude(email, oauth, is_active, bank_path, status, oauth_account)
             except Exception as e:
                 r, netfail = ({"provider": "claude", "email": email, "active": is_active,
                                "error": f"unhandled: {type(e).__name__}", "fetched_at": now()}, False)
@@ -905,7 +928,7 @@ def main():
 
         # auto-ping (still under the lock): fire detached pings for opted-in
         # accounts whose 5h window has lapsed. Non-blocking; debounced by cooldown.
-        bank_paths = {em: bp for em, (_o, bp, _s) in claude_accts.items() if bp}
+        bank_paths = {em: bp for em, (_o, bp, _s, _oa) in claude_accts.items() if bp}
         try:
             fired = maybe_autoping(results, bank_paths)
         except Exception:
