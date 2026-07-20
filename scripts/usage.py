@@ -255,8 +255,15 @@ def summarize_claude(raw):
     # model_cap: the highest model-scoped weekly limit (e.g. Fable/Opus), exposed
     # as its own field so the card shows it CONSISTENTLY regardless of whether it
     # is the current worst — its label carries a "(Model)" suffix from _limit_label.
-    scoped = [c for c in cands if c["kind"] not in ("five_hour", "seven_day")]
-    model_cap = max(scoped, key=lambda c: c["percent"]) if scoped else None
+    model_limits = []
+    for lim in (raw.get("limits") or []):
+        sc = lim.get("scope") or {}
+        model = (sc.get("model") or {}).get("display_name") if isinstance(sc, dict) else None
+        p = lim.get("percent")
+        if model and p is not None:
+            model_limits.append({"kind": _limit_label(lim), "percent": float(p),
+                                 "resets_at": lim.get("resets_at")})
+    model_cap = max(model_limits, key=lambda c: c["percent"]) if model_limits else None
     return five_hour, seven_day, worst, model_cap
 
 
