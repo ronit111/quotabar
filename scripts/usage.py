@@ -303,20 +303,33 @@ def set_bank_status(bank_path, status):
 
 
 # ---------- per-account: CLAUDE ----------
-def _plan_from_org_type(org_type):
-    """Map oauthAccount.organizationType (e.g. "claude_max") to the max|pro|free
-    tier strings autopick expects. Preferred over claudeAiOauth.subscriptionType:
-    the latter is a field cached inside the Keychain OAuth blob at last
-    login/refresh and can go stale after a plan upgrade until the next refresh,
-    while organizationType is refreshed from ~/.claude.json each session."""
-    if not isinstance(org_type, str) or not org_type.startswith("claude_"):
+def _norm_plan(raw):
+    """Normalize a plan string from EITHER oauthAccount.organizationType
+    (e.g. "claude_max", "claude_max_20x") OR claudeAiOauth.subscriptionType
+    (e.g. "max") to the max|pro|free tier strings autopick matches EXACTLY.
+    Prefix-based so tier variants ($100 Max 5x / $200 Max 20x) both collapse to
+    "max" — a naive "claude_"-strip would yield "max_20x" and silently break
+    is_max()'s `== "max"` check, excluding a $200 account from the tier ladder."""
+    if not isinstance(raw, str) or not raw:
         return None
-    return org_type[len("claude_"):] or None
+    r = raw.lower()
+    if r.startswith("claude_"):
+        r = r[len("claude_"):]
+    if r.startswith("max"):
+        return "max"
+    if r.startswith("pro"):
+        return "pro"
+    if r.startswith("free"):
+        return "free"
+    return None
 
 
 def process_claude(email, oauth, is_active, bank_path, status, oauth_account=None):
-    plan = _plan_from_org_type((oauth_account or {}).get("organizationType")) \
-        or (oauth or {}).get("subscriptionType")
+    # organizationType (from ~/.claude.json, refreshed each session) preferred over
+    # the Keychain subscriptionType (cached at login, stale after a plan change) —
+    # Shashi Jangra's fix (#1). Both normalized so every tier variant maps correctly.
+    plan = _norm_plan((oauth_account or {}).get("organizationType")) \
+        or _norm_plan((oauth or {}).get("subscriptionType"))
     res = {"provider": "claude", "email": email, "active": is_active,
            "five_hour": None, "seven_day": None, "worst_limit": None, "model_cap": None,
            "status": status, "fetched_at": now(),
