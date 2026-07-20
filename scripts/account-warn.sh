@@ -141,10 +141,17 @@ if doc is None:
         qb = True   # assume running (skip the heavier path) if pgrep is unavailable
     if not qb:
         try:
+            # (#2) DISABLE parked lazy-refresh in this short hook path: the 5s
+            # timeout below can kill a claude grandchild after it has rotated the
+            # refresh token but before we commit it, stranding the bank on a spent
+            # token (permanent false death). Parked refresh happens only from
+            # QuotaBar's untimed poll or an explicit ping. auto-ping/auto-pick and
+            # active/Codex polling are unaffected.
             subprocess.run(["python3", os.path.join(self_dir, "usage.py")],
                            capture_output=True, text=True, timeout=5,
                            stdin=subprocess.DEVNULL,
-                           env=dict(os.environ, ACCOUNT_BANK_LOCK_WAIT="2"))
+                           env=dict(os.environ, ACCOUNT_BANK_LOCK_WAIT="2",
+                                    ACCOUNT_BANK_NO_PARKED_REFRESH="1"))
         except Exception:
             pass
         doc = load_cache_fresh()

@@ -295,9 +295,40 @@ With two saved Claude accounts, expect one to eventually need a manual re-login:
 parked refresh tokens rotate and can be revoked server-side. This is **normal**,
 not an edge case.
 
-- Any refresh failure, or a 401/403 on a parked poll → the bank file's `status`
-  is set to `needs-relogin` (under lock); the stale entry is **kept**, not
-  deleted.
+### Transient vs revoked — only a confirmed rejection marks a token dead (finding #1)
+
+A parked refresh runs a real `claude` turn in an isolated config dir, and that
+turn can fail for many reasons that have **nothing** to do with the credentials:
+the `claude` binary isn't resolvable under a minimal GUI `PATH`, the process
+can't launch, the turn times out, the network is down, or it exits nonzero for an
+unrelated reason. Marking the account `needs-relogin` on any of those (which
+forces a manual `/login`) is a **false death** — the token was fine.
+
+`refresh_via_config_dir` therefore returns a structured `RefreshResult`
+(`auth_failed`, `reason`) and the system splits the two cases:
+
+- **Confirmed revocation → `needs-relogin`.** Only when (a) the turn actually ran
+  and its stderr carries an authentication signature — `Failed to authenticate`,
+  `OAuth session expired`, `could not be refreshed`, `invalid_grant`/
+  `invalid_token`, or a 401/403 — **or** (b) the refresh token is provably past
+  its `refreshTokenExpiresAt`, **or** (c) a live parked poll returns HTTP 401/403.
+  These are the *only* paths that set `needs-relogin`.
+- **Transient → keep the account, retry next cycle.** Resolver-not-found, launch
+  error, timeout, network, non-auth nonzero exit, or a changed-but-malformed
+  readback: the status is **left unchanged** (an `ok` account stays `ok`), the
+  cached figure is served, and a distinct error is surfaced (`refresh deferred:
+  <reason>`). A ping reports this as rc 6 ("transient — will retry"), never a
+  dead token.
+
+Signatures of each outcome from `isolated_refresh.py` (exit codes): `3` =
+confirmed dead (auth rejection / refresh-token expiry); `4` = malformed readback
+(record left untouched); `5` = turn didn't confirm the 5h window (token may be
+alive); `6` = transient (resolver/launch/timeout/non-auth nonzero). Only exit `3`
+makes `ping-account.sh` write `needs-relogin`.
+
+- A **confirmed** refresh rejection, or a 401/403 on a parked poll → the bank
+  file's `status` is set to `needs-relogin` (under lock); the stale entry is
+  **kept**, not deleted. Transient failures never do this.
 - `needs-relogin` accounts are not polled/refreshed again until re-banked.
 - The SwiftBar plugin shows them red as "re-login needed" (no stale
   percentages) and excludes them from the title figures.
@@ -332,7 +363,36 @@ extra OAuth grants.
 
 Config knobs (env): `ACCOUNT_BANK_TIMEOUT` (5), `ACCOUNT_BANK_REFRESH` (1),
 `ACCOUNT_BANK_PARKED_MAX_AGE` (1800), `ACCOUNT_BANK_CODEX_PING` (0),
-`ACCOUNT_BANK_PING_MODEL` (haiku).
+`ACCOUNT_BANK_PING_MODEL` (haiku), `ACCOUNT_BANK_NO_PARKED_REFRESH` (0),
+`ACCOUNT_BANK_CLAUDE_BIN` (unset → auto-resolve).
+
+### The `claude` binary resolver (findings #3–#5)
+
+`isolated_refresh.py` (`resolve_claude_bin`) and `lib.sh` (`claude_bin`) share
+**one** contract: honor `ACCOUNT_BANK_CLAUDE_BIN` only if it is an actually-
+executable file; else `command -v` / `which`, then `~/.local/bin/claude` and the
+homebrew paths; every candidate must be a real, executable regular file (so an
+alias/function description from `command -v`, or a non-executable match, is
+rejected). There is **no** login-shell (`sh -lc`) fallback — it runs synchronously
+after lock acquisition and a slow login profile could block the bank lock
+unboundedly, and its stdout can be contaminated. When the binary can't be
+resolved the resolver returns empty/error and the caller treats it as a
+**transient** failure (retry), never a dead token.
+
+### The hook path never does parked refresh (finding #2)
+
+A parked refresh spawns a `claude` grandchild that can rotate the refresh token
+server-side. The SessionStart hook bounds its `usage.py` poll with a ~5 s timeout
+that kills `usage.py` but **not** that grandchild — so a rotation landing right
+before the kill would leave the bank holding the now-spent old token (a permanent
+false death). To close this, the hook passes `ACCOUNT_BANK_NO_PARKED_REFRESH=1`:
+`usage.py` then **skips** the isolated-refresh turn for parked expired tokens and
+just serves the cached/stale figure. Parked refresh happens only from QuotaBar's
+untimed 5-minute poll or an explicit ping (neither has a short external timeout).
+Defense-in-depth: `refresh_via_config_dir` runs `claude` in its own process group
+(`start_new_session`) and, even on a timeout-kill, reads back and **journals** any
+rotated creds before returning, so `reconcile.py` recovers the rotation on the
+next locked op (verified end-to-end).
 
 ## Safety invariants (hardened after a cross-vendor security review)
 

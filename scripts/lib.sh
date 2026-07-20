@@ -27,6 +27,37 @@ _LIB_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KC_TIMEOUT="${ACCOUNT_BANK_KC_TIMEOUT:-8}"
 LOCK_STALE_SECS=300   # 5 min
 
+# claude_bin — absolute path to the claude CLI, or nonzero return when unresolved.
+# When usage.py/ping run from a GUI app (QuotaBar, LSUIElement) the PATH is minimal
+# and bare `claude` is NOT found (rc 127) — which silently breaks auto-ping and
+# token-refresh. This is the ONE resolver contract, mirrored by isolated_refresh.py
+# resolve_claude_bin:
+#   - honor ACCOUNT_BANK_CLAUDE_BIN, but only if it is an actually-executable file;
+#   - else `command -v`, then the known install locations;
+#   - every candidate must be a real, executable regular file: `-f` rejects the
+#     alias/function/builtin descriptions `command -v` can print, and `-x` rejects
+#     a non-executable match;
+#   - NO login-shell fallback: `sh -lc` runs synchronously after lock acquisition
+#     and a slow login profile could block the bank lock unboundedly, and its
+#     stdout can be contaminated by profile chatter. ~/.local/bin + homebrew cover
+#     the common installs.
+# Returns 1 (empty stdout) when unresolved; callers MUST treat that as a TRANSIENT
+# failure (retry), never a dead token.
+claude_bin() {
+  local override="${ACCOUNT_BANK_CLAUDE_BIN:-}"
+  if [ -n "$override" ]; then
+    if [ -f "$override" ] && [ -x "$override" ]; then printf '%s\n' "$override"; return 0; fi
+    return 1
+  fi
+  local c
+  c="$(command -v claude 2>/dev/null)"
+  if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then printf '%s\n' "$c"; return 0; fi
+  for cand in "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    [ -f "$cand" ] && [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 1
+}
+
 LOCK_TOKEN=""         # set by acquire_lock; verified by release_lock
 
 # --- fs setup ----------------------------------------------------------------

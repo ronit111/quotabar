@@ -113,10 +113,18 @@ PY
 ok=0
 if [ "$target" = "$active" ]; then
   echo "Pinging ACTIVE account $target (model $MODEL, 60s cap)…"
-  # </dev/null: never block on stdin in non-tty contexts (SwiftBar, hooks).
-  out="$(run_with_timeout 60 claude -p "reply with just: ok" --model "$MODEL" </dev/null 2>&1)"; rc=$?
+  # </dev/null: never block on stdin in non-tty contexts (GUI app, hooks).
+  # Absolute path: bare `claude` is not on PATH under a GUI app (rc 127). An
+  # unresolved binary is a TRANSIENT failure (findings #3/#5): defer with the
+  # 5-min failure cooldown, never treat it as a dead account.
+  if ! CLAUDE="$(claude_bin)"; then
+    err "Ping deferred: could not resolve an executable 'claude' binary (transient). Set ACCOUNT_BANK_CLAUDE_BIN or check the install; will retry."
+    set_last_ping_failed
+    exit 1
+  fi
+  out="$(run_with_timeout 60 "$CLAUDE" -p "reply with just: ok" --model "$MODEL" </dev/null 2>&1)"; rc=$?
   if [ $rc -ne 0 ]; then
-    out="$(run_with_timeout 60 claude -p "reply with just: ok" </dev/null 2>&1)"; rc=$?
+    out="$(run_with_timeout 60 "$CLAUDE" -p "reply with just: ok" </dev/null 2>&1)"; rc=$?
   fi
   if [ $rc -eq 0 ]; then
     echo "Ping OK — 5h window started for $target."
@@ -148,8 +156,12 @@ fd,t=tempfile.mkstemp(dir=os.path.dirname(tf),prefix=".acct.")
 with os.fdopen(fd,"w") as f: json.dump(r,f,indent=2)
 os.chmod(t,0o600); os.replace(t,tf)
 PY
-      err "Ping failed: $target's parked token is dead (refresh rejected). Marked needs-relogin."
+      err "Ping failed: $target's parked token is dead (confirmed auth rejection / refresh token expired). Marked needs-relogin."
       err "Run /login in Claude Code, pick $target, then: bash $HERE/bank-account.sh"
+    elif [ $rc -eq 6 ]; then
+      # transient (resolver/launch/timeout/non-auth nonzero): token untouched,
+      # account stays retriable — do NOT mark needs-relogin (finding #1).
+      err "Ping deferred: transient failure (rc 6); $target's token is untouched and will be retried."
     else
       err "Ping failed (rc $rc)."
     fi

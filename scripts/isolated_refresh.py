@@ -30,14 +30,38 @@ try:
 except Exception:
     _rec = None
 
-CLAUDE_BIN = None
+# creds:      the oauth dict to use going forward (new if valid+rotated, else old).
+# rotated:    True iff the CLI produced a NEW, schema-valid access token.
+# cli_ok:     True iff a claude turn exited 0 (the turn actually ran and billed).
+# err:        non-None reason string iff the CLI returned a CHANGED but malformed
+#             blob — in which case we keep the OLD creds and refuse to commit.
+# auth_failed: True ONLY when a claude turn actually RAN and was rejected with an
+#             authentication/OAuth signature (see AUTH_FAIL_SIGNATURES). This is
+#             the *sole* refresh-side trigger for marking a token dead
+#             (needs-relogin). Never set for resolver/launch/timeout/network/
+#             non-auth-nonzero failures — those are transient and stay retriable
+#             (finding #1).
+# reason:     structured outcome tag: "ok" | "auth_rejected" | "resolver_error" |
+#             "launch_error" | "timeout" | "nonzero" | "malformed". Lets callers
+#             surface a distinct transient error without conflating it with death.
+RefreshResult = namedtuple("RefreshResult", "creds rotated cli_ok err auth_failed reason")
 
-# creds:   the oauth dict to use going forward (new if valid+rotated, else old).
-# rotated: True iff the CLI produced a NEW, schema-valid access token.
-# cli_ok:  True iff a claude turn exited 0 (the turn actually ran and billed).
-# err:     non-None reason string iff the CLI returned a CHANGED but malformed
-#          blob — in which case we keep the OLD creds and refuse to commit.
-RefreshResult = namedtuple("RefreshResult", "creds rotated cli_ok err")
+# A parked turn's stderr matching any of these (case-insensitive) means the server
+# genuinely rejected the credentials — the ONLY confirmed-revocation signal. The
+# confirmed real-death signature observed in the wild is
+# "Failed to authenticate: OAuth session expired and could not be refreshed".
+# Kept deliberately auth-specific so a transient/network/launch failure is never
+# misread as revocation (finding #1). A bare 401/403 in a claude turn's stderr is
+# an auth status; transient failures report "network"/timeout, not 401/403.
+AUTH_FAIL_SIGNATURES = (
+    "failed to authenticate",
+    "oauth session expired",
+    "could not be refreshed",
+    "invalid_grant",
+    "invalid_token",
+    "401",
+    "403",
+)
 
 
 def _valid_blob(o):
@@ -49,18 +73,27 @@ def _valid_blob(o):
             and isinstance(o.get("expiresAt"), (int, float)))
 
 
-def _claude_bin():
-    global CLAUDE_BIN
-    if CLAUDE_BIN:
-        return CLAUDE_BIN
-    # PATH may be minimal under SwiftBar/hooks; check the known install location too
-    for cand in (_sh.which("claude"),
-                 os.path.expanduser("~/.local/bin/claude"),
+def resolve_claude_bin():
+    """Unified resolver contract (findings #3/#4/#5), mirrored by lib.sh claude_bin:
+      - honor ACCOUNT_BANK_CLAUDE_BIN, but only if it is an actually-executable file;
+      - else PATH lookup, then the known install locations;
+      - every candidate must be a real, executable regular file (rejects aliases /
+        function descriptions / non-executable matches);
+      - NO login-shell fallback (it can hang unbounded on a slow profile and can
+        return contaminated stdout) — ~/.local/bin + homebrew cover this machine.
+    Returns an absolute path, or "" when unresolved. An unresolved binary is a
+    TRANSIENT failure for the caller, never a dead token."""
+    override = os.environ.get("ACCOUNT_BANK_CLAUDE_BIN")
+    if override:
+        return override if (os.path.isfile(override) and os.access(override, os.X_OK)) else ""
+    c = _sh.which("claude")
+    if c and os.path.isfile(c) and os.access(c, os.X_OK):
+        return c
+    for cand in (os.path.expanduser("~/.local/bin/claude"),
                  "/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
-        if cand and os.path.exists(cand):
-            CLAUDE_BIN = cand
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
-    return "claude"
+    return ""
 
 
 def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60):
@@ -70,9 +103,17 @@ def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60):
     (finding #7); a changed-but-malformed readback keeps the OLD creds and reports
     err. cli_ok reflects whether a claude turn genuinely exited 0 (finding #8) —
     the caller needs this separately from token-expiry to avoid reporting a failed
-    ping as a success."""
+    ping as a success. auth_failed/reason let the caller distinguish a CONFIRMED
+    auth rejection (mark dead) from a transient failure (retry later, finding #1)."""
     old_at = creds.get("accessToken")
     cli_ok = False
+    # (#3/#4/#5) resolve the binary up front. Unresolved => transient, not death.
+    cbin = resolve_claude_bin()
+    if not cbin:
+        return RefreshResult(creds, False, False, None, False, "resolver_error")
+    stderr_accum = ""      # accumulated across attempts; inspected only if !cli_ok
+    launch_error = False   # subprocess could not start (FileNotFound / OSError)
+    timed_out = False      # a turn was killed by the timeout
     d = tempfile.mkdtemp(prefix="acctbank-cfg-")
     os.chmod(d, 0o700)
     try:
@@ -83,40 +124,76 @@ def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60):
         env = dict(os.environ, CLAUDE_CONFIG_DIR=d)
         # minimal turn; try requested model, fall back to default on failure
         for m in ([model] if model else []) + [None]:
-            cmd = [_claude_bin(), "-p", "reply with just: ok"]
+            cmd = [cbin, "-p", "reply with just: ok"]
             if m:
                 cmd += ["--model", m]
             try:
                 # stdin=DEVNULL: claude -p reads the prompt from argv, but in a
-                # non-tty context (SwiftBar/hook) an inherited stdin can hang it.
+                # non-tty context (GUI app/hook) an inherited stdin can hang it.
+                # start_new_session (finding #2): the child leads its own process
+                # group, so a timeout-kill isolates it from us and grandchildren
+                # are orphaned rather than left attached to the caller.
                 r = subprocess.run(cmd, env=env, capture_output=True, text=True,
-                                   timeout=timeout, stdin=subprocess.DEVNULL)
+                                   timeout=timeout, stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+                stderr_accum += (r.stderr or "")
                 if r.returncode == 0:
                     cli_ok = True
                     break
-            except subprocess.TimeoutExpired:
-                break  # creds may still have rotated before the hang; read back
+            except subprocess.TimeoutExpired as e:
+                # creds may still have rotated before the hang; read back below.
+                timed_out = True
+                partial = getattr(e, "stderr", None)
+                if partial:
+                    stderr_accum += partial if isinstance(partial, str) else partial.decode("utf-8", "replace")
+                break
+            except (FileNotFoundError, PermissionError, OSError):
+                launch_error = True
+                break
             except Exception:
-                pass
+                launch_error = True
+                break
+        # Read back BEFORE cleanup so a rotation that landed just before a
+        # timeout-kill is still captured + journaled (finding #2 defense-in-depth).
         try:
             new = json.load(open(credpath)).get("claudeAiOauth", creds)
         except Exception:
             new = creds
         changed = bool(new.get("accessToken")) and new.get("accessToken") != old_at
+        rotated_valid = changed and _valid_blob(new)
+
         if not _valid_blob(new):
             # A malformed readback must NEVER overwrite a good bank record. Keep
             # the old creds; surface an error only if the CLI *appeared* to rotate
             # (a changed but invalid blob is the dangerous case worth reporting).
             return RefreshResult(creds, False, cli_ok,
-                                 "rotated blob failed schema validation" if changed else None)
-        rotated = changed
-        # crash-safety journal: persist rotated creds before we delete the tmpdir
-        if rotated and email and _rec is not None:
-            try:
-                _rec.write_journal(email, new)
-            except Exception:
-                pass
-        return RefreshResult(new, rotated, cli_ok, None)
+                                 "rotated blob failed schema validation" if changed else None,
+                                 False, "malformed" if changed else "nonzero")
+
+        if rotated_valid:
+            # A live, schema-valid rotation trumps any stderr noise: the token
+            # clearly works, so this is never a death even if the turn exited
+            # nonzero for an unrelated reason.
+            if email and _rec is not None:
+                try:
+                    _rec.write_journal(email, new)
+                except Exception:
+                    pass
+            return RefreshResult(new, True, cli_ok, None, False, "ok")
+
+        # No rotation. Classify the outcome so the caller can tell a confirmed
+        # auth rejection (dead) from a transient failure (retry).
+        if cli_ok:
+            # Turn ran fine and the token did not need rotating — healthy.
+            return RefreshResult(new, False, True, None, False, "ok")
+        low = stderr_accum.lower()
+        if any(sig in low for sig in AUTH_FAIL_SIGNATURES):
+            return RefreshResult(new, False, False, None, True, "auth_rejected")
+        if timed_out:
+            return RefreshResult(new, False, False, None, False, "timeout")
+        if launch_error:
+            return RefreshResult(new, False, False, None, False, "launch_error")
+        return RefreshResult(new, False, False, None, False, "nonzero")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -132,18 +209,32 @@ def _cli():
     creds = rec.get("claudeAiOauth", {})
     rr = refresh_via_config_dir(creds, email=email)
     new, rotated = rr.creds, rr.rotated
-    # A changed-but-malformed readback: keep the existing bank record untouched
-    # and fail non-zero (finding #7). Exit 4 = generic ping failure (not a dead
-    # token), so ping-account.sh reports failure without marking needs-relogin.
+    # Exit-code contract (only exit 3 makes ping-account.sh mark needs-relogin):
+    #   3 = CONFIRMED dead token (auth rejection OR refresh-token provably expired)
+    #   4 = changed-but-malformed readback (finding #7; record left untouched)
+    #   5 = turn did not confirm the 5h window (finding #8; token may be alive)
+    #   6 = TRANSIENT refresh failure (resolver/launch/timeout/non-auth nonzero) —
+    #       token unchanged, retry next cycle, DO NOT mark dead (finding #1)
+    # A changed-but-malformed readback: keep the existing bank record untouched.
     if rr.err:
         print(f"ping FAILED ({rr.err}); keeping existing bank record", file=sys.stderr)
         sys.exit(4)
     now_ms = time.time() * 1000
     still_expired = (new.get("expiresAt") or 0) <= now_ms
-    # A dead token (couldn't rotate and still expired) -> needs-relogin (exit 3).
-    if not rotated and still_expired:
-        print("refresh FAILED (token unchanged and still expired)", file=sys.stderr)
+    rexp = creds.get("refreshTokenExpiresAt")
+    refresh_tok_expired = isinstance(rexp, (int, float)) and rexp <= now_ms
+    # CONFIRMED death only: the server rejected the credentials (auth_failed) or
+    # the refresh token is provably past its expiry. Nothing else is death.
+    if rr.auth_failed or refresh_tok_expired:
+        why = "auth rejected by server" if rr.auth_failed else "refresh token expired"
+        print(f"refresh FAILED (confirmed dead token: {why})", file=sys.stderr)
         sys.exit(3)
+    # Transient failure, token unchanged and still expired: keep the account
+    # retriable rather than marking it dead (finding #1).
+    if not rotated and still_expired:
+        print(f"refresh deferred (transient: {rr.reason}); token unchanged, will retry",
+              file=sys.stderr)
+        sys.exit(6)
     # The turn must have genuinely run (finding #8). If the CLI never exited 0,
     # the window was NOT started even though the token may be alive/rotated — do
     # not report a ping success. Exit 5 = turn failed (distinct from dead token).

@@ -90,6 +90,14 @@ CODEX_USAGE_URL = os.environ.get("ACCOUNT_BANK_CODEX_URL", "https://chatgpt.com/
 
 HTTP_TIMEOUT = float(os.environ.get("ACCOUNT_BANK_TIMEOUT", "5"))
 REFRESH_ENABLED = os.environ.get("ACCOUNT_BANK_REFRESH", "1") == "1"
+# (#2) In the short SessionStart-hook path, parked lazy-refresh is disabled: the
+# hook bounds usage.py with a ~5s timeout that can kill a claude grandchild AFTER
+# it has rotated the refresh token server-side but BEFORE we commit it — stranding
+# the bank on the now-spent old token (permanent false death). When set, we skip
+# the isolated_refresh turn for parked expired tokens and just serve cached/stale.
+# Parked refresh then happens only from QuotaBar's poll (no short timeout) or an
+# explicit ping.
+NO_PARKED_REFRESH = os.environ.get("ACCOUNT_BANK_NO_PARKED_REFRESH", "0") == "1"
 PARKED_MAX_AGE = float(os.environ.get("ACCOUNT_BANK_PARKED_MAX_AGE", "1800"))   # 30 min
 CODEX_PING_ON_401 = os.environ.get("ACCOUNT_BANK_CODEX_PING", "0") == "1"        # gated, off
 BACKOFF_FAILS = 3
@@ -300,11 +308,18 @@ def process_claude(email, oauth, is_active, bank_path, status):
         if not LOCKED:      # never refresh/rotate without the lock
             res["error"] = "parked token expired; refresh skipped (no lock)"
             return res, False
+        if NO_PARKED_REFRESH:
+            # (#2) short hook path: don't risk a timeout-killed rotation. Serve the
+            # cached/stale figure (netfail=True) — no status change, retried by the
+            # next QuotaBar poll or an explicit ping.
+            res["error"] = "parked token expired; refresh skipped (hook path)"
+            return res, True
         if not REFRESH_ENABLED or isolated_refresh is None:
             res["error"] = "parked token expired; refresh disabled"
             return res, False
         rexp = oauth.get("refreshTokenExpiresAt")
         if rexp is not None and rexp <= now_ms():
+            # refresh token provably expired -> CONFIRMED death.
             set_bank_status(bank_path, "needs-relogin")
             res["status"] = "needs-relogin"; res["error"] = "needs-relogin"
             return res, False
@@ -316,14 +331,22 @@ def process_claude(email, oauth, is_active, bank_path, status):
             new, rotated = rr.creds, rr.rotated
             if rr.err:
                 # changed-but-malformed readback: keep the old record, skip this
-                # poll rather than commit a partial blob (finding #7).
+                # poll rather than commit a partial blob (finding #7). Transient —
+                # serve the cached figure, leave the account retriable.
                 res["error"] = f"refresh invalid: {rr.err}"
-                return res, False
+                return res, True
             still_expired = (new.get("expiresAt") or 0) <= now_ms()
             if not rotated and still_expired:
-                set_bank_status(bank_path, "needs-relogin")
-                res["status"] = "needs-relogin"; res["error"] = "needs-relogin"
-                return res, False
+                if rr.auth_failed:
+                    # (#1) CONFIRMED auth rejection is the ONLY refresh-side death.
+                    set_bank_status(bank_path, "needs-relogin")
+                    res["status"] = "needs-relogin"; res["error"] = "needs-relogin"
+                    return res, False
+                # (#1) transient (resolver/launch/timeout/non-auth nonzero): keep
+                # the existing status, note the deferral, serve the cached figure,
+                # and retry next cycle rather than marking a live token dead.
+                res["error"] = f"refresh deferred: {rr.reason}"
+                return res, True
             if bank_path and os.path.exists(bank_path):
                 rec = json.load(open(bank_path))
                 if isinstance(rec, dict):
