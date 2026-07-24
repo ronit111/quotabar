@@ -88,7 +88,12 @@ cycle required before any build.
    structure. r15 review asks are listed in the doc.
 5. Backlog (unchanged value, lower priority now): un-seed flow; pre-limit nudge;
    limit-stalled restart offer; hide "Link account" under v2; legacy-login card
-   re-caption. (fork-drift runtime-file exclusion DONE 2026-07-24 — archiverd.py
+   re-caption; v1.0.1 visual candidates from the release-eve polish pass (each
+   needs a small logic change, deliberately deferred): collapse the health-banner
+   gap (PopoverLayout.estimatedHeight couples to it), continuous gauge color ramp
+   (Severity is 3-step model-side), live ticking Ping countdown (needs a timer),
+   friendly plan-chip names (raw backend strings like MAX_20X render uppercased).
+   (fork-drift runtime-file exclusion DONE 2026-07-24 — archiverd.py
    `_drift_check` now skips daemon.lock/daemon.status.json/gh-pr-status-cache.json
    + any *.lock.)
 
