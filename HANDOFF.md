@@ -2,6 +2,15 @@
 
 Resume point. Read FULLY. Supersedes all prior handoffs.
 
+## RELEASED: v1.0.0 IS PUBLIC (2026-07-25 00:15 IST)
+Tag v1.0.0 on main (squash-merged; leaky wip history never reached main; remote
+wip branch deleted, full history kept locally). GitHub release carries
+QuotaBar-1.0.0.zip (sha256 verified against the published cask). Homebrew tap
+ronit111/homebrew-quotabar is live: `brew tap ronit111/quotabar && brew install
+--cask quotabar`. Shipped as the HYBRID framing. Remaining review debt: binding
+cross-vendor Codex r15 (Jul 29+) now audits a RELEASED surface — findings become
+v1.0.1.
+
 ## STATE IN ONE PARAGRAPH
 
 Epoch = **shadow again (gen 19), BY OWNER DECISION** — not a failure. The flip to v2
