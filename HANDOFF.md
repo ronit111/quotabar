@@ -88,7 +88,10 @@ cycle required before any build.
    structure. r15 review asks are listed in the doc.
 5. Backlog (unchanged value, lower priority now): un-seed flow; pre-limit nudge;
    limit-stalled restart offer; hide "Link account" under v2; legacy-login card
-   re-caption; v1.0.1 visual candidates from the release-eve polish pass (each
+   re-caption; archiverd single-instance enforcement (found 2026-07-25: a
+   manually-bootstrapped instance + the launchd one coexisted for 2 days, both
+   pre-fix, alternating status writes — kickstart couldn't kill the manual one;
+   add a pid-lock so a second instance exits) — plus v1.0.1 visual candidates from the release-eve polish pass (each
    needs a small logic change, deliberately deferred): collapse the health-banner
    gap (PopoverLayout.estimatedHeight couples to it), continuous gauge color ramp
    (Severity is 3-step model-side), live ticking Ping countdown (needs a timer),
