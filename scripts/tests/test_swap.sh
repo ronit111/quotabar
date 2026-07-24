@@ -1,0 +1,75 @@
+#!/bin/bash
+# Fail-closed swap transaction (findings 7,8,9,10,12) + happy path + rollback.
+# All against a stub keychain; the real login is never touched.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/testlib.sh"
+SWAP="$AB_DIR/swap-account.sh"
+
+# ---- happy path a->b ----
+new_env swap_happy >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B "" "$FUT" pro claude_pro
+/bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_eq 0 "$rc" "happy swap exits 0"
+assert_contains '"accessToken":"B"' "$(kc_now)" "keychain now holds B"
+assert_eq "b@x.com" "$(claude_json_email)" "claude.json now names b@x.com"
+assert_file_present "$BANK_DIR/a@x.com.json" "outgoing a@x.com re-banked"
+assert_file_absent "$BANK_DIR/.swap-journal.json" "journal cleared on clean commit"
+
+# ---- finding 8: no valid preimage (keychain unreadable) -> abort, no change ----
+new_env swap_nopre >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B
+before="$(kc_now)"
+STUB_KC_MODE=readfail /bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_ne 0 "$rc" "swap aborts when the outgoing keychain read is empty (transient)"
+assert_eq "$before" "$(kc_now)" "keychain unchanged when preimage capture failed"
+assert_file_absent "$BANK_DIR/.swap-journal.json" "no journal left after preimage abort"
+
+# ---- finding 7: outgoing re-bank fails -> abort before any keychain mutation ----
+new_env swap_rebankfail >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B
+mkdir -p "$BANK_DIR/a@x.com.json"        # make the outgoing re-bank target un-writable (a dir)
+before="$(kc_now)"
+/bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_ne 0 "$rc" "swap aborts when outgoing re-bank fails (finding 7)"
+assert_eq "$before" "$(kc_now)" "keychain unchanged when re-bank failed"
+
+# ---- finding 9: swap journal cannot be created -> abort before kc_write ----
+new_env swap_journalfail >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B
+mkdir -p "$BANK_DIR/.swap-journal.json"  # journal path is a dir -> write fails
+before="$(kc_now)"
+/bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_ne 0 "$rc" "swap aborts when the journal cannot be written (finding 9)"
+assert_contains '"accessToken":"A"' "$(kc_now)" "keychain still A after journal-fail abort"
+
+# ---- finding 10: indeterminate kc_write -> journal RETAINED, fail loud ----
+new_env swap_indeterminate >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B
+STUB_KC_MODE=writeignore /bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_ne 0 "$rc" "indeterminate keychain write -> nonzero (finding 10)"
+assert_contains '"accessToken":"A"' "$(kc_now)" "keychain unchanged (write didn't land)"
+assert_file_present "$BANK_DIR/.swap-journal.json" "journal RETAINED after indeterminate write (never assume unchanged)"
+
+# ---- metadata write fails -> keychain rolled back to pre-swap ----
+new_env swap_rollback >/dev/null
+rod="$BANK_DIR/../rod"; rm -rf "$rod" || _fixture_die "rm rod"; mkdir -p "$rod" || _fixture_die "mkdir rod"
+# (r5 #5) checked fixture write: if this metadata write silently failed, the swap
+# would abort early on missing identity and the rollback assertions below (68-70)
+# would all pass VACUOUSLY without ever exercising rollback. W fails hard instead.
+printf '{"oauthAccount":{"emailAddress":"a@x.com","organizationType":"claude_max"}}' | W "$rod/claude.json"
+export CLAUDE_JSON="$rod/claude.json"
+printf '{"claudeAiOauth":{"accessToken":"A","refreshToken":"rA","expiresAt":%s,"subscriptionType":"max"}}' "$FUT" | W "$STUB_KC_FILE"
+bank_record b@x.com B
+chmod 500 "$rod"                          # claude.json dir read-only -> metadata write fails
+/bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+chmod 700 "$rod"
+assert_ne 0 "$rc" "metadata-write failure -> swap nonzero"
+assert_contains '"accessToken":"A"' "$(kc_now)" "keychain ROLLED BACK to A after metadata failure"
+assert_file_absent "$BANK_DIR/.swap-journal.json" "journal cleared after successful rollback"
+
+finish "swap"

@@ -41,9 +41,11 @@ this for parked-account refresh (below). *Verified empirically 2026-07-19.*
   validate_blob.py    schema-validate a keychain blob (read from STDIN)
   swiftbar-render.py  render usage JSON as SwiftBar menu-bar text
   claude-usage.5m.sh  SwiftBar plugin (symlinked into ~/.swiftbar)
-  account-warn.sh     SessionStart hook: warn when active account >= 80%
+  account-warn.sh     SessionStart hook: AUTO-PICK the best Claude account for
+                      future sessions (plan-tiered ladder); falls back to a warn
+                      note when it cannot pick
 
-$BANK_DIR/                          the "bank" (chmod 700; default ~/.local/share/quotabar)
+$BANK_DIR/                          the "bank" (chmod 700; default ~/.claude/accounts)
   <email>.json                      full account record (chmod 600)
   .keychain-snapshots/              pre-write keychain backups (last 20)
   .usage-cache.json                 last-good usage output + backoff state
@@ -167,9 +169,13 @@ poll (every 5 min) notices an account's 5h window has **lapsed**, it fires a pin
   so the poll never blocks on it (plugin stays ~1.4 s). The ping takes the bank
   lock itself, so a parked-account auto-ping (which rotates tokens via the
   isolated profile) cannot race a concurrent swap.
-- **Debounce:** the existing 30-min per-account cooldown, keyed off **both**
-  `last_ping` and `last_autoping`. `usage.py` records `last_autoping` *before*
-  spawning, so a crashed ping can't re-fire more than once per cooldown.
+- **Debounce:** a 30-min per-account success cooldown (keyed off **both**
+  `last_ping` and `last_autoping`) plus a 5-min **failure** cooldown
+  (`last_ping_failed`). The cooldown markers are written **inside**
+  `ping-account.sh` only *after* it takes the lock and knows the outcome (see the
+  "One ping per cycle" note below) — `usage.py` does **not** stamp before spawning
+  — and every marker write is a **validated, checked** rewrite that refuses to
+  clobber a malformed record and fails loud on a write error (finding #39).
 - **Never fires** for a needs-relogin account, an account with a poll error, or
   one showing only a cached (stale) figure. Requires the bank lock (skipped in
   read-only mode).
@@ -198,21 +204,29 @@ poll (every 5 min) notices an account's 5h window has **lapsed**, it fires a pin
 ## Scheduler reality (there is no daemon of ours — finding #9)
 
 Auto-ping and auto-pick are **not** background jobs. Both run **only when
-`usage.py` runs**, and `usage.py` runs from exactly two callers:
+`usage.py` runs**. Its callers:
 
 1. **QuotaBar's in-process 5-minute loop** (`Services.swift`) — the normal
    steady-state scheduler. It calls `usage.py` (which runs `maybe_autoping`) every
    5 minutes while the app is open.
 2. **The SessionStart hook** (`account-warn.sh`) — runs once per new Claude Code
-   session.
+   session, and only does a full `usage.py` poll when the cache is stale AND
+   QuotaBar is not running (otherwise it just reads the cache).
+3. **The SwiftBar wrapper** (`claude-usage.5m.sh`) and **`ping-account.sh`** (the
+   post-ping cache refresh, `ACCOUNT_BANK_FORCE_FRESH=<target>`) also invoke it.
+
+`usage.py` is **internally time-bounded** (a wall-clock `TOTAL_DEADLINE` plus a
+per-refresh budget) so no caller needs an external kill — an external SIGKILL
+could tear a lock-owning operation and strand the lock (findings #42/#55).
 
 **Enforcement is Launch-at-Login:** QuotaBar must be set to launch at login so the
 5-minute loop actually exists. If QuotaBar is **not** running, the only thing that
 fires auto-ping/auto-pick is starting a new session. To cover that gap, when the
 hook finds the cache stale (>10 min) **and** `pgrep -x QuotaBar` shows the app is
-not running, it does one full `usage.py` poll (hard 5 s cap, `maybe_autoping`
-included) instead of a bare active-only request — so opening a session still gives
-hook-time auto-ping coverage with the app closed. With QuotaBar running the hook
+not running, it does one full `usage.py` poll (bounded by the hook's REMAINING
+budget, `maybe_autoping` included; on overrun the child is **detached, never
+SIGKILLed** — findings #42/#43/#44) instead of a bare active-only request — so
+opening a session still gives hook-time auto-ping coverage with the app closed. With QuotaBar running the hook
 just reads its fresh cache and never does the heavier poll. There is still **no
 launchd job, watcher, or polling loop of ours** (efficiency directive intact).
 

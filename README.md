@@ -1,7 +1,26 @@
+<div align="center">
+
 # QuotaBar
 
-A native macOS menu bar app that tracks AI usage limits across multiple accounts,
-for people who hold more than one paid AI subscription and switch between them.
+**A native macOS menu bar app that tracks AI usage limits across multiple accounts,
+for people who hold more than one paid AI subscription and switch between them.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/popover-dark.svg">
+  <img src="assets/popover-light.svg" alt="Illustration of the QuotaBar popover: a menu bar item reading 78%, and below it three cards — two Claude accounts and a Codex account — each showing 5-hour and weekly usage bars, reset times, plan chips, and Ping / Swap here buttons." width="504">
+</picture>
+
+<sub>*Illustration, not a screenshot — the accounts and percentages shown are made up.*</sub>
+
+[![license: MIT](assets/badge-license.svg)](LICENSE)
+[![platform: macOS 14+](assets/badge-platform.svg)](#requirements)
+[![chip: Apple Silicon](assets/badge-silicon.svg)](#requirements)
+[![signing: ad-hoc, not notarized](assets/badge-signing.svg)](#first-launch-gatekeeper)
+
+[What it does](#what-it-does) · [How it works](#how-it-works) · [Install](#install) ·
+[Security](#security-and-privacy) · [Configuration](#configuration) · [Uninstall](#uninstall)
+
+</div>
 
 QuotaBar shows the current 5-hour and weekly usage for each of your Claude Code
 accounts and your ChatGPT/Codex account, side by side, in the menu bar. It can
@@ -45,6 +64,51 @@ QuotaBar does not create accounts, generate credentials, or circumvent any
 provider's controls — it reads the same usage the provider shows you and switches
 between logins you already own.
 
+## How it works
+
+Claude Code reads its login from one keychain slot on **every request**, not once at
+launch. QuotaBar is built on that fact.
+
+**The shared rail.** Your terminal sessions all read the default keychain slot — the
+"rail". Clicking **Swap here** on an account runs `swap-account.sh`, which writes that
+account's banked credentials into the default slot under a lock. Every running session
+that isn't pinned picks the new account up on its next request: no logout, no restart,
+no interruption mid-conversation. This is the normal way to use QuotaBar, and the only
+mode most people need.
+
+**Pinned sessions (opt-in).** Sometimes you want a session to *stay* on one account —
+an overnight agent run that must not follow a swap, or work you want billed to a
+specific plan. Launch it with:
+
+```sh
+~/.local/share/quotabar/account-bank/claude-acct you@example.com
+```
+
+That session gets its own config home and reads *that* home's credential slot, so rail
+swaps never move it. Pinned sessions are per-session and explicit; nothing is pinned
+unless you ask for it. Pinning needs `./install.sh --with-pinning`, which records where
+your real `claude` binary lives so the launcher can find it.
+
+**One swap at a time.** A swap is guarded by `--expect-active`: if the active account
+changed between the moment the card was drawn and the moment the script runs, the swap
+aborts rather than clobbering a newer one, and the card says "Active account changed —
+try again". The app disables every Swap button while one is in flight, so this should
+be rare.
+
+**"Switch here" and the v2 mode.** The repo also contains a fully-built *alternative*
+design (["v2", see `ISOLATION-DESIGN.md`](ISOLATION-DESIGN.md)) in which every session
+is pinned at launch and there is no shared rail — the button relabels itself to
+**Switch here**, which repoints *future* launches instead of moving live sessions. That
+mode is **optional, off by default, and not the shipped path.** The author runs the
+hybrid described above, and so will you unless you deliberately turn v2 on.
+
+If you install with `--with-pinning`, the installer prints two terms from that
+machinery. **SHADOW** is the state you're in: v2's homes and archiver exist and are
+monitored while the shared rail stays authoritative. **Cutover** is the deliberate,
+manual flip to full v2 — prepending the shim to your `PATH` and loading the launch
+agent by hand. Neither happens on its own, and neither term appears in a default
+install.
+
 ## Requirements
 
 - macOS 14 (Sonoma) or later, Apple Silicon.
@@ -55,14 +119,51 @@ between logins you already own.
 
 ## Install
 
-There is no notarized download — you build it yourself. From the repo root:
+### Homebrew (recommended)
+
+```sh
+brew tap ronit111/quotabar
+brew install --cask quotabar
+```
+
+Update later with `brew upgrade --cask quotabar`. Uninstall with
+`brew uninstall --cask quotabar` (see [Uninstall](#uninstall) — that removes the app,
+not your banked data).
+
+The cask downloads the release zip and installs `QuotaBar.app` into `/Applications`.
+That's all it installs. The app is self-contained: the account-bank scripts ship inside
+`QuotaBar.app/Contents/Resources/account-bank`, and the app falls back to that copy when
+nothing is installed on disk, so usage display and account switching work out of the box.
+
+The cask does **not** install the scripts anywhere you can call them from a shell, add a
+SessionStart hook, or set up the launch agent. For command-line, SwiftBar, or hook use —
+or for the opt-in pinning machinery — install from source (below).
+
+The app is **ad-hoc signed, not notarized** (no Apple Developer ID), so the first
+launch needs the Gatekeeper step [below](#first-launch-gatekeeper).
+
+### From source (developers)
+
+There is no notarized download; from source you build it yourself. From the repo root:
 
 ```sh
 ./install.sh
 ```
 
 That installs the scripts to `~/.local/share/quotabar/account-bank` and builds and
-installs `QuotaBar.app` into `/Applications`. To build only the app:
+installs `QuotaBar.app` into `/Applications`. It also writes a resolved SessionStart
+hook fragment next to the scripts for you to merge yourself; nothing merges it for you.
+
+Add `--with-pinning` to additionally stage the opt-in pinning rail — it records
+`REAL_CLAUDE_BIN` in `~/.claude/accounts/.config.json`, stages the launch shim at
+`~/.claude/accounts/bin/claude` (never put on your `PATH`), and writes the archiver
+launch agent to `~/Library/LaunchAgents` (never loaded). None of it activates itself:
+
+```sh
+./install.sh --with-pinning
+```
+
+To build only the app:
 
 ```sh
 cd app && make install   # or: make bundle  (build to app/dist.noindex without installing)
@@ -106,15 +207,21 @@ it once so QuotaBar knows about it:
 bash ~/.local/share/quotabar/account-bank/bank-account.sh
 ```
 
+(That's the *scripts* path. The record it writes lands in the bank directory,
+`~/.claude/accounts`.)
+
 If you enable the SessionStart hook (below), banking happens automatically the next
 time you start a Claude Code session — adding an account becomes just `/login`.
 
 ### Optional: SessionStart hook (auto-bank, auto-pick, auto-ping)
 
 Auto-bank / auto-pick / auto-ping run inside Claude Code's SessionStart hook. This
-is opt-in because it edits your Claude Code settings. To enable, add
-`account-warn.sh` as a SessionStart hook in your Claude Code `settings.json`, and
-turn on the features you want in `~/.local/share/quotabar/.config.json`
+is opt-in because it edits your Claude Code settings — the installer writes the hook
+snippet to `~/.local/share/quotabar/account-bank/hooks-fragment.resolved.json` with
+the paths already filled in, but never merges it. To enable, merge that fragment (or
+add `account-warn.sh` as a SessionStart hook by hand) into your Claude Code
+`settings.json`, and
+turn on the features you want in `~/.claude/accounts/.config.json`
 (e.g. `{"auto_pick": true, "auto_ping": ["you@example.com"]}`). See
 [`scripts/README.md`](scripts/README.md) for the full behavior and safety model.
 
@@ -132,13 +239,17 @@ before you trust it. This is the honest accounting.
 
 **Where it stores things.** Banked account records (a copy of each account's
 credentials plus metadata), keychain snapshots, the usage cache, and the lock all
-live under `~/.local/share/quotabar` (directory `700`, files `600`). Nothing
-sensitive is written inside this repo or anywhere world-readable. The app's log is
-`~/Library/Logs/QuotaBar.log` and never contains token values.
+live under `~/.claude/accounts` — the bank directory, overridable with `BANK_DIR`
+(directory `700`, files `600`). The *scripts themselves* are installed separately to
+`~/.local/share/quotabar/account-bank`; that directory holds code, not credentials.
+Nothing sensitive is written inside this repo or anywhere world-readable. The app's
+log is `~/Library/Logs/QuotaBar.log` and never contains token values.
 
 **Network.** The app itself makes **no** network connections — the `make audit`
-target mechanically enforces the absence of any networking, keychain, analytics, or
-logging APIs in the app binary. The scripts contact exactly two hosts, both the
+target greps the app's Swift sources (`App.swift`, `Models.swift`, `Services.swift`,
+`Views.swift`) and fails the build if any networking, keychain, analytics, or
+structured-logging API appears in them. It is a source-level check, not binary
+analysis. The scripts contact exactly two hosts, both the
 providers' own usage endpoints:
 
 - Anthropic's usage API, using your existing Claude token.
@@ -178,9 +289,9 @@ Environment variables (all optional):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BANK_DIR` | `~/.local/share/quotabar` | Where banked records, cache, lock, snapshots live. |
-| `QUOTABAR_SCRIPTS_DIR` | `~/.local/share/quotabar/account-bank` | Where the app looks for the scripts (falls back to the copy bundled in the app). |
-| `XDG_DATA_HOME` | `~/.local/share` | Base for the two defaults above. |
+| `BANK_DIR` | `~/.claude/accounts` | Where banked records, config, cache, lock, snapshots live. (`ACCOUNT_BANK_DIR` is honoured as a fallback.) |
+| `QUOTABAR_SCRIPTS_DIR` | `~/.local/share/quotabar/account-bank` | Where the scripts are installed and where the app looks for them (falls back to the copy bundled in the app). |
+| `XDG_DATA_HOME` | `~/.local/share` | Base for the scripts install path above. |
 | `ACCOUNT_BANK_TIMEOUT` | `5` | Per-request network timeout (seconds). |
 | `ACCOUNT_BANK_PING_MODEL` | `haiku` | Model used for a ping turn. |
 | `ACCOUNT_BANK_CODEX_PING` | `0` (off) | Allow the Codex CLI to self-refresh on a 401. |
@@ -191,12 +302,36 @@ way the scripts do, so the two always agree.
 
 ## Uninstall
 
+Removing the app does **not** remove your data. `~/.claude/accounts` holds a **copy of
+each banked account's credentials** plus keychain snapshots — delete it explicitly
+unless you intend to keep it.
+
+If you installed with Homebrew, remove the app first:
+
 ```sh
-rm -rf /Applications/QuotaBar.app ~/.local/share/quotabar ~/Library/Logs/QuotaBar.log
+brew uninstall --cask quotabar
 ```
 
-Remove the SessionStart hook from your Claude Code `settings.json` if you added it.
-Your Claude Code and Codex logins are untouched.
+Then, for either install method, remove the data and the pieces `install.sh` may have
+placed outside `/Applications`:
+
+```sh
+# the launch agent (only exists if you installed with --with-pinning)
+launchctl bootout gui/$UID/com.quotabar.archiver 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.quotabar.archiver.plist
+
+# the resolved SessionStart hook fragment
+rm -f ~/.local/share/quotabar/account-bank/hooks-fragment.resolved.json
+
+# the app, the scripts, the log, and the bank (CREDENTIAL COPIES — see above)
+rm -rf /Applications/QuotaBar.app \
+       ~/.local/share/quotabar \
+       ~/Library/Logs/QuotaBar.log \
+       ~/.claude/accounts
+```
+
+Remove the SessionStart hook entry from your Claude Code `settings.json` if you added
+it. Your Claude Code and Codex logins are untouched.
 
 ## License
 

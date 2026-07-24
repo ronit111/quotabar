@@ -30,13 +30,22 @@ test:
 audit:
 	@# Forbidden everywhere: networking, credentials/keychain, analytics, structured logging.
 	@! /usr/bin/grep -En 'URLSession|NWConnection|Network\.framework|import Security|SecItem|Keychain|analytics|telemetry|OSLog|Logger\(' App.swift Models.swift Services.swift Views.swift
-	@# No filesystem-mutating APIs anywhere.
-	@! /usr/bin/grep -En 'createFile|removeItem|copyItem|moveItem' App.swift Models.swift Services.swift Views.swift
+	@# Filesystem-mutating APIs: create/copy/move forbidden everywhere; removeItem forbidden in
+	@# App/Models/Views (allowed in Services ONLY for the runtime-marker teardown, asserted below).
+	@# (\.moveItem so the pattern does not match the 'moveItem' substring inside removeItem.)
+	@! /usr/bin/grep -En 'createFile|copyItem|\.moveItem' App.swift Models.swift Services.swift Views.swift
+	@! /usr/bin/grep -En 'removeItem' App.swift Models.swift Views.swift
 	@# File writes and UserDefaults are permitted ONLY in Services.swift (SPEC "Allowed I/O").
 	@! /usr/bin/grep -En 'Data\.write|write\(to:|write\(contentsOf:|UserDefaults' App.swift Models.swift Views.swift
-	@# Services.swift may write ONLY the failure log (exactly its 2 log write calls) and
-	@# persist ONLY its own prefs (codexLastPing); the log path must be the sanctioned one.
-	@test "$$(/usr/bin/grep -Ec 'Data\.write|write\(to:|write\(contentsOf:' Services.swift)" = "2"
+	@# Services.swift may write ONLY the 2 failure-log calls + the 1 runtime-marker write, persist
+	@# ONLY its own prefs (codexLastPing / seedAuditAckTs), and the log path must be the sanctioned
+	@# one. The runtime marker (accounts/quotabar.runtime.json {pid,epoch_aware}) is the SOLE file
+	@# the app writes under accounts/ — attest-cutover.sh fails closed without it (SPEC "Allowed I/O").
+	@test "$$(/usr/bin/grep -Ec 'Data\.write|write\(to:|write\(contentsOf:' Services.swift)" = "3"
+	@# The ONLY removeItem in Services is the runtime-marker teardown (exactly one call).
+	@test "$$(/usr/bin/grep -Ec 'removeItem' Services.swift)" = "1"
+	@/usr/bin/grep -F 'quotabar.runtime.json' Services.swift >/dev/null
+	@/usr/bin/grep -F 'epoch_aware' Services.swift >/dev/null
 	@/usr/bin/grep -F 'Library/Logs/QuotaBar.log' Services.swift >/dev/null
 	@/usr/bin/grep -F 'codexLastPing' Services.swift >/dev/null
 	@/usr/bin/grep -F '"/usr/bin/python3"' Services.swift >/dev/null

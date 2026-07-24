@@ -1,0 +1,149 @@
+#!/bin/bash
+# The v2 launch shim (ISOLATION-DESIGN.md rev 6 §3). Installed PATH-FIRST at
+# ~/.claude/accounts/bin/claude — never over the real CLI.
+#
+# Rule precedence (marker FIRST), verbatim from the design:
+#   1. CLAUDE_ACCT_SHIM=1  -> CLAUDE_CONFIG_DIR must canonicalize to a REGISTERED
+#      READY home; anything else is a HARD ERROR (66). Never keychain fallthrough.
+#   2. no marker, CLAUDE_CONFIG_DIR under homes/ -> READY required -> exec real CLI.
+#   3. no marker, CLAUDE_CONFIG_DIR elsewhere    -> exec real CLI unchanged (never
+#      auto-pick someone else's explicit config).
+#   4. no marker, unset -> auto-pick -> resolve pointer to REAL home (READY
+#      required) -> exec with marker+home.
+#
+# Exit codes: 64 usage/internal · 65 not READY/unknown · 66 pairing violation ·
+#             67 real binary unresolved · 78 epoch fence. Success never returns.
+set -u
+
+ACCOUNTS_DIR="${ACCOUNT_BANK_DIR:-$HOME/.claude/accounts}"
+SCRIPTS_DIR="${ACCOUNT_BANK_SCRIPTS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# The shim lives in accounts/bin in production but in scripts/bin in the repo; the
+# scripts dir is authoritative for python helpers either way.
+[ -f "$SCRIPTS_DIR/registry.py" ] || SCRIPTS_DIR="$HOME/.claude/scripts/account-bank"
+
+# (r12 sweep-c) source the shared alt-auth strip list; a MANAGED launch (rules 1/2/4, which
+# pin a home) must not let an inherited ANTHROPIC_API_KEY / Bedrock/Vertex var override the
+# home's OAuth. Fallback stub if the file is missing so the shim never hard-fails on it.
+if [ -f "$SCRIPTS_DIR/_authenv.sh" ]; then . "$SCRIPTS_DIR/_authenv.sh"; else strip_auth_env_exec() { exec "$@"; }; fi
+
+fail() { echo "claude-shim: $2" >&2; exit "$1"; }
+
+canon() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+is_ready() { python3 "$SCRIPTS_DIR/registry.py" is-ready "$ACCOUNTS_DIR" "$1"; }
+
+# ---- real binary resolution (§3: registry first, canonicalized, self-excluded) ----
+# (finding 26) exclusion is by canonical path under accounts/bin AND by dev/inode
+# equality with the shim — a HARD LINK to the shim outside accounts/bin, or a
+# symlinked accounts root, no longer defeats the check and cannot recurse.
+_accept_real() {
+    # args: candidate shim-source accounts-dir ; prints canonical path + exit 0 if OK
+    python3 - "$1" "$2" "$3" <<'PY'
+import os, stat, sys
+cand, shim, acc = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    rc = os.path.realpath(cand)
+    st = os.stat(rc)
+except OSError:
+    sys.exit(1)
+if not (stat.S_ISREG(st.st_mode) and os.access(rc, os.X_OK)):
+    sys.exit(1)
+binroot = os.path.realpath(os.path.join(acc, "bin"))
+if rc == binroot or rc.startswith(binroot + os.sep):
+    sys.exit(1)                     # resides under accounts/bin (canonicalized)
+try:
+    ss = os.stat(os.path.realpath(shim))
+    if (st.st_dev, st.st_ino) == (ss.st_dev, ss.st_ino):
+        sys.exit(1)                 # same dev/inode as the shim (hard link / alias)
+except OSError:
+    pass
+print(rc)
+PY
+}
+
+real_claude() {
+    local cand out
+    for cand in "${ACCOUNT_BANK_CLAUDE_BIN:-}" \
+                "$(python3 -c '
+import json,os,sys
+p=os.path.join(sys.argv[1],".config.json")
+try: print(json.load(open(p)).get("REAL_CLAUDE_BIN",""))
+except Exception: print("")' "$ACCOUNTS_DIR")" \
+                "$(command -v claude 2>/dev/null || true)" \
+                "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
+        [ -n "$cand" ] || continue
+        out="$(_accept_real "$cand" "${BASH_SOURCE[0]}" "$ACCOUNTS_DIR")" || continue
+        echo "$out"; return 0
+    done
+    return 1
+}
+
+# ---- (r13 #9) dedicated attestation probe: does the shim resolve the REAL binary? ----
+# Handled FIRST, before the rule dispatch, so an inherited CLAUDE_ACCT_SHIM=1 / CLAUDE_CONFIG_DIR
+# cannot divert it to a rule-1/2/4 exit (64/65/66/78) that attest-cutover.sh would misread as
+# "resolved". rc 0 == real binary resolved (attest PASS); rc 67 == unresolved (FAIL). No pointer,
+# marker, or config required.
+if [ "${1:-}" = "--account-bank-attest-probe" ]; then
+    real_claude >/dev/null 2>&1 && exit 0 || exit 67
+fi
+
+# ---- rule 1: marker first (finding 39: pairing validated BEFORE real-binary
+# resolution, so a malformed marker/config yields 66, never a 67 masking it) ----
+if [ "${CLAUDE_ACCT_SHIM:-}" = "1" ]; then
+    [ -n "${CLAUDE_CONFIG_DIR:-}" ] || fail 66 "CLAUDE_ACCT_SHIM=1 but CLAUDE_CONFIG_DIR unset (broken inheritance; refusing keychain fallthrough)"
+    C="$(canon "$CLAUDE_CONFIG_DIR")"
+    case "$C" in
+        "$(canon "$ACCOUNTS_DIR")"/homes/*) : ;;
+        *) fail 66 "CLAUDE_ACCT_SHIM=1 with non-home CLAUDE_CONFIG_DIR ($C); refusing" ;;
+    esac
+    is_ready "$C" || fail 66 "CLAUDE_ACCT_SHIM=1 with unregistered/non-READY home ($C); refusing"
+    REAL="$(real_claude)" || fail 67 "real claude binary unresolved (registry/.config.json REAL_CLAUDE_BIN, PATH, known locations all failed)"
+    # (r8 #6) PIN AT LAUNCH: re-export the CANONICAL real-home path, never the value we
+    # were handed. If CLAUDE_CONFIG_DIR was a symlink (e.g. a "rail" pointing at home A),
+    # the child's per-turn credential reads would traverse that symlink live — repointing
+    # the rail to B mid-session would flip the running session's identity, exactly the
+    # forbidden live-flip rail (§0). Canonical C has no symlink components, so the pin holds.
+    export CLAUDE_CONFIG_DIR="$C"
+    strip_auth_env_exec "$REAL" "$@"   # (r12 sweep-c) managed launch: strip alt-auth env
+fi
+
+# marker absent: resolve the real binary for the remaining rules
+REAL="$(real_claude)" || fail 67 "real claude binary unresolved (registry/.config.json REAL_CLAUDE_BIN, PATH, known locations all failed)"
+
+# ---- rules 2+3: explicit CLAUDE_CONFIG_DIR ----
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    C="$(canon "$CLAUDE_CONFIG_DIR")"
+    case "$C" in
+        "$(canon "$ACCOUNTS_DIR")"/homes/*)
+            is_ready "$C" || fail 65 "pinned home is not READY: $C"
+            # (r8 #6) pin the CANONICAL home path, not the (possibly symlinked) value the
+            # caller passed — otherwise a repointed rail live-flips the running session (§0).
+            export CLAUDE_ACCT_SHIM=1 CLAUDE_CONFIG_DIR="$C"
+            strip_auth_env_exec "$REAL" "$@" ;;   # (r12 sweep-c) managed: strip alt-auth
+        *)  # user's own config dir: pass through untouched, never auto-pick (their env too)
+            exec "$REAL" "$@" ;;
+    esac
+fi
+
+# ---- rule 4: default launch -> auto-pick via pointer, epoch-gated ----
+# (r13 #13) a malformed/unreadable EPOCH is an epoch FENCE, not a usage/internal error: the
+# contract assigns rc 78 to every epoch-fence outcome. snapshot() succeeds (v1 0) on an ABSENT
+# EPOCH, so a nonzero here means a PRESENT-but-broken EPOCH -> fail 78, not 64.
+SNAP="$(python3 "$SCRIPTS_DIR/epoch.py" snapshot "$ACCOUNTS_DIR" 2>/dev/null)" || fail 78 "EPOCH present but unreadable/malformed (epoch fence)"
+STATE="${SNAP%% *}"
+if [ "$STATE" != "v2" ]; then
+    # pre-cutover: the shim is transparent (v1 world unchanged)
+    exec "$REAL" "$@"
+fi
+# auto-pick may repoint (policy decides); then resolve the pointer to a REAL home.
+python3 "$SCRIPTS_DIR/autopick_v2.py" "$ACCOUNTS_DIR" >/dev/null 2>&1 || true  # advisory; pointer stays authoritative
+HOME_PATH="$(python3 -c '
+import sys, os
+sys.path.insert(0, sys.argv[2])
+import repoint
+t = repoint.read_current(sys.argv[1])
+print(t or "")' "$ACCOUNTS_DIR" "$SCRIPTS_DIR")"
+[ -n "$HOME_PATH" ] || fail 65 "no current pointer; run claude-acct <email> or QuotaBar Switch first"
+HOME_PATH="$(canon "$HOME_PATH")"
+is_ready "$HOME_PATH" || fail 65 "pointer target is not a READY home: $HOME_PATH"
+export CLAUDE_ACCT_SHIM=1 CLAUDE_CONFIG_DIR="$HOME_PATH"
+strip_auth_env_exec "$REAL" "$@"   # (r12 sweep-c) managed auto-pick launch: strip alt-auth

@@ -8,7 +8,8 @@ welcome.
 - **Never commit credentials or personal data.** No account emails, tokens,
   keychain blobs, session IDs, cost figures, or hardcoded absolute home paths
   (`~/…` is fine, a literal home path under your username is not). Runtime
-  state lives outside the repo (`~/.local/share/quotabar`); test fixtures use
+  state lives outside the repo (banked records in `~/.claude/accounts`, the
+  installed scripts in `~/.local/share/quotabar`); test fixtures use
   `example.com` addresses and synthetic numbers only.
 - **Keep the security posture.** The scripts follow strict invariants (lock-first,
   atomic writes, secrets via stdin never argv, fail-closed keychain writes,

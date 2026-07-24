@@ -14,9 +14,11 @@ private enum TestFailure: Error, CustomStringConvertible {
 struct QuotaBarTests {
     static func main() async throws {
         try testDecodingOptionalFields()
-        try testLiveFixtureShape()
+        try testUnresolvedLoginPresentation()
+        try testSampleFixtureShape()
         try testMicrosecondTimestamp()
         try testCachedEntryDetection()
+        try testCachedDataBadgeText()
         try testSeverityBoundaries()
         try testCooldownBoundaries()
         try testResetFormatting()
@@ -41,6 +43,18 @@ struct QuotaBarTests {
         try testOptimisticSwitchFlip()
         try testPopoverLayoutBranches()
         try testCodexPingLogic()
+        try testEpochAndSwitchRouting()
+        try testSwapInvocationArguments()
+        try testQueuedSwapRaceGuards()
+        try testMonitorOnlyDecodeAndRemoveGuard()
+        try testEpochHealthCooldownDecode()
+        try testHealthAnomalies()
+        try testPingCooldownV2()
+        try testIdleSessionsParsing()
+        try testRuntimeMarkerPayload()
+        try testScriptsLocationResolution()
+        try testNullUtilizationDecodesTolerantly()
+        try testRestartOutcomeMapping()
         try await testLargeStderrDrain()
         try await testScriptRunnerEnvironmentPropagation()
         try await testNonzeroStderr()
@@ -83,43 +97,104 @@ struct QuotaBarTests {
         try expect(snapshot.accounts[1].fiveHour == nil, "null five_hour must remain nil")
     }
 
-    // Captured verbatim from `usage.py` on 2026-07-19 (percentages/timestamps only, no credentials).
-    private static let liveFixture = #"""
+    // The fail-closed identity state must reach the UI as a DESIGNED presentation:
+    // structured fields decode, the internal sentinel string never renders, and a
+    // stale cache written before the backend emitted the flag still maps over.
+    private static func testUnresolvedLoginPresentation() throws {
+        let json = #"""
+        {
+          "generated_at": "2026-07-22T05:00:00Z",
+          "accounts": [
+            {
+              "provider": "claude",
+              "email": "(active/unresolved)",
+              "active": true,
+              "unresolved": true,
+              "metadata_email": "person@example.com",
+              "plan": "pro"
+            },
+            {
+              "provider": "claude",
+              "email": "(active/unresolved)",
+              "active": true
+            },
+            {
+              "provider": "claude",
+              "email": "person@example.com",
+              "active": false
+            }
+          ]
+        }
+        """#
+        let snapshot = try UsageSnapshot.decode(from: Data(json.utf8))
+        let structured = snapshot.accounts[0]
+        try expect(structured.isUnresolved, "structured unresolved flag must decode")
+        try expect(
+            structured.displayName == "person@example.com",
+            "unresolved card shows the metadata identity, never the sentinel"
+        )
+        let staleCache = snapshot.accounts[1]
+        try expect(
+            staleCache.isUnresolved && staleCache.displayName == "New login",
+            "sentinel email from a pre-flag cache still maps to the designed name"
+        )
+        let named = snapshot.accounts[2]
+        try expect(
+            !named.isUnresolved && named.displayName == "person@example.com",
+            "ordinary accounts keep their email as the display name"
+        )
+        // Action-surface contract: an unresolved entry (even a stale inactive one)
+        // must never expose Remove — its confirmation strip would leak the sentinel.
+        let staleInactiveUnresolved = UsageAccount(
+            provider: "claude", email: "(active/unresolved)", active: false, plan: nil,
+            status: nil, error: nil, fiveHour: nil, sevenDay: nil,
+            worstLimit: nil, modelCap: nil, staleEntry: true, fetchedAt: nil,
+            unresolved: true, metadataEmail: nil, monitorOnly: nil, cooldownUntil: nil
+        )
+        try expect(
+            !RemoveAccountPolicy.canRemove(staleInactiveUnresolved),
+            "stale inactive unresolved entry must not show Remove"
+        )
+    }
+
+    // A synthetic `usage.py` payload in the shape the app decodes: two Claude accounts (one
+    // active, one session-exhausted) plus a Codex account, microsecond timestamps included.
+    private static let sampleFixture = #"""
     {
-      "generated_at": "2026-07-19T07:20:30Z",
-      "active_email": "primary@example.com",
+      "generated_at": "2026-01-05T07:20:30Z",
+      "active_email": "a@example.com",
       "accounts": [
         {
           "provider": "claude",
-          "email": "secondary@example.com",
+          "email": "b@example.com",
           "active": false,
-          "five_hour": {"utilization": 100.0, "resets_at": "2026-07-19T07:50:00.159118+00:00"},
-          "seven_day": {"utilization": 12.0, "resets_at": "2026-07-24T05:00:00.159136+00:00"},
-          "worst_limit": {"kind": "session", "percent": 100.0, "resets_at": "2026-07-19T07:50:00.159118+00:00"},
+          "five_hour": {"utilization": 100.0, "resets_at": "2026-01-05T07:50:00.100000+00:00"},
+          "seven_day": {"utilization": 10.0, "resets_at": "2026-01-10T05:00:00.100000+00:00"},
+          "worst_limit": {"kind": "session", "percent": 100.0, "resets_at": "2026-01-05T07:50:00.100000+00:00"},
           "status": "ok",
-          "fetched_at": 1784444886.544259,
+          "fetched_at": 1767598800.0,
           "plan": "pro"
         },
         {
           "provider": "claude",
-          "email": "primary@example.com",
+          "email": "a@example.com",
           "active": true,
-          "five_hour": {"utilization": 33.0, "resets_at": "2026-07-19T11:40:00.298153+00:00"},
-          "seven_day": {"utilization": 21.0, "resets_at": "2026-07-25T08:00:00.298172+00:00"},
-          "worst_limit": {"kind": "session", "percent": 33.0, "resets_at": "2026-07-19T11:40:00.298153+00:00"},
+          "five_hour": {"utilization": 30.0, "resets_at": "2026-01-05T11:40:00.200000+00:00"},
+          "seven_day": {"utilization": 20.0, "resets_at": "2026-01-11T08:00:00.200000+00:00"},
+          "worst_limit": {"kind": "session", "percent": 30.0, "resets_at": "2026-01-05T11:40:00.200000+00:00"},
           "status": "ok",
-          "fetched_at": 1784445628.831713,
+          "fetched_at": 1767599400.0,
           "plan": "max"
         },
         {
           "provider": "codex",
-          "email": "secondary@example.com",
+          "email": "b@example.com",
           "active": false,
           "five_hour": null,
-          "seven_day": {"utilization": 34.0, "resets_at": "2026-07-25T08:18:44+00:00"},
-          "worst_limit": {"kind": "weekly", "percent": 34.0, "resets_at": "2026-07-25T08:18:44+00:00"},
+          "seven_day": {"utilization": 40.0, "resets_at": "2026-01-11T08:18:44+00:00"},
+          "worst_limit": {"kind": "weekly", "percent": 40.0, "resets_at": "2026-01-11T08:18:44+00:00"},
           "status": "ok",
-          "fetched_at": 1784445629.4484081,
+          "fetched_at": 1767599400.0,
           "plan": "plus"
         }
       ],
@@ -130,8 +205,8 @@ struct QuotaBarTests {
     }
     """#
 
-    private static func testLiveFixtureShape() throws {
-        let snapshot = try UsageSnapshot.decode(from: Data(liveFixture.utf8))
+    private static func testSampleFixtureShape() throws {
+        let snapshot = try UsageSnapshot.decode(from: Data(sampleFixture.utf8))
         try expect(snapshot.accounts.count == 3, "fixture must decode 3 accounts")
         let claude = snapshot.accounts.filter(\.isClaude)
         try expect(claude.count == 2, "fixture must have 2 claude accounts")
@@ -190,6 +265,39 @@ struct QuotaBarTests {
         try expect(
             snapshot.accounts[0].fetchedAtDate == Date(timeIntervalSince1970: 1_784_448_000),
             "cached age must use the entry's fetched_at timestamp"
+        )
+    }
+
+    private static func testCachedDataBadgeText() throws {
+        // No 429 marker anywhere -> honest generic wording, never an unearned "rate-limited".
+        try expect(
+            CachedDataBadgeText.headline(activeError: nil, staleReason: nil) == "cached data",
+            "absent any rate-limit marker the badge must stay generic"
+        )
+        // Backoff is generic (429/403/5xx/network all trip it) so it must NOT claim rate-limiting.
+        try expect(
+            CachedDataBadgeText.headline(
+                activeError: nil,
+                staleReason: "claude backoff; retry after 2026-07-21T09:00:00Z"
+            ) == "cached data",
+            "generic backoff must not be attributed to rate-limiting"
+        )
+        // A surviving HTTP 429 on the active account is a real, distinguishable rate-limit signal.
+        try expect(
+            CachedDataBadgeText.headline(activeError: "HTTP 429", staleReason: nil)
+                == "rate-limited · cached",
+            "a live 429 marker must surface plainly as rate-limited"
+        )
+        try expect(
+            CachedDataBadgeText.headline(activeError: "HTTP 429 Too Many Requests", staleReason: nil)
+                == "rate-limited · cached",
+            "429 detection must not depend on an exact string"
+        )
+        // Detection is case-insensitive and also honors an explicit stale_reason phrasing.
+        try expect(
+            CachedDataBadgeText.headline(activeError: nil, staleReason: "Rate Limit exceeded")
+                == "rate-limited · cached",
+            "a rate-limit stale_reason must surface even without a per-account error"
         )
     }
 
@@ -351,7 +459,8 @@ struct QuotaBarTests {
         let parkedRelogin = UsageAccount(
             provider: "claude", email: "dead@example.com", active: false, plan: nil,
             status: "needs-relogin", error: nil, fiveHour: nil, sevenDay: nil,
-            worstLimit: nil, modelCap: nil, staleEntry: nil, fetchedAt: nil
+            worstLimit: nil, modelCap: nil, staleEntry: nil, fetchedAt: nil,
+            unresolved: nil, metadataEmail: nil, monitorOnly: nil, cooldownUntil: nil
         )
 
         try expect(RemoveAccountPolicy.canRemove(parked), "a parked Claude account must show Remove")
@@ -377,7 +486,7 @@ struct QuotaBarTests {
 
         // Inline strip prompt uses the short (local-part) form to fit the 320-wide popover row.
         try expect(
-            RemoveAccountPolicy.shortEmail("first.user@example.com") == "first.user",
+            RemoveAccountPolicy.shortEmail("parked.person@example.com") == "parked.person",
             "shortEmail must drop the domain"
         )
         try expect(
@@ -385,7 +494,7 @@ struct QuotaBarTests {
             "shortEmail must pass through an address with no @"
         )
         try expect(
-            RemoveAccountPolicy.inlinePrompt(email: "first.user@example.com") == "Remove first.user?",
+            RemoveAccountPolicy.inlinePrompt(email: "parked.person@example.com") == "Remove parked.person?",
             "inline prompt must read 'Remove <local>?'"
         )
     }
@@ -471,8 +580,8 @@ struct QuotaBarTests {
     }
 
     private static func testOptimisticSwitchFlip() throws {
-        let original = try UsageSnapshot.decode(from: Data(liveFixture.utf8))
-        let targetEmail = "secondary@example.com"
+        let original = try UsageSnapshot.decode(from: Data(sampleFixture.utf8))
+        let targetEmail = "b@example.com"
         let switched = original.optimisticallyActivatingClaudeAccount(email: targetEmail)
         let claude = switched.accounts.filter(\.isClaude)
 
@@ -482,7 +591,7 @@ struct QuotaBarTests {
             "optimistic switch must activate the successful target"
         )
         try expect(
-            claude.first(where: { $0.email == "primary@example.com" })?.active == false,
+            claude.first(where: { $0.email == "a@example.com" })?.active == false,
             "optimistic switch must clear the previous active flag"
         )
         try expect(
@@ -497,25 +606,25 @@ struct QuotaBarTests {
 
         let unknown = original.optimisticallyActivatingClaudeAccount(email: "missing@example.com")
         try expect(
-            unknown.accounts.filter { $0.isClaude && $0.active }.first?.email == "primary@example.com",
+            unknown.accounts.filter { $0.isClaude && $0.active }.first?.email == "a@example.com",
             "an unknown target must preserve the original active account"
         )
     }
 
     private static func testStableAccountOrder() throws {
-        let first = makeAccount(email: "primary@example.com", active: false, fetchedAt: 1_000)
+        let first = makeAccount(email: "a@example.com", active: false, fetchedAt: 1_000)
         let codex = makeAccount(
-            provider: "codex", email: "secondary@example.com",
+            provider: "codex", email: "b@example.com",
             active: false, fetchedAt: 1_000
         )
-        let second = makeAccount(email: "secondary@example.com", active: true, fetchedAt: 1_000)
+        let second = makeAccount(email: "b@example.com", active: true, fetchedAt: 1_000)
 
         let original = AccountOrdering.claudeAccountsInSnapshotOrder([first, codex, second])
         let switched = AccountOrdering.claudeAccountsInSnapshotOrder([
             first.withActive(true), codex, second.withActive(false)
         ])
 
-        let expected = ["primary@example.com", "secondary@example.com"]
+        let expected = ["a@example.com", "b@example.com"]
         try expect(original.map(\.email) == expected, "Claude cards must follow backend bank order")
         try expect(
             switched.map(\.email) == expected,
@@ -737,7 +846,9 @@ struct QuotaBarTests {
                 generatedAt: Date(timeIntervalSince1970: 10_000),
                 stale: false,
                 staleReason: nil,
-                accounts: accounts
+                accounts: accounts,
+                epoch: nil,
+                health: nil
             )
         }
 
@@ -911,13 +1022,300 @@ struct QuotaBarTests {
         }
     }
 
+    // MARK: - v2 wiring contract tests
+
+    // Epoch parsing + the Switch routing table: v1/unknown -> in-place swap (no restart offer);
+    // shadow/v2 -> repoint (future launches) + restart offer.
+    private static func testEpochAndSwitchRouting() throws {
+        try expect(EpochState.from(nil) == .v1, "absent epoch is the pre-v2 world (v1)")
+        try expect(EpochState.from("") == .v1, "empty epoch decodes v1")
+        try expect(EpochState.from("v1") == .v1, "explicit v1 decodes v1")
+        try expect(EpochState.from("shadow") == .shadow, "shadow decodes shadow")
+        try expect(EpochState.from("V2") == .v2, "epoch parse is case-insensitive")
+        try expect(EpochState.from("garbage") == .unknown, "a broken epoch decodes unknown")
+
+        try expect(SwitchRoute.route(for: .v1) == .swap, "v1 Switch = in-place swap")
+        try expect(SwitchRoute.route(for: .unknown) == .swap, "unknown epoch stays on the safe swap path")
+        // (rollback-day) shadow now takes the v1 SEAMLESS swap, not a repoint — the owner rejected
+        // pin-at-launch and wants mid-session turn-level pickup. Only v2 repoints.
+        try expect(SwitchRoute.route(for: .shadow) == .swap, "shadow Switch = v1 seamless swap (rollback-day)")
+        try expect(SwitchRoute.route(for: .v2) == .repoint, "v2 Switch = repoint")
+        try expect(!SwitchRoute.swap.offersRestart, "an in-place swap offers no restart")
+        try expect(SwitchRoute.repoint.offersRestart, "a repoint offers to restart idle sessions")
+        try expect(SwitchRoute.swap.actionTitle == "Swap here", "v1/shadow button reads 'Swap here'")
+        try expect(SwitchRoute.repoint.actionTitle == "Switch here", "v2 button reads 'Switch here'")
+        // shadow still runs the archiver/registry, so health chrome stays visible under shadow.
+        try expect(EpochState.v2.showsHealth && EpochState.shadow.showsHealth, "health shows under shadow|v2")
+        try expect(!EpochState.v1.showsHealth && !EpochState.unknown.showsHealth, "health hidden under v1/unknown")
+    }
+
+    // (rollback-day) The v1 swap argv: --expect-active is appended ONLY when the active account
+    // is known (non-empty and not the target itself), so a stale click can't clobber a newer swap.
+    private static func testSwapInvocationArguments() throws {
+        let swap = "/x/swap-account.sh"
+        try expect(
+            SwapInvocation.arguments(swapScript: swap, target: "b@x.com", activeEmail: "a@x.com")
+                == [swap, "b@x.com", "--expect-active", "a@x.com"],
+            "known active is passed as --expect-active"
+        )
+        try expect(
+            SwapInvocation.arguments(swapScript: swap, target: "b@x.com", activeEmail: nil)
+                == [swap, "b@x.com"],
+            "unknown active omits the guard flag"
+        )
+        try expect(
+            SwapInvocation.arguments(swapScript: swap, target: "b@x.com", activeEmail: "")
+                == [swap, "b@x.com"],
+            "empty active omits the guard flag"
+        )
+        try expect(
+            SwapInvocation.arguments(swapScript: swap, target: "b@x.com", activeEmail: "b@x.com")
+                == [swap, "b@x.com"],
+            "active == target omits the (nonsensical) guard flag"
+        )
+    }
+
+    // The two halves of the queued-swap race fix: no second swap may be enqueued behind the
+    // first (its --expect-active would already be stale), and if one somehow loses the race
+    // anyway, the card explains it instead of printing the script's lock diagnostic.
+    private static func testQueuedSwapRaceGuards() throws {
+        try expect(!SwitchGate.isBlocked(busyKinds: []), "an idle bank blocks nothing")
+        try expect(
+            !SwitchGate.isBlocked(busyKinds: ["ping", "autoping", "remove"]),
+            "non-switch actions must never disable Swap"
+        )
+        try expect(
+            SwitchGate.isBlocked(busyKinds: ["ping", SwitchGate.switchKind]),
+            "a switch anywhere in the busy table disables Swap on EVERY card"
+        )
+
+        try expect(
+            SwapFailureText.message(isSwitch: true, exitCode: 3, stderrLine: "aborted: active is b@example.com")
+                == SwapFailureText.staleActive,
+            "rc 3 from swap-account.sh reads as a retry instruction, not raw stderr"
+        )
+        try expect(
+            SwapFailureText.message(isSwitch: true, exitCode: 1, stderrLine: "no such account")
+                == "no such account",
+            "other swap failures keep their own message"
+        )
+        try expect(
+            SwapFailureText.message(isSwitch: false, exitCode: 3, stderrLine: "rc 3 from some other script")
+                == "rc 3 from some other script",
+            "the rc-3 mapping is scoped to swap/switch actions"
+        )
+        try expect(
+            SwapFailureText.message(isSwitch: true, exitCode: nil, stderrLine: "Script failed")
+                == "Script failed",
+            "a failure with no exit status (launch/timeout) is untouched"
+        )
+    }
+
+    // monitor_only decodes, and a v2 monitor-only home is NEVER offered the v1 Remove affordance
+    // (it has no bank record; remove-account.sh would fence/fail on it).
+    private static func testMonitorOnlyDecodeAndRemoveGuard() throws {
+        let json = #"""
+        {
+          "generated_at": "2026-07-24T05:00:00Z",
+          "epoch": "v2",
+          "accounts": [
+            {"provider": "claude", "email": "home@x.com", "active": false,
+             "monitor_only": true, "cooldown_until": 1900000000}
+          ]
+        }
+        """#
+        let snapshot = try UsageSnapshot.decode(from: Data(json.utf8))
+        try expect(snapshot.epochState == .v2, "epoch field decodes")
+        let home = snapshot.accounts[0]
+        try expect(home.isMonitorOnly, "monitor_only decodes")
+        try expect(home.cooldownUntilDate == Date(timeIntervalSince1970: 1_900_000_000),
+                   "cooldown_until decodes to an absolute date")
+        try expect(!RemoveAccountPolicy.canRemove(home),
+                   "a v2 monitor-only home must NOT show the v1 Remove affordance")
+        // an ordinary parked v1 account still shows Remove
+        let parked = makeAccount(email: "parked@x.com", active: false, fetchedAt: 1_000)
+        try expect(RemoveAccountPolicy.canRemove(parked), "an ordinary parked account still shows Remove")
+    }
+
+    // A pre-v2 usage.py payload (no epoch/health) decodes cleanly to v1 + no health.
+    private static func testEpochHealthCooldownDecode() throws {
+        let legacy = try UsageSnapshot.decode(from: Data(sampleFixture.utf8))
+        try expect(legacy.epochState == .v1, "a payload without an epoch field is treated as v1")
+        try expect(legacy.health == nil, "a payload without health decodes health = nil")
+    }
+
+    private static func testHealthAnomalies() throws {
+        func health(from json: String) throws -> Health {
+            try JSONDecoder().decode(Health.self, from: Data(json.utf8))
+        }
+        // healthy: fresh heartbeat, no blind, no drift, no seed audit -> nothing shows.
+        let healthy = try health(from: #"{"archiver":{"heartbeat_age":5,"epoch_parked":false,"blind_homes":[]}}"#)
+        try expect(HealthPresentation.archiverWarning(healthy, epoch: .v2) == nil, "healthy archiver = no warning")
+        try expect(HealthPresentation.isHealthy(healthy, epoch: .v2, seedAuditAckTs: 0), "healthy payload shows no chrome")
+        // v1 hides all health even when the payload is anomalous.
+        let blind = try health(from: #"{"archiver":{"heartbeat_age":5,"epoch_parked":false,"blind_homes":["/h/a"]}}"#)
+        try expect(HealthPresentation.archiverWarning(blind, epoch: .v1) == nil, "v1 hides archiver health")
+        try expect(HealthPresentation.archiverWarning(blind, epoch: .v2) != nil, "a blind home warns under v2")
+        // stale heartbeat (>10m) warns; just under does not.
+        let stale = try health(from: #"{"archiver":{"heartbeat_age":601,"blind_homes":[]}}"#)
+        let fresh = try health(from: #"{"archiver":{"heartbeat_age":600,"blind_homes":[]}}"#)
+        try expect(HealthPresentation.archiverWarning(stale, epoch: .v2) != nil, ">10m heartbeat warns")
+        try expect(HealthPresentation.archiverWarning(fresh, epoch: .v2) == nil, "exactly 10m does not warn")
+        // epoch_parked archiver never warns (deliberately idle after rollback).
+        let parked = try health(from: #"{"archiver":{"heartbeat_age":9999,"epoch_parked":true,"blind_homes":["/h/a"]}}"#)
+        try expect(HealthPresentation.archiverWarning(parked, epoch: .v2) == nil, "epoch_parked archiver is silent")
+        // fork drift.
+        let drift = try health(from: #"{"fork_drift":{"/h/a":["settings.json","x.json"]}}"#)
+        try expect(HealthPresentation.forkDriftLine(drift, epoch: .v2) != nil, "fork drift surfaces a line")
+        try expect(HealthPresentation.forkDriftLine(drift, epoch: .v1) == nil, "v1 hides fork drift")
+        // seed-audit review: newer than the ack surfaces; ack silences it.
+        let audit = try health(from: #"{"seed_audit":{"latest_ts":222,"latest_linked_count":3,"count":2}}"#)
+        try expect(HealthPresentation.seedAuditReview(audit, epoch: .v2, ackedTs: 100)?.count == 3,
+                   "an unacknowledged seeding event surfaces its shared-file count")
+        try expect(HealthPresentation.seedAuditReview(audit, epoch: .v2, ackedTs: 222) == nil,
+                   "acknowledging the latest ts silences the review line")
+        let emptyAudit = try health(from: #"{"seed_audit":{"latest_ts":222,"latest_linked_count":0,"count":2}}"#)
+        try expect(HealthPresentation.seedAuditReview(emptyAudit, epoch: .v2, ackedTs: 0) == nil,
+                   "a seeding that shared nothing shows no review line")
+    }
+
+    private static func testPingCooldownV2() throws {
+        let now = Date(timeIntervalSince1970: 100_000)
+        // v2 home cooldown_until wins over any v1 last_ping.
+        let v2 = makeAccount(email: "home@x.com", fetchedAt: 1_000,
+                             cooldownUntil: now.timeIntervalSince1970 + 300)
+        try expect(PingCooldown.remaining(for: v2, v1LastPing: nil, now: now) == 300,
+                   "a v2 home uses its absolute cooldown_until")
+        let expired = makeAccount(email: "home@x.com", fetchedAt: 1_000,
+                                  cooldownUntil: now.timeIntervalSince1970 - 5)
+        try expect(PingCooldown.remaining(for: expired, v1LastPing: nil, now: now) == 0,
+                   "a lapsed v2 cooldown clamps to zero")
+        // a v1 account (no cooldown_until) falls back to the last_ping window.
+        let v1 = makeAccount(email: "v1@x.com", fetchedAt: 1_000)
+        try expect(PingCooldown.remaining(for: v1, v1LastPing: now.addingTimeInterval(-1_800), now: now) == 0,
+                   "a v1 account 30m past its ping is eligible")
+        try expect(PingCooldown.remaining(for: v1, v1LastPing: now.addingTimeInterval(-1_799), now: now) == 1,
+                   "a v1 account 1799s in still has 1s of cooldown")
+    }
+
+    private static func testIdleSessionsParsing() throws {
+        let json = #"""
+        {
+          "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa": {"state": "IDLE", "home": "/homes/other"},
+          "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb": {"state": "BUSY", "home": "/homes/other"},
+          "cccccccc-cccc-cccc-cccc-cccccccccccc": {"state": "idle", "home": "/homes/target"},
+          "dddddddd-dddd-dddd-dddd-dddddddddddd": {"state": "RESTARTING", "home": "/homes/other"}
+        }
+        """#
+        // No target home => IDLE-only filter.
+        try expect(
+            IdleSessions.movableSessionIDs(fromListJSON: Data(json.utf8), targetHome: nil) == [
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            ],
+            "only IDLE sessions (case-insensitive) are restart candidates, sorted"
+        )
+        // (review #2) a session already pinned to the target home is excluded — moving it is a no-op.
+        try expect(
+            IdleSessions.movableSessionIDs(fromListJSON: Data(json.utf8), targetHome: "/homes/target") == [
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            ],
+            "an IDLE session already on the target home is not offered for restart"
+        )
+        try expect(
+            IdleSessions.movableSessionIDs(fromListJSON: Data("not json".utf8), targetHome: nil).isEmpty,
+            "malformed session list yields no candidates"
+        )
+    }
+
+    private static func testRuntimeMarkerPayload() throws {
+        try expect(RuntimeMarker.payload(pid: 4321) == "{\"pid\": 4321, \"epoch_aware\": true}\n",
+                   "runtime marker payload must match what attest-cutover.sh parses")
+    }
+
+    private static func testScriptsLocationResolution() throws {
+        // env dir wins when it exists.
+        try expect(
+            ScriptsLocation.choose(env: "/env/dir", candidates: ["/a", "/b"]) { $0 == "/env/dir" || $0 == "/a" } == "/env/dir",
+            "an existing QUOTABAR_SCRIPTS_DIR wins"
+        )
+        // env set but missing -> fall through to the first existing default.
+        try expect(
+            ScriptsLocation.choose(env: "/missing", candidates: ["/a", "/b"]) { $0 == "/b" } == "/b",
+            "a missing env dir falls through to the first existing default"
+        )
+        // no env -> first existing candidate (owner install before XDG).
+        try expect(
+            ScriptsLocation.choose(env: nil, candidates: ["/a", "/b"]) { $0 == "/a" || $0 == "/b" } == "/a",
+            "with no env, the owner install path is preferred over XDG"
+        )
+        try expect(
+            ScriptsLocation.choose(env: nil, candidates: ["/a", "/b"]) { _ in false } == nil,
+            "nothing exists -> nil (caller supplies a last-resort default)"
+        )
+    }
+
+    // (review #3) A stranded-lease restart (rc 75, "not registered / lease held") maps to a
+    // recovery hint, not a bare "Script failed"; refusals keep their reason; empty -> "failed".
+    private static func testRestartOutcomeMapping() throws {
+        try expect(
+            RestartOutcomeText.outcome(forFailureLine:
+                "successor not registered in time (phase SPAWNED); lease intentionally held — run: restart.py /acc recover sid-x")
+                == "needs recovery",
+            "a stranded lease maps to a recovery hint"
+        )
+        try expect(
+            RestartOutcomeText.outcome(forFailureLine: nil) == "failed",
+            "an empty/absent failure line reads 'failed', never blank"
+        )
+        try expect(
+            RestartOutcomeText.outcome(forFailureLine: "Script failed") == "failed",
+            "the generic 'Script failed' is normalized to 'failed'"
+        )
+        try expect(
+            RestartOutcomeText.outcome(forFailureLine: "restart refused: no READY home for x@x.com")
+                == "restart refused: no READY home for x@x.com",
+            "a refusal keeps its reason"
+        )
+    }
+
+    // (review #1) A window with utilization:null must NOT throw valueNotFound and blank the whole
+    // snapshot — it decodes to a window with no data (nil), and other accounts stay intact.
+    private static func testNullUtilizationDecodesTolerantly() throws {
+        let json = #"""
+        {
+          "generated_at": "2026-07-24T05:00:00Z",
+          "epoch": "v2",
+          "accounts": [
+            {"provider": "claude", "email": "home@x.com", "active": false, "monitor_only": true,
+             "five_hour": {"utilization": null, "resets_at": "2026-07-24T07:00:00Z"},
+             "seven_day": {"utilization": null, "resets_at": null}},
+            {"provider": "claude", "email": "good@x.com", "active": true,
+             "five_hour": {"utilization": 42, "resets_at": "2026-07-24T07:00:00Z"}}
+          ]
+        }
+        """#
+        let snapshot = try UsageSnapshot.decode(from: Data(json.utf8))
+        try expect(snapshot.accounts.count == 2,
+                   "a null-utilization window must not drop the whole snapshot")
+        let home = snapshot.accounts[0]
+        try expect(home.fiveHour != nil && home.fiveHour?.utilization == nil,
+                   "a null utilization decodes to a window with no data (nil), never a throw")
+        try expect(home.fiveHour?.hasData == false, "hasData is false for a null-utilization window")
+        try expect(home.sevenDay?.utilization == nil, "the seven_day null variant also decodes tolerantly")
+        try expect(snapshot.accounts[1].fiveHour?.utilization == 42,
+                   "a real utilization still decodes intact")
+    }
+
     private static func makeAccount(
         provider: String = "claude",
         email: String,
         active: Bool = false,
         fetchedAt: Double?,
         staleEntry: Bool? = nil,
-        error: String? = nil
+        error: String? = nil,
+        monitorOnly: Bool? = nil,
+        cooldownUntil: Double? = nil
     ) -> UsageAccount {
         UsageAccount(
             provider: provider,
@@ -931,7 +1329,11 @@ struct QuotaBarTests {
             worstLimit: nil,
             modelCap: nil,
             staleEntry: staleEntry,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            unresolved: nil,
+            metadataEmail: nil,
+            monitorOnly: monitorOnly,
+            cooldownUntil: cooldownUntil
         )
     }
 

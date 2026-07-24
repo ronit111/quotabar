@@ -26,7 +26,19 @@ else
   SELF_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 fi
 
-out="$(python3 "$SELF_DIR/usage.py" 2>/dev/null)"
+# usage.py is INTERNALLY bounded (finding #55): a wall-clock TOTAL_DEADLINE plus
+# per-refresh budget caps its runtime and lock-hold — so this wrapper needs no
+# external kill (an external SIGKILL here could tear a lock-owning operation). We
+# only pass an explicit deadline and capture stderr diagnostics (redacted) to a
+# 0600 log rather than discarding them.
+_errlog="$SELF_DIR/.swiftbar-usage.err"
+out="$(ACCOUNT_BANK_TOTAL_DEADLINE="${ACCOUNT_BANK_TOTAL_DEADLINE:-45}" \
+       python3 "$SELF_DIR/usage.py" 2>>"$_errlog")"
+chmod 600 "$_errlog" 2>/dev/null || true
+# trim the err log if it grows
+if [ -f "$_errlog" ] && [ "$(wc -c <"$_errlog" 2>/dev/null || echo 0)" -gt 65536 ]; then
+  tail -c 32768 "$_errlog" > "$_errlog.tmp" 2>/dev/null && mv -f "$_errlog.tmp" "$_errlog"
+fi
 if [ -z "$out" ]; then
   echo "⚡ ? | color=gray"
   echo "---"

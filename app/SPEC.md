@@ -40,9 +40,10 @@ Layout top to bottom:
 
 ## DO NOT
 - Do NOT read or write the macOS Keychain, `<bank-dir>/*.json` beyond the read-only fields listed, or any credential material. Scripts are the only actuators.
-- Do NOT make any network calls. The app's only I/O: the account-bank scripts (usage.py, ping/swap/bank/toggle-autoping), the resolved `codex` binary, the bank-dir reads listed, UserDefaults for its own prefs (launch-at-login, `codexLastPing`), one plain-text failure log at `~/Library/Logs/QuotaBar.log` (diagnostic messages only, never token/credential material), and `NSPasteboard` for the user-invoked "Copy usage summary". Nothing else touches the filesystem or network. The Makefile `audit` rule enforces exactly this surface.
+- Do NOT make any network calls. The app's only I/O: the account-bank scripts (usage.py, ping/swap/bank/toggle-autoping, and the v2 seam scripts `claude-acct`, `sessions.py`, `restart.py`), the resolved `codex` binary, an `osascript` launch of Terminal for the owner-interactive add-account flow, the bank-dir reads listed, UserDefaults for its own prefs (launch-at-login, `codexLastPing`, `seedAuditAckTs`), one plain-text failure log at `~/Library/Logs/QuotaBar.log` (diagnostic messages only, never token/credential material), the epoch-aware runtime marker (below), and `NSPasteboard` for the user-invoked "Copy usage summary". Nothing else touches the filesystem or network. The Makefile `audit` rule enforces exactly this surface.
+- **Allowed write under accounts/ — the runtime marker (v2):** on launch the app writes `accounts/quotabar.runtime.json` = `{"pid": <pid>, "epoch_aware": true}` (atomic, 0600), keeps it fresh, and removes it on a clean quit. This is the SOLE file the app writes under `~/.claude/`; `attest-cutover.sh` fails closed unless the RUNNING QuotaBar pid matches an epoch-aware marker. It carries no credential material. The `audit` rule pins Services.swift to exactly the 2 log writes + this 1 marker write, and to exactly one `removeItem` (the marker teardown).
 - Do NOT bundle, log, or display tokens. Do NOT add analytics.
-- Do NOT modify anything under ~/.claude/ (scripts belong to another system).
+- Do NOT modify anything under ~/.claude/ (scripts belong to another system), EXCEPT the app's own runtime marker at `accounts/quotabar.runtime.json` (above).
 - Do NOT disable or uninstall the SwiftBar plugin — switchover is handled separately after verification.
 - Do NOT auto-enable launch-at-login; it's an off-by-default toggle.
 - Do NOT invent extra features beyond this spec.

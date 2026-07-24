@@ -6,7 +6,9 @@ exit 0 only if it is a well-formed Claude credential blob. Explicit schema check
 Prints nothing on success; a short reason to stderr on failure. Never echoes the
 secret.
 """
-import sys, json
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bank_common   # the SINGLE credential validator (re-review issue 6)
 
 def fail(msg):
     sys.stderr.write(f"blob invalid: {msg}\n")
@@ -22,17 +24,11 @@ except Exception as e:
 if not isinstance(b, dict):
     fail("top-level not object")
 oa = b.get("claudeAiOauth")
-if not isinstance(oa, dict):
-    fail("missing claudeAiOauth object")
-at = oa.get("accessToken")
-rt = oa.get("refreshToken")
-exp = oa.get("expiresAt")
-if not isinstance(at, str) or not at:
-    fail("accessToken missing/empty")
-if not isinstance(rt, str) or not rt:
-    fail("refreshToken missing/empty")
-if not isinstance(exp, (int, float)):
-    fail("expiresAt missing/not numeric")
+# Route through the shared validator so shell + Python agree on exactly what a
+# valid credential is (accessToken+refreshToken non-empty strings, numeric-but-
+# NOT-boolean expiresAt). A stray `True`/`False` expiresAt is rejected here too.
+if not bank_common.valid_oauth(oa):
+    fail("claudeAiOauth missing/invalid (need accessToken+refreshToken+numeric expiresAt)")
 # reject whitespace: security -i tokenizes the blob on the command line by
 # whitespace, so a compact (space-free) blob is required for a safe write.
 if any(ch.isspace() for ch in raw.strip()):

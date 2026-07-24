@@ -39,13 +39,22 @@ struct UsageSnapshot: Decodable, Sendable {
     let stale: Bool?
     let staleReason: String?
     let accounts: [UsageAccount]
+    /// (v2 wiring) The protocol epoch state usage.py emits, driving Switch/health routing.
+    /// Absent (pre-v2 usage.py) decodes nil and is treated as v1 (the pre-v2 world).
+    let epoch: String?
+    /// (v2 wiring) Anomaly-only health surface; nil/empty in the healthy state.
+    let health: Health?
 
     enum CodingKeys: String, CodingKey {
         case generatedAt = "generated_at"
         case stale
         case staleReason = "stale_reason"
         case accounts
+        case epoch
+        case health
     }
+
+    var epochState: EpochState { EpochState.from(epoch) }
 
     static func decode(from data: Data) throws -> UsageSnapshot {
         let decoder = JSONDecoder()
@@ -90,7 +99,9 @@ struct UsageSnapshot: Decodable, Sendable {
             accounts: accounts.map { account in
                 guard account.isClaude else { return account }
                 return account.withActive(account.email == email)
-            }
+            },
+            epoch: epoch,
+            health: health
         )
     }
 
@@ -126,7 +137,12 @@ enum PlanCapsulePresentation {
 /// visibility and the confirmation copy can be unit-tested without a view.
 enum RemoveAccountPolicy {
     static func canRemove(_ account: UsageAccount) -> Bool {
-        account.isClaude && !account.active
+        // An unresolved entry has no bank record to remove; showing Remove would also
+        // leak the sentinel into the confirmation strip. (A stale-cache unresolved
+        // entry can arrive active=false, so !active alone is not enough.)
+        // A v2 monitor-only home has NO v1 bank record either — remove-account.sh (a v1
+        // op) would fence/fail on it; un-seeding a home is a separate, owner-driven flow.
+        account.isClaude && !account.active && !account.isUnresolved && !account.isMonitorOnly
     }
 
     static func confirmationTitle(email: String) -> String {
@@ -236,11 +252,37 @@ struct UsageAccount: Decodable, Identifiable, Sendable {
     let modelCap: WorstLimit?
     let staleEntry: Bool?
     let fetchedAt: Double?
+    let unresolved: Bool?
+    let metadataEmail: String?
+    /// (r13 #7) A v2 READY home whose credential is owned by the home CLI / archiver — usage.py
+    /// never legacy-refreshes it. It has no v1 bank record, so v1 actuators (remove/re-bank)
+    /// must never target it; its Ping routes through ping-account.sh's shadow|v2 home path.
+    let monitorOnly: Bool?
+    /// (r12 #13) Absolute epoch seconds until this v2 home's Ping is eligible again, from
+    /// <home>/.ping-marker.json via usage.py. The app never reads that file itself.
+    let cooldownUntil: Double?
 
     var id: String { "\(provider):\(email)" }
     var isClaude: Bool { provider.lowercased() == "claude" }
     var isCodex: Bool { provider.lowercased() == "codex" }
+    var isMonitorOnly: Bool { monitorOnly == true }
     var needsRelogin: Bool { status?.lowercased() == "needs-relogin" }
+    /// A v2 home's Ping cooldown deadline (absolute), or nil when not cooling down.
+    var cooldownUntilDate: Date? {
+        guard let cooldownUntil, cooldownUntil.isFinite, cooldownUntil > 0 else { return nil }
+        return Date(timeIntervalSince1970: cooldownUntil)
+    }
+    /// The keychain login the backend could not attribute to any banked account
+    /// (fail-closed identity). The sentinel-email fallback covers a stale cache
+    /// written before the backend emitted the structured flag.
+    var isUnresolved: Bool { unresolved == true || email == "(active/unresolved)" }
+    /// What the card header shows. The raw sentinel string is an internal state
+    /// name and must never reach the UI.
+    var displayName: String {
+        guard isUnresolved else { return email }
+        if let metadataEmail, !metadataEmail.isEmpty { return metadataEmail }
+        return "New login"
+    }
     var isCachedEntry: Bool {
         staleEntry == true || hasError
     }
@@ -269,18 +311,25 @@ struct UsageAccount: Decodable, Identifiable, Sendable {
             worstLimit: worstLimit,
             modelCap: modelCap,
             staleEntry: staleEntry,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            unresolved: unresolved,
+            metadataEmail: metadataEmail,
+            monitorOnly: monitorOnly,
+            cooldownUntil: cooldownUntil
         )
     }
 
     enum CodingKeys: String, CodingKey {
-        case provider, email, active, plan, status, error
+        case provider, email, active, plan, status, error, unresolved
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case worstLimit = "worst_limit"
         case modelCap = "model_cap"
         case staleEntry = "stale_entry"
         case fetchedAt = "fetched_at"
+        case metadataEmail = "metadata_email"
+        case monitorOnly = "monitor_only"
+        case cooldownUntil = "cooldown_until"
     }
 }
 
@@ -369,6 +418,28 @@ enum AccountFreshness {
     }
 }
 
+/// Plain-language lead-in for the popover's top "cached data" badge. The backend fail-softs to the
+/// last-good reading on any transient upstream failure (429/403/5xx/network) and marks the served
+/// entry `stale_entry` — but that served entry is the PREVIOUS GOOD one and no longer carries the
+/// failing run's error, so a cached-with-data entry usually can't be attributed to rate-limiting.
+/// A "rate-limited" claim is therefore only honest when a 429 marker actually survives in the
+/// snapshot: the active account's `error` string (present when there was no cache to fall back to,
+/// e.g. "HTTP 429"), or a snapshot-level `stale_reason`. Absent that we say the honest generic
+/// thing. Pure so the wording can be unit-tested without a view.
+enum CachedDataBadgeText {
+    static func headline(activeError: String?, staleReason: String?) -> String {
+        if mentionsRateLimit(activeError) || mentionsRateLimit(staleReason) {
+            return "rate-limited · cached"
+        }
+        return "cached data"
+    }
+
+    private static func mentionsRateLimit(_ text: String?) -> Bool {
+        guard let text = text?.lowercased() else { return false }
+        return text.contains("429") || text.contains("rate limit") || text.contains("rate-limit")
+    }
+}
+
 enum UsagePollMode: Equatable, Sendable {
     case regular
     case forceFresh(String)
@@ -441,8 +512,15 @@ enum SwitchTimingDiagnostics {
 }
 
 struct UsageLimit: Decodable, Sendable {
-    let utilization: Double
+    /// (review #1) Tolerant: the backend may emit `{"utilization": null}` for a window with no
+    /// active data (a monitor-only home with no live window). Optional so an explicit null
+    /// decodes to nil (via decodeIfPresent) INSTEAD of throwing valueNotFound and dropping the
+    /// whole snapshot. Presentation treats nil as "no window" — never 0% masquerading as data.
+    let utilization: Double?
     let resetsAt: Date?
+
+    /// A window worth rendering: it has a real utilization value.
+    var hasData: Bool { utilization != nil }
 
     enum CodingKeys: String, CodingKey {
         case utilization
@@ -690,5 +768,207 @@ enum CodexPing {
         guard remaining > 0 else { return "Ping" }
         let minutes = max(1, Int(ceil(remaining / 60)))
         return "Ping · \(minutes)m"
+    }
+}
+
+// MARK: - v2 wiring: epoch, Switch routing, health, ping cooldown
+
+/// The protocol epoch usage.py reports (`epoch` field). Absent/nil == the pre-v2 world (v1);
+/// "unknown" is a present-but-broken EPOCH, where the app stays on the safe v1 Switch path —
+/// the scripts fence a real mutation regardless, so the worst case is a surfaced script error.
+enum EpochState: String, Sendable, Equatable {
+    case v1, shadow, v2, unknown
+
+    static func from(_ raw: String?) -> EpochState {
+        switch raw?.lowercased() {
+        case "shadow": return .shadow
+        case "v2": return .v2
+        case "v1", "", nil: return .v1
+        default: return .unknown
+        }
+    }
+
+    /// (rollback-day) Only v2 repoints the Switch (future launches + assisted restart). Under
+    /// v1 AND shadow the Switch is the v1 SEAMLESS swap (swap-account.sh): the owner rejected
+    /// pin-at-launch and wants mid-session turn-level pickup, accepting v1's failure modes. So
+    /// shadow, which still runs the archiver/registry (hence showsHealth), no longer repoints.
+    /// unknown stays on the safe swap path too (a real mutation is script-fenced regardless).
+    var usesRepointSwitch: Bool { self == .v2 }
+    /// Health chrome (archiver / fork-drift / seed-audit) is only meaningful once the v2
+    /// layer is live; under v1 there is no archiver/registry to be anomalous about.
+    var showsHealth: Bool { self == .shadow || self == .v2 }
+}
+
+/// Pure Switch-routing decision: which script "Switch here" runs, and whether to offer an
+/// assisted restart afterward. Side-effect-free so the routing table is a contract test.
+enum SwitchRoute: Equatable, Sendable {
+    case swap        // v1 / shadow / unknown: swap-account.sh <email> (in-place keychain swap)
+    case repoint     // v2 only: claude-acct --switch <email> (future launches) + restart offer
+
+    static func route(for epoch: EpochState) -> SwitchRoute {
+        epoch.usesRepointSwitch ? .repoint : .swap
+    }
+
+    var offersRestart: Bool { self == .repoint }
+
+    /// (rollback-day) The card action-button label. Under v1/shadow the button is the v1
+    /// seamless "Swap here"; under v2 it stays "Switch here" (a repoint of future launches).
+    var actionTitle: String { self == .repoint ? "Switch here" : "Swap here" }
+}
+
+/// Pure builder for the v1 seamless swap invocation (swap-account.sh). When the active account
+/// is known from the SAME payload the UI rendered, it appends `--expect-active <active>` so a
+/// stale click can't clobber a newer swap: swap-account.sh aborts (rc 3) under its lock if the
+/// live active account no longer matches. Side-effect-free so the argv is a contract test. (rollback-day)
+enum SwapInvocation {
+    static func arguments(swapScript: String, target: String, activeEmail: String?) -> [String] {
+        var args = [swapScript, target]
+        if let active = activeEmail, !active.isEmpty, active != target {
+            args.append(contentsOf: ["--expect-active", active])
+        }
+        return args
+    }
+}
+
+/// One swap at a time, across every card. A queued swap carries the `--expect-active` snapshot it
+/// was built from, so a second swap enqueued behind it runs against an expectation the first one
+/// has already invalidated and aborts under the lock (rc 3). Per-card disabling doesn't catch that
+/// — clicking B then C enqueues two — so the gate is global over the whole busy table.
+enum SwitchGate {
+    /// `AppModel.ActionKind.switchAccount.rawValue` (also the string the card views match on).
+    static let switchKind = "switch"
+
+    static func isBlocked(busyKinds: some Sequence<String>) -> Bool {
+        busyKinds.contains(switchKind)
+    }
+}
+
+/// Card copy for a failed swap. swap-account.sh exits 3 when its `--expect-active` guard finds a
+/// different active account under the lock: another swap landed first, so this click was built
+/// from a stale view. Its stderr is a lock diagnostic; the card says what to do instead.
+enum SwapFailureText {
+    static let staleActive = "Active account changed — try again"
+
+    static func message(isSwitch: Bool, exitCode: Int32?, stderrLine: String) -> String {
+        isSwitch && exitCode == 3 ? staleActive : stderrLine
+    }
+}
+
+/// The health payload usage.py emits (`health`). Every field is optional and absent in the
+/// healthy state, so the popover renders no health chrome unless something is genuinely wrong.
+struct Health: Decodable, Sendable {
+    struct Archiver: Decodable, Sendable {
+        let heartbeatAge: Int?
+        let epochParked: Bool?
+        let blindHomes: [String]?
+        enum CodingKeys: String, CodingKey {
+            case heartbeatAge = "heartbeat_age"
+            case epochParked = "epoch_parked"
+            case blindHomes = "blind_homes"
+        }
+    }
+    struct SeedAudit: Decodable, Sendable {
+        let latestTs: Int?
+        let latestLinkedCount: Int?
+        let count: Int?
+        enum CodingKeys: String, CodingKey {
+            case latestTs = "latest_ts"
+            case latestLinkedCount = "latest_linked_count"
+            case count
+        }
+    }
+    let archiver: Archiver?
+    let forkDrift: [String: [String]]?
+    let seedAudit: SeedAudit?
+    enum CodingKeys: String, CodingKey {
+        case archiver
+        case forkDrift = "fork_drift"
+        case seedAudit = "seed_audit"
+    }
+}
+
+/// Pure anomaly reducer: turns the health payload + epoch into the SMALL set of lines the
+/// popover may show. Everything returns nil/empty in the healthy state, so the view renders
+/// no health chrome. Thresholds live here, one place — mirroring how freshness thresholds do.
+enum HealthPresentation {
+    static let archiverStaleThreshold = 600.0   // heartbeat stale past 10 min (task)
+
+    /// ONE compact warning when the archiver heartbeat is stale (>10m) OR any home is blind.
+    /// Only meaningful under shadow|v2; nil otherwise. An epoch_parked archiver (deliberately
+    /// idle after a rollback to v1) never trips this — v1 hides health entirely.
+    static func archiverWarning(_ health: Health?, epoch: EpochState) -> String? {
+        guard epoch.showsHealth, let a = health?.archiver, a.epochParked != true else { return nil }
+        let blindCount = (a.blindHomes ?? []).count
+        let stale = Double(a.heartbeatAge ?? 0) > archiverStaleThreshold
+        switch (blindCount > 0, stale) {
+        case (true, true):
+            return "Archiver stalled — \(blindCount) home\(plural(blindCount)) unwatched"
+        case (true, false):
+            return "\(blindCount) home\(plural(blindCount)) unwatched by the archiver"
+        case (false, true):
+            let mins = Int((Double(a.heartbeatAge ?? 0) / 60).rounded())
+            return "Archiver heartbeat stale (\(mins)m)"
+        case (false, false):
+            return nil
+        }
+    }
+
+    /// Fork-drift line: shared files that diverged in one or more homes (needs reconcile).
+    static func forkDriftLine(_ health: Health?, epoch: EpochState) -> String? {
+        guard epoch.showsHealth, let drift = health?.forkDrift, !drift.isEmpty else { return nil }
+        let files = Set(drift.values.flatMap { $0 }).count
+        let homes = drift.count
+        return "Fork drift in \(homes) home\(plural(homes)) · \(files) shared file\(plural(files))"
+    }
+
+    /// Seed-audit review: surfaced only when a seeding event NEWER than the acknowledged
+    /// timestamp shared files into homes. Dismissal (ack = latestTs) persists app-side so the
+    /// line stays quiet once seen, reappearing only when a later seeding shares more.
+    static func seedAuditReview(
+        _ health: Health?, epoch: EpochState, ackedTs: Int
+    ) -> (ts: Int, count: Int)? {
+        guard epoch.showsHealth, let sa = health?.seedAudit,
+              let ts = sa.latestTs, ts > ackedTs, (sa.latestLinkedCount ?? 0) > 0
+        else { return nil }
+        return (ts, sa.latestLinkedCount ?? 0)
+    }
+
+    /// True when NOTHING is anomalous — the popover shows no health chrome at all.
+    static func isHealthy(_ health: Health?, epoch: EpochState, seedAuditAckTs: Int) -> Bool {
+        archiverWarning(health, epoch: epoch) == nil
+            && forkDriftLine(health, epoch: epoch) == nil
+            && seedAuditReview(health, epoch: epoch, ackedTs: seedAuditAckTs) == nil
+    }
+
+    private static func plural(_ n: Int) -> String { n == 1 ? "" : "s" }
+}
+
+/// Maps a restart.py failure line to a compact per-session outcome (review #3). A stranded lease
+/// — a successor spawned but not registered in time (rc 75) — becomes a recovery hint rather than
+/// a bare "Script failed"; a refusal keeps its reason; an empty/generic line reads "failed".
+enum RestartOutcomeText {
+    static func outcome(forFailureLine line: String?) -> String {
+        let l = (line ?? "").lowercased()
+        if l.contains("lease intentionally held") || l.contains("not registered")
+            || l.contains("did not complete") {
+            return "needs recovery"
+        }
+        if l.hasPrefix("restart refused") || l.contains("aborted") {
+            return line ?? "failed"
+        }
+        let trimmed = (line ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed.isEmpty || l == "script failed") ? "failed" : trimmed
+    }
+}
+
+/// Ping-cooldown remaining for a card: a v2 home's absolute `cooldown_until` (from usage.py)
+/// takes precedence; otherwise the v1 per-account last_ping window. Pure so the presentation
+/// is unit-tested without pressing Ping.
+enum PingCooldown {
+    static func remaining(for account: UsageAccount, v1LastPing: Date?, now: Date) -> TimeInterval {
+        if let until = account.cooldownUntilDate {
+            return max(0, until.timeIntervalSince(now))
+        }
+        return TimeFormatting.cooldownRemaining(lastPing: v1LastPing, now: now)
     }
 }

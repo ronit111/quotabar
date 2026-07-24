@@ -1,0 +1,69 @@
+#!/bin/bash
+# Stub `claude` for account-bank tests. Emulates a parked-refresh turn run inside
+# an isolated CLAUDE_CONFIG_DIR. Behaviour via $STUB_CLAUDE_MODE:
+#   ok        : rotate the token in $CLAUDE_CONFIG_DIR/.credentials.json, exit 0
+#   norotate  : turn runs fine, token NOT rotated, exit 0
+#   authfail  : print the confirmed OAuth-death signature to STDOUT, exit 1 (dead)
+#   forbidden : print an ambiguous 403 to STDOUT, exit 1 (must stay TRANSIENT)
+#   nonzero   : print a generic error, exit 1 (transient)
+#   timeout   : sleep well past the caller's timeout (tests whole-group kill)
+# It ignores all args (prompt on argv) except reads CLAUDE_CONFIG_DIR.
+mode="${STUB_CLAUDE_MODE:-ok}"
+cred="$CLAUDE_CONFIG_DIR/.credentials.json"
+
+_rotate() {
+  python3 - "$cred" <<'PY'
+import json, sys, time
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {"claudeAiOauth": {}}
+o = d.get("claudeAiOauth", {})
+o["accessToken"] = "ROT-" + str(int(time.time() * 1000))
+o["refreshToken"] = (o.get("refreshToken", "r")) + "x"
+o["expiresAt"] = int((time.time() + 36000) * 1000)
+d["claudeAiOauth"] = o
+json.dump(d, open(p, "w"))
+PY
+}
+
+_metaonly() {   # change ONLY subscriptionType, not the credential fields (r3 #15)
+  python3 - "$cred" <<'PY'
+import json, sys
+p = sys.argv[1]
+try: d = json.load(open(p))
+except Exception: d = {"claudeAiOauth": {}}
+o = d.get("claudeAiOauth", {})
+o["subscriptionType"] = "max" if o.get("subscriptionType") != "max" else "pro"
+d["claudeAiOauth"] = o
+json.dump(d, open(p, "w"))
+PY
+}
+
+case "$mode" in
+  ok)          _rotate; echo "ok"; exit 0 ;;
+  rotate_fail) _rotate; echo "rotated but the turn then failed"; exit 1 ;;  # rotation + nonzero
+  metaonly)    _metaonly; echo "ok"; exit 0 ;;   # (r3 #15) plan-only change, NOT a rotation
+  torn)        _rotate; printf 'not json at all {' > "$cred"; echo "ok"; exit 0 ;;  # (r3 #6) torn readback
+  emptydict)   _rotate; printf '{}' > "$cred"; echo "ok"; exit 0 ;;  # (r4 #3) parseable but no oauth object
+  changed_malformed)   # (r4 #3) rotated refreshToken but the blob is MALFORMED (no expiresAt)
+    printf '{"claudeAiOauth":{"accessToken":"ROT-x","refreshToken":"rNEWx"}}' > "$cred"; echo "ok"; exit 0 ;;
+  become_active)  # (r3 #5) the parked account becomes ACTIVE during the turn, then rotates
+    if [ -n "${STUB_BECOME_EMAIL:-}" ] && [ -n "${CLAUDE_JSON:-}" ]; then
+      printf '{"oauthAccount":{"emailAddress":"%s"}}' "$STUB_BECOME_EMAIL" > "$CLAUDE_JSON"
+    fi
+    _rotate; echo "ok"; exit 0 ;;
+  mutate_kc)   # (r3 #18) active-ping turn under which the live keychain credential changes
+    if [ -n "${STUB_KC_FILE:-}" ]; then
+      printf '{"claudeAiOauth":{"accessToken":"CHANGED-%s","refreshToken":"rX","expiresAt":9999999999999,"subscriptionType":"max"}}' "$$" > "$STUB_KC_FILE"
+    fi
+    echo "ok"; exit 0 ;;
+  oauth403)    echo "API error: 403 Forbidden — OAuth token not permitted for this model"; exit 1 ;;
+  norotate)  echo "ok"; exit 0 ;;
+  authfail)  echo "Failed to authenticate: OAuth session expired and could not be refreshed"; exit 1 ;;
+  forbidden) echo "API error: 403 Forbidden (organization policy blocks this model)"; exit 1 ;;
+  nonzero)   echo "transient upstream error, please retry"; exit 1 ;;
+  timeout)   sleep 30; echo "late"; exit 0 ;;
+  *)         echo "ok"; exit 0 ;;
+esac

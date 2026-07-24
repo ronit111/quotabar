@@ -1,0 +1,10 @@
+{
+  "_comment": "QuotaBar v2 lifecycle hooks (rev 9 §13). TEMPLATE: __SCRIPTS_DIR__ is substituted by install.sh, which emits hooks-fragment.resolved.json — merge THAT into ~/.claude/settings.json hooks at SHADOW phase, never before. session-hook.sh self-gates on managed sessions, so these are no-ops for unmanaged/keychain sessions except the v2 escaped-launch telemetry.",
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "bash __SCRIPTS_DIR__/session-hook.sh start"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "bash __SCRIPTS_DIR__/session-hook.sh prompt"}]}],
+    "Notification": [{"hooks": [{"type": "command", "command": "bash __SCRIPTS_DIR__/session-hook.sh notify"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "bash __SCRIPTS_DIR__/session-hook.sh stop"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "bash __SCRIPTS_DIR__/session-hook.sh end"}]}]
+  }
+}

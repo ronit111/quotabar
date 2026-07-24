@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.quotabar.archiver</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__SCRIPTS_DIR__/archiverd.py</string>
+    </array>
+    <key>KeepAlive</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardErrorPath</key><string>/tmp/com.quotabar.archiver.err</string>
+    <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>

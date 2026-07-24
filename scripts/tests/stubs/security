@@ -1,0 +1,48 @@
+#!/bin/bash
+# Stub `security` for account-bank tests. The single keychain item is stored as a
+# raw blob in $STUB_KC_FILE. Behaviour is controlled by $STUB_KC_MODE:
+#   normal (default) : reads/writes the store honestly
+#   readfail         : find-generic-password exits nonzero (item "absent")
+#   writeignore      : `-i` accepts the write, exits 0, but the store is UNCHANGED
+#                      (simulates a write that reported success without landing)
+#   writefail        : `-i` exits nonzero, store unchanged
+#   writelate        : `-i` sleeps past the caller's timeout then writes (tests the
+#                      indeterminate/post-verify path)
+store="${STUB_KC_FILE:-/tmp/stub_kc.json}"
+mode="${STUB_KC_MODE:-normal}"
+cmd="$1"; shift
+case "$cmd" in
+  find-generic-password)
+    [ "$mode" = "readfail" ] && exit 44
+    if [ "$mode" = "empty_recheck" ]; then
+      # (r5 #1) first read returns the store; the SECOND+ read returns EMPTY/absent,
+      # simulating a keychain that becomes unreadable between kc_write's snapshot and
+      # its final pre-write re-read. The empty re-read must NOT bypass the gate.
+      cnt="${store}.rdcount"
+      n=$(cat "$cnt" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$cnt"
+      if [ "$n" -ge 2 ]; then exit 44; fi
+    fi
+    if [ "$mode" = "rotate_recheck" ]; then
+      # (r4 #2) first read returns the store; the SECOND+ read returns a ROTATED
+      # blob, simulating an external /login landing between kc_write's snapshot read
+      # and its write syscall.
+      cnt="${store}.rdcount"
+      n=$(cat "$cnt" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$cnt"
+      if [ "$n" -ge 2 ]; then
+        printf '{"claudeAiOauth":{"accessToken":"ROTATED","refreshToken":"rROT","expiresAt":333}}'
+        exit 0
+      fi
+    fi
+    if [ -f "$store" ]; then cat "$store"; exit 0; else exit 44; fi ;;
+  add-generic-password)
+    exit 0 ;;
+  -i)
+    read -r line
+    [ "$mode" = "writefail" ] && exit 1
+    [ "$mode" = "writeignore" ] && exit 0
+    [ "$mode" = "writelate" ] && sleep 30
+    blob="${line#*-w }"
+    printf '%s' "$blob" > "$store"
+    exit 0 ;;
+  *) exit 0 ;;
+esac

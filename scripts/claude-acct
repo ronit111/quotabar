@@ -1,0 +1,162 @@
+#!/bin/bash
+# claude-acct — pinned account launcher (ISOLATION-DESIGN.md rev 6 §3).
+#
+#   claude-acct <email> [claude args...]   launch pinned to <email>'s READY home
+#   claude-acct --back                     undo the last committed pointer switch
+#   claude-acct --current                  print the current pointer target's email
+#
+# Pinning NEVER touches the pointer: the email maps through the READY registry to a
+# real home path (r4: registry-mapped, never path construction), and the real home
+# path — never the pointer — becomes CLAUDE_CONFIG_DIR.
+#
+# Exit codes: 64 usage · 65 email unknown / home not READY · 67 real binary
+# unresolved · 78 epoch fence. Success never returns (exec).
+set -u
+
+ACCOUNTS_DIR="${ACCOUNT_BANK_DIR:-$HOME/.claude/accounts}"
+# (r10 #4) resolve the scripts dir like the shim (bin/claude) does: explicit env override,
+# else THIS script's own directory (so an installed claude-acct finds its sibling
+# add-account.sh / registry.py wherever it was installed — e.g. the XDG path — not a
+# hard-coded dev default), else the legacy default only if the self dir lacks the scripts.
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+SCRIPTS_DIR="${ACCOUNT_BANK_SCRIPTS_DIR:-$_SELF_DIR}"
+# fall back to the legacy default only if the resolved dir lacks the scripts (registry.py
+# is the primary-path dependency — same sanity check bin/claude uses).
+[ -f "$SCRIPTS_DIR/registry.py" ] || SCRIPTS_DIR="$HOME/.claude/scripts/account-bank"
+SHIM="$ACCOUNTS_DIR/bin/claude"
+[ -x "$SHIM" ] || SHIM="$SCRIPTS_DIR/bin/claude"
+
+fail() { echo "claude-acct: $2" >&2; exit "$1"; }
+[ $# -ge 1 ] || fail 64 "usage: claude-acct <email> [args...] | --back | --current"
+
+case "$1" in
+    --back)
+        python3 - "$ACCOUNTS_DIR" "$SCRIPTS_DIR" <<'EOF'
+import sys, os
+sys.path.insert(0, sys.argv[2])
+import repoint, registry
+acc = sys.argv[1]
+try:
+    r = repoint.back(acc, registry_check=lambda h: registry.is_ready_home(acc, h))
+    print(f"pointer restored -> {r['to']}")
+except repoint.EpochRefused as e:
+    # (r9 #7) repoint is shadow|v2 only; --back after a rollback to v1 is fenced (rc 78).
+    print(f"claude-acct --back: {e}", file=sys.stderr)
+    sys.exit(78)
+except repoint.RepointError as e:
+    print(f"claude-acct --back: {e}", file=sys.stderr)
+    sys.exit(65)
+EOF
+        exit $? ;;
+    --current)
+        python3 - "$ACCOUNTS_DIR" "$SCRIPTS_DIR" <<'EOF'
+import sys, os, json
+sys.path.insert(0, sys.argv[2])   # (finding 40) honor the configured scripts dir
+import repoint, registry
+acc = sys.argv[1]
+t = repoint.read_current(acc)
+if not t:
+    print("(no pointer)"); sys.exit(0)
+try:
+    reg = registry.load(acc)
+except registry.RegistryError:
+    print(t); sys.exit(0)
+for email, ent in reg.items():
+    if isinstance(ent, dict) and os.path.realpath(ent.get("home","")) == os.path.realpath(t):
+        print(email); sys.exit(0)
+print(t)
+EOF
+        exit $? ;;
+    --switch)
+        # QuotaBar Switch under shadow|v2: forward-repoint `accounts/current` at the target's
+        # READY home so FUTURE launches open on it (running sessions keep their pinned account;
+        # QuotaBar offers an assisted restart to move idle ones). This NEVER touches a live rail
+        # — repoint is bookkeeping (§4); pinning at launch is the actual credential selection.
+        # registry-gated (READY only) and epoch-gated inside repoint (shadow|v2 only). Exit:
+        # 65 email unknown / not READY, 78 epoch fence, 0 on success.
+        [ $# -ge 2 ] || fail 64 "usage: claude-acct --switch <email>"
+        python3 - "$ACCOUNTS_DIR" "$SCRIPTS_DIR" "$2" <<'EOF'
+import sys, os
+sys.path.insert(0, sys.argv[2])
+import repoint, registry
+acc, email = sys.argv[1], sys.argv[3]
+home = registry.ready_home(acc, email)
+if not home:
+    print(f"claude-acct --switch: no READY home for {email}", file=sys.stderr)
+    sys.exit(65)
+try:
+    r = repoint.repoint(acc, home, f"quotabar-switch:{email}",
+                        registry_check=lambda h: registry.is_ready_home(acc, h))
+    print(f"switched -> {email}")
+except repoint.EpochRefused as e:
+    print(f"claude-acct --switch: {e}", file=sys.stderr)
+    sys.exit(78)
+except repoint.RepointError as e:
+    print(f"claude-acct --switch: {e}", file=sys.stderr)
+    sys.exit(65)
+EOF
+        exit $? ;;
+    --add)
+        [ $# -ge 2 ] || fail 64 "usage: claude-acct --add <email>"
+        # (r11 #2) export the RESOLVED scripts dir so add-account.sh's `import bank_common`
+        # finds it on a clean XDG install (no legacy ~/.claude/scripts/account-bank). Without
+        # this the child defaults to the legacy path and seeding exits 64 on the import.
+        export ACCOUNT_BANK_SCRIPTS_DIR="$SCRIPTS_DIR"
+        exec bash "$SCRIPTS_DIR/add-account.sh" "$2" ;;
+    --*)
+        fail 64 "unknown option $1" ;;
+esac
+
+EMAIL="$1"; shift
+
+# (r2 new MAJOR) validate any --resume <id> / --resume=<id> as a canonical UUID BEFORE
+# launching — an arbitrary value would otherwise flow to claude and (via the session
+# registry / lease paths) become a filesystem component that could escape.
+uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+RESUME_SID=""
+prev=""
+for a in "$@"; do
+    case "$a" in
+        --resume=*)
+            v="${a#--resume=}"
+            [[ "$v" =~ $uuid_re ]] || fail 64 "--resume value is not a valid session UUID: $v"
+            RESUME_SID="$v" ;;
+    esac
+    if [ "$prev" = "--resume" ]; then
+        [[ "$a" =~ $uuid_re ]] || fail 64 "--resume value is not a valid session UUID: $a"
+        RESUME_SID="$a"
+    fi
+    prev="$a"
+done
+# (r3 MINOR3) a TRAILING bare `--resume` with no following value must be refused, not
+# passed through to the real CLI where it would consume the next flag or resume nothing.
+[ "$prev" = "--resume" ] && fail 64 "--resume requires a session UUID value (none given)"
+
+# (r10 #9 CRITICAL) refuse a --resume while the session's RESTART LEASE is held. A restart
+# transaction (restart.py) holds accounts/sessions/<sid>.lease/ from IDLE->RESTARTING until
+# REGISTERED; launching a SECOND resume of the same sid mid-restart is exactly the
+# duplicate-resume §0/G10 require the lease to refuse — and lease enforcement must live in
+# the PUBLIC launcher, not only in restart_session(). sessions.py prompt-gate exits 2 iff
+# the lease is held for the sid.
+if [ -n "$RESUME_SID" ]; then
+    # (r13 #1) the restart CONTROLLER holds the lease and launches this authorized resume — it
+    # passes ACCOUNT_BANK_RESUME_LEASE_TOKEN (the lease owner token it holds). lease-gate returns
+    # "owner" for that authorized resume (proceed), "free" when no lease (proceed), and "held"
+    # for an UNAUTHORIZED duplicate resume (refuse rc 75). This unblocks the controller's own
+    # resume while still refusing everyone else's — closing the r10 #9 regression.
+    # (r14 #3) FAIL CLOSED: only the documented "free" (no lease) or "owner" (authorized
+    # controller resume) outcomes proceed. ANYTHING else — "held", empty output, a python
+    # error (missing/invalid sessions.py), or garbage — REFUSES rc 75, surfacing the raw
+    # output. The r13 form only rejected the literal "held" and thus failed OPEN on any error.
+    _gate="$(python3 "$SCRIPTS_DIR/sessions.py" lease-gate "$ACCOUNTS_DIR" "$RESUME_SID" "${ACCOUNT_BANK_RESUME_LEASE_TOKEN:-}" 2>&1)"
+    case "$_gate" in
+        free|owner) : ;;   # no lease held, or the authorized controller's own resume -> proceed
+        *) fail 75 "refusing --resume for $RESUME_SID (restart-lease gate did not authorize; lease-gate said: '${_gate}')" ;;
+    esac
+fi
+
+HOME_PATH="$(python3 "$SCRIPTS_DIR/registry.py" ready-home "$ACCOUNTS_DIR" "$EMAIL")" \
+    || fail 65 "no READY home for $EMAIL (seed it: claude-acct --add coming via QuotaBar add-account flow)"
+
+export CLAUDE_ACCT_SHIM=1 CLAUDE_CONFIG_DIR="$HOME_PATH"
+exec "$SHIM" "$@"

@@ -161,7 +161,22 @@ def decide(doc, config, active_email):
     all_max_accts = [a for a in accounts if is_max(a)]
     all_pro_accts = [a for a in accounts if is_pro(a)]
 
+    # (finding #49) An account with an UNRECOGNIZED plan string might actually be a
+    # Max (or Pro) with headroom that we simply failed to classify. While any such
+    # account is present with usable data, we CANNOT prove a higher tier is
+    # exhausted — so it must BLOCK every tier-DOWN fallback (to pro or free). It is
+    # still never itself a swap target (that requires a literal plan).
+    unresolved_tier_present = any(
+        plan_tag(a) == "unknown"
+        and a.get("status") != "needs-relogin"
+        and not a.get("error")
+        and not a.get("stale_entry")
+        for a in accounts)
+
     def tier_exhausted(tier_accts, tier_elig):
+        # An unresolved-tier account anywhere blocks the claim of exhaustion.
+        if unresolved_tier_present:
+            return False
         return bool(tier_elig) and all(
             eligible(a) and (worst_of(a) or 0) >= MAX_EXHAUSTED for a in tier_accts)
 
