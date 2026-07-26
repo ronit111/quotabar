@@ -58,6 +58,15 @@ bank_record b@x.com B "" "$FUT" max claude_max
 /bin/bash "$AB_DIR/swap-account.sh" b@x.com >/dev/null 2>&1
 assert_file_absent "$BANK_DIR/.swap-journal.json" "(r15 #2) a completed swap leaves no journal behind"
 
+# The remaining sections exercise REPO-ROOT artifacts (install.sh, release.sh, README.md,
+# app/Makefile). In the byte-synced LIVE tree those are absent by design (documented
+# known-OK exceptions) — SKIP them there, same discipline as test_install_plist.sh;
+# the repo tree is where they are verified.
+if [ ! -f "$REPO/install.sh" ] || [ ! -f "$REPO/release.sh" ] || [ ! -d "$REPO/app" ]; then
+  echo "  ok   repo-root sections SKIPPED (live tree: install.sh/release.sh/app absent by design)"
+  finish "r15"; exit $?
+fi
+
 # ---- (r15 #9) the installer's bank-lock failure handler is REACHABLE under set -e ----
 # install.sh runs `set -euo pipefail`, which killed the shell the moment the merge exited 3
 # — so the `_merge_rc` capture and the "shim NOT staged" warning below it never ran.

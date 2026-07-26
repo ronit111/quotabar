@@ -195,6 +195,13 @@ assert_contains "rc == 6" "$(cat "$AB_DIR/account-warn.sh")" \
 # ---------------------------------------------------------------------------
 # (#3) release.sh cannot label an artifact with a version the bundle disagrees with
 # ---------------------------------------------------------------------------
+# Repo-root artifacts (app/Info.plist, release.sh) are absent in the byte-synced LIVE
+# tree by design (known-OK exceptions) — SKIP there, same discipline as test_r15.sh;
+# the repo tree verifies them.
+if [ ! -f "$REPO/app/Info.plist" ] || [ ! -f "$REPO/release.sh" ]; then
+  echo "  ok   (#3) repo-root section SKIPPED (live tree: app/Info.plist + release.sh absent by design)"
+  finish v101_confirm; exit $?
+fi
 V_SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$REPO/app/Info.plist")"
 V_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$REPO/app/Info.plist")"
 assert_eq "1.0.1" "$V_SHORT" "(#3) the shipped Info.plist reports 1.0.1"
