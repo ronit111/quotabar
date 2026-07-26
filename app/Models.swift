@@ -34,6 +34,73 @@ enum Severity: Int, Comparable, Sendable {
     }
 }
 
+/// (v102) A CONTINUOUS colour for the usage gauge, derived from the percentage alone. Purely
+/// presentational: `Severity`'s three steps stay the authoritative semantics for the menu bar icon
+/// and the card's status dot, which have to answer "is this account in trouble" at a glance and so
+/// must not drift with every point of usage. The bar is a different question — it shows a quantity,
+/// and a quantity that changes colour in one jump at 60% misreports how close 59% is to 61%.
+///
+/// The ramp is anchored ON Severity's own thresholds, so the two can never disagree where it
+/// matters: at exactly 60 the bar IS the warning colour, at exactly 85 it IS the critical colour.
+/// Below 40 it holds flat green rather than starting to yellow immediately — a quarter-full window
+/// is not a soft warning, and tinting it like one is the noise this app exists to avoid.
+enum GaugeRamp {
+    /// (percent, colour) anchors, ascending. Between anchors the colour is interpolated.
+    static let anchors: [(percent: Double, severity: Severity)] = [
+        (0, .healthy), (40, .healthy), (60, .warning), (85, .critical), (100, .critical),
+    ]
+
+    /// Which two anchors a percentage falls between, and how far along. Pure, so the ramp's
+    /// alignment with Severity's thresholds is a contract test rather than a visual judgement.
+    struct Stop: Equatable {
+        let from: Severity
+        let to: Severity
+        /// 0 = exactly `from`, 1 = exactly `to`.
+        let fraction: Double
+    }
+
+    static func stop(forPercent percent: Double) -> Stop {
+        let value = min(max(percent.isFinite ? percent : 0, 0), 100)
+        for index in 1..<anchors.count where value <= anchors[index].percent {
+            let lower = anchors[index - 1]
+            let upper = anchors[index]
+            let span = upper.percent - lower.percent
+            let fraction = span > 0 ? (value - lower.percent) / span : 1
+            return Stop(from: lower.severity, to: upper.severity, fraction: fraction)
+        }
+        let last = anchors[anchors.count - 1].severity
+        return Stop(from: last, to: last, fraction: 1)
+    }
+
+    /// The interpolated colour, resolved per appearance. The blend happens INSIDE a dynamic
+    /// NSColor provider so both anchors are resolved for the appearance actually being drawn —
+    /// blending outside it would freeze light-mode components into a dark-mode popover.
+    static func color(forPercent percent: Double) -> Color {
+        let stop = stop(forPercent: percent)
+        guard stop.from != stop.to else { return stop.to.color }
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            var blended = stop.to.nsColor
+            appearance.performAsCurrentDrawingAppearance {
+                blended = mix(stop.from.nsColor, stop.to.nsColor, fraction: stop.fraction)
+            }
+            return blended
+        })
+    }
+
+    private static func mix(_ from: NSColor, _ to: NSColor, fraction: Double) -> NSColor {
+        guard let a = from.usingColorSpace(.sRGB), let b = to.usingColorSpace(.sRGB) else {
+            return to
+        }
+        let t = CGFloat(min(max(fraction, 0), 1))
+        return NSColor(
+            srgbRed: a.redComponent + (b.redComponent - a.redComponent) * t,
+            green: a.greenComponent + (b.greenComponent - a.greenComponent) * t,
+            blue: a.blueComponent + (b.blueComponent - a.blueComponent) * t,
+            alpha: a.alphaComponent + (b.alphaComponent - a.alphaComponent) * t
+        )
+    }
+}
+
 struct UsageSnapshot: Decodable, Sendable {
     let generatedAt: Date
     let stale: Bool?
@@ -123,10 +190,36 @@ struct UsageSnapshot: Decodable, Sendable {
     }
 }
 
+/// The plan chip's copy. (v102) The backend hands us its own vocabulary — today Claude collapses
+/// every Max variant to `max` (bank_common.plan_tier) while Codex passes `plan_type` through — so
+/// the chip is a presentation-side mapping, not a model change: the names people actually use for
+/// their subscriptions, with anything unrecognised passing through uppercased exactly as before.
+/// The key is normalised first (case, whitespace, `-` vs `_`, a `claude_` prefix) so a tier variant
+/// reaching the app in any of its spellings still lands on the friendly name.
 enum PlanCapsulePresentation {
+    /// Ordered so the chip stays short enough for the 320-wide card header. The × is a real
+    /// multiplication sign — "MAX 5x" reads as a typo at 9pt.
+    static let friendlyNames: [String: String] = [
+        "max": "MAX",
+        "max_5x": "MAX 5×",
+        "max_20x": "MAX 20×",
+        "pro": "PRO",
+        "free": "FREE",
+    ]
+
     static func text(for plan: String?) -> String? {
-        guard let plan, !plan.isEmpty else { return nil }
-        return plan.uppercased()
+        guard let plan else { return nil }
+        let trimmed = plan.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return friendlyNames[normalized(trimmed)] ?? trimmed.uppercased()
+    }
+
+    static func normalized(_ plan: String) -> String {
+        var key = plan.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        if key.hasPrefix("claude_") { key.removeFirst("claude_".count) }
+        return key
     }
 }
 
@@ -169,6 +262,170 @@ enum RemoveAccountPolicy {
     }
 }
 
+/// (v102) Pure policy for the "Un-seed…" affordance on a v2 monitor-only card. Those cards
+/// deliberately hide the Remove ✕ — a home has no v1 bank record, so remove-account.sh would fence
+/// on it — which left the only way to undo a seeding as a shell command the owner had to remember.
+/// This is the affordance for that: a different operation with a different verb, offered ONLY where
+/// it applies (a seeded home), never on a v1 banked account and never on the account currently
+/// serving requests. Side-effect-free so visibility and copy are unit-tested without a view.
+enum UnseedPolicy {
+    static func canUnseed(_ account: UsageAccount) -> Bool {
+        account.isClaude && account.isMonitorOnly && !account.active && !account.isUnresolved
+    }
+
+    static let actionTitle = "Un-seed…"
+    static let confirmButtonTitle = "Un-seed"
+
+    /// Same one-row shape as the remove strip: "Un-seed <local>?  [Cancel] [Un-seed]".
+    static func inlinePrompt(email: String) -> String {
+        "Un-seed \(RemoveAccountPolicy.shortEmail(email))?"
+    }
+
+    static let confirmationMessage =
+        "Removes this account's pinned home. Its banked credentials and usage history are untouched."
+}
+
+/// (v102) The one-line caption a finished un-seed leaves on the card. The command reports what it
+/// did — what it removed, what it archived — and that report is the answer to the only question the
+/// owner has after tearing down a home, so it becomes the caption rather than a generic "Done".
+///
+/// Parsed from `unseed.py --json`, which the scripts side documents as the form QuotaBar drives:
+/// the result dict on stdout, human text on stderr. Every field is optional and a decode failure
+/// falls back to the command's own last line, so a shape change on the scripts side degrades to a
+/// duller caption instead of a wrong one.
+enum UnseedSummary {
+    private struct Result: Decodable {
+        let wouldRemove: Bool?
+        let homeRemoved: Bool?
+        let registryEntryRemoved: Bool?
+        let keychainSlotDeleted: Bool?
+        let archivedCredential: String?
+        let archivedHomeHistory: String?
+        let warnings: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case wouldRemove = "would_remove"
+            case homeRemoved = "home_removed"
+            case registryEntryRemoved = "registry_entry_removed"
+            case keychainSlotDeleted = "keychain_slot_deleted"
+            case archivedCredential = "archived_credential"
+            case archivedHomeHistory = "archived_home_history"
+            case warnings
+        }
+    }
+
+    static func caption(fromStdout stdout: String) -> String {
+        guard let result = try? JSONDecoder().decode(Result.self, from: Data(stdout.utf8)) else {
+            return fallbackCaption(stdout)
+        }
+
+        // The clean no-op: a home that was already gone. Saying "removed nothing" would read as
+        // a failure; it isn't one.
+        if result.wouldRemove == false { return "nothing to un-seed" }
+
+        var removed: [String] = []
+        if result.homeRemoved == true { removed.append("home") }
+        if result.keychainSlotDeleted == true { removed.append("keychain slot") }
+        if result.registryEntryRemoved == true { removed.append("registry entry") }
+
+        var archived: [String] = []
+        if result.archivedCredential?.isEmpty == false { archived.append("credential") }
+        if result.archivedHomeHistory?.isEmpty == false { archived.append("history") }
+
+        var parts: [String] = []
+        if !removed.isEmpty { parts.append("removed \(removed.joined(separator: ", "))") }
+        if !archived.isEmpty { parts.append("archived \(archived.joined(separator: ", "))") }
+        // A warning is the command telling us the removal left something worth knowing about
+        // (today: a dangling v1 pointer). It outranks the inventory — carry it verbatim.
+        if let warning = result.warnings?.first(where: { !$0.isEmpty }) {
+            parts.append(warning)
+        }
+        guard !parts.isEmpty else { return "nothing to un-seed" }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Only reached if the payload stops being JSON. The FIRST line, never the last: the human
+    /// rendering ends on a "recover:" hint, so captioning the card with its last line would
+    /// state the recovery advice as though it were the outcome.
+    private static func fallbackCaption(_ stdout: String) -> String {
+        let lines = stdout
+            .split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return lines.first ?? "Un-seeded"
+    }
+}
+
+/// (v102) Card copy for a REFUSED un-seed. unseed.py computes every refusal before it touches
+/// anything and reports it as an exit code, so a refusal is a safe outcome with a specific cause —
+/// but its stderr reason is a paragraph written for a terminal, and the card has one short line.
+/// The codes that mean something to the owner get their own copy (same idea as rc 3 from
+/// swap-account.sh); anything else keeps the script's own first line rather than being flattened.
+enum UnseedFailureText {
+    static func message(exitCode: Int32?, stderrLine: String) -> String {
+        switch exitCode {
+        // Two different situations share rc 74, and they need different actions from the owner.
+        // The refusal sentence distinguishes them, so the card tells them which one to take.
+        case 74:
+            let reason = stderrLine.lowercased()
+            if reason.contains("accounts/current") {
+                return "Future launches still point here — switch to another account first"
+            }
+            // (v102-r2) The third cause of rc 74: a pinned launch admitted on this home whose
+            // process is still alive. It is not a registered session yet — the owner is looking
+            // at a Terminal that just opened, not a session in the list — so saying "a session"
+            // would send them looking for something they cannot see.
+            if reason.contains("pinned launch") {
+                return "A pinned session is starting on this home — quit that window first"
+            }
+            return "A session is still live on this home — quit it first"
+        case 78: return "Seeding in flight — try again once it finishes"
+        case 70: return "Bank busy — try again in a moment"
+        case 73: return "Needs confirmation — try again"
+        // rc 75 is fail-closed and safe to retry (nothing is destroyed unarchived), but its
+        // cause varies — a locked keychain, an unreadable registry — so the reason is the
+        // useful part and it stays verbatim.
+        default: return stderrLine
+        }
+    }
+}
+
+/// (v102) The "Pinned session…" affordance: open a Terminal running `claude-acct <email>`, which
+/// launches Claude Code pinned to that account's home for the life of that window. Offered only
+/// where homes exist at all (shadow|v2) and only for an account we can name — an unresolved login
+/// has no registry entry to map, and a needs-relogin account would open a dead session.
+enum PinnedSessionPolicy {
+    static func canOpen(_ account: UsageAccount, epoch: EpochState) -> Bool {
+        guard epoch == .shadow || epoch == .v2 else { return false }
+        return account.isClaude && !account.isUnresolved && !account.needsRelogin
+    }
+
+    static let actionTitle = "Pinned session…"
+    static let help =
+        "Open a Terminal running Claude Code pinned to this account, leaving other sessions alone."
+    /// (v102-r2) Shown instead while an un-seed holds the homes tree — see PinnedLaunchGate.
+    static let blockedHelp =
+        "Unavailable while an account is being un-seeded — the homes it would launch from are "
+        + "being torn down."
+}
+
+/// (v102) The unresolved ("UNLINKED") card's copy and action, which differ by epoch. Under v1 and
+/// shadow the keychain login IS the live rail, so linking it to a banked account is the one useful
+/// thing to do and `bank-account.sh` can do it. Under v2 it is a leftover: sessions pin their own
+/// home, the legacy slot only drains whatever old sessions still hold it, and a re-bank is fenced
+/// (rc 78) — so offering the button would be offering a flow the epoch refuses. Pure so the
+/// epoch-by-epoch surface is a contract test.
+enum UnresolvedCardPresentation {
+    static func showsLinkButton(epoch: EpochState) -> Bool { epoch != .v2 }
+
+    static func caption(epoch: EpochState, displayName: String) -> String {
+        guard epoch == .v2 else {
+            return "This login isn't linked to a tracked account yet. Link it to attribute usage."
+        }
+        return "pre-cutover login — drains \(displayName), expires with old sessions"
+    }
+}
+
 /// Which single parked-Claude card, if any, currently has its inline "Remove <email>?" strip
 /// revealed. This REPLACES the old SwiftUI `.confirmationDialog`, whose presentation binding
 /// survived the popover losing key-window inside `MenuBarExtra(.window)` and left a sticky modal.
@@ -179,26 +436,47 @@ enum RemoveAccountPolicy {
 /// still calls `AppModel.removeAccount` -> `ActionScheduler`. `reset()` is invoked on every
 /// popover open and close so a half-armed card can never re-render pre-armed on the next open.
 struct InlineRemovalConfirmation: Equatable {
-    private(set) var armedEmail: String?
+    /// (v102) Which destructive action the armed strip is confirming. Remove forgets a v1 bank
+    /// record; un-seed tears down a v2 home. They are different operations on different cards, but
+    /// they share this one slot so the "only one strip open anywhere" invariant still holds
+    /// structurally — a card cannot be armed for both at once, and arming either disarms the other.
+    enum Kind: Equatable {
+        case remove
+        case unseed
+    }
 
-    var isArmed: Bool { armedEmail != nil }
+    struct Armed: Equatable {
+        let email: String
+        let kind: Kind
+    }
 
-    func isArmed(email: String) -> Bool { armedEmail == email }
+    private(set) var armed: Armed?
+
+    var armedEmail: String? { armed?.email }
+
+    var isArmed: Bool { armed != nil }
+
+    func isArmed(email: String) -> Bool { armed?.email == email }
+
+    func isArmed(email: String, kind: Kind) -> Bool {
+        armed == Armed(email: email, kind: kind)
+    }
 
     /// Tapping the × on a card: arm it if disarmed, disarm it if it is the armed one. Arming a
     /// different card while one is already armed silently moves the strip (only one at a time).
-    mutating func toggle(email: String) {
-        armedEmail = (armedEmail == email) ? nil : email
+    mutating func toggle(email: String, kind: Kind = .remove) {
+        let candidate = Armed(email: email, kind: kind)
+        armed = (armed == candidate) ? nil : candidate
     }
 
     /// Cancel button, or a completed removal: hide the strip.
     mutating func disarm() {
-        armedEmail = nil
+        armed = nil
     }
 
     /// Popover open/close: never leave a card armed across a popover lifecycle.
     mutating func reset() {
-        armedEmail = nil
+        armed = nil
     }
 }
 
@@ -701,11 +979,23 @@ enum PopoverLayout {
     static let cardSpacing: CGFloat = 10
     static let maxAccountRegionHeight: CGFloat = 560
 
+    /// (v102) The account region's own top inset. It exists to open a gap below the popover's top
+    /// edge, so it applies ONLY when the cards are the first thing in the popover. When a cached
+    /// badge or a health banner sits above them, that inset stacked on top of the VStack's 10pt
+    /// spacing pushed the first card 22pt clear of the banner — a gap wide enough to read as a
+    /// section break between the warning and the account it is warning about. Zeroing it there
+    /// leaves exactly the 10pt card rhythm, so the banner sits in the stack like another card.
+    /// The estimator has to agree with the view or the ScrollView's frame is off by the difference.
+    static func topInset(isStale: Bool, hasHealthBanner: Bool) -> CGFloat {
+        (isStale || hasHealthBanner) ? 0 : 12
+    }
+
     static func estimatedHeight(
         claudeAccounts: Int,
         reloginAccounts: Int,
         hasCodex: Bool,
-        isStale: Bool
+        isStale: Bool,
+        hasHealthBanner: Bool
     ) -> CGFloat {
         let normal = max(0, claudeAccounts - reloginAccounts)
         var total = CGFloat(normal) * claudeCardEstimate
@@ -717,7 +1007,7 @@ enum PopoverLayout {
         }
         guard items > 0 else { return 0 }
         total += CGFloat(items - 1) * cardSpacing
-        total += (isStale ? 0 : 12) + 2
+        total += topInset(isStale: isStale, hasHealthBanner: hasHealthBanner) + 2
         return total
     }
 
@@ -725,11 +1015,12 @@ enum PopoverLayout {
         claudeAccounts: Int,
         reloginAccounts: Int,
         hasCodex: Bool,
-        isStale: Bool
+        isStale: Bool,
+        hasHealthBanner: Bool
     ) -> Bool {
         estimatedHeight(
             claudeAccounts: claudeAccounts, reloginAccounts: reloginAccounts,
-            hasCodex: hasCodex, isStale: isStale
+            hasCodex: hasCodex, isStale: isStale, hasHealthBanner: hasHealthBanner
         ) > maxAccountRegionHeight
     }
 
@@ -737,12 +1028,13 @@ enum PopoverLayout {
         claudeAccounts: Int,
         reloginAccounts: Int,
         hasCodex: Bool,
-        isStale: Bool
+        isStale: Bool,
+        hasHealthBanner: Bool
     ) -> CGFloat {
         min(
             estimatedHeight(
                 claudeAccounts: claudeAccounts, reloginAccounts: reloginAccounts,
-                hasCodex: hasCodex, isStale: isStale
+                hasCodex: hasCodex, isStale: isStale, hasHealthBanner: hasHealthBanner
             ),
             maxAccountRegionHeight
         )
@@ -765,9 +1057,29 @@ enum CodexPing {
     }
 
     static func buttonTitle(remaining: TimeInterval) -> String {
-        guard remaining > 0 else { return "Ping" }
-        let minutes = max(1, Int(ceil(remaining / 60)))
-        return "Ping · \(minutes)m"
+        PingCountdown.title(remaining: remaining)
+    }
+}
+
+/// (v102) The ping button's cooldown label, for both the Claude cards and the Codex card. It used
+/// to round up to whole minutes, so a 30-minute cooldown showed the same "Ping · 12m" for sixty
+/// seconds at a stretch and read as a stuck button rather than a running clock. M:SS ticks once a
+/// second against the model's shared clock, which the popover drives only while it is open — so the
+/// countdown is live when it is being looked at and costs nothing when it is not. Being text, it
+/// needs no reduce-motion branch; the label is set in monospaced digits so it doesn't jitter.
+enum PingCountdown {
+    static func title(remaining: TimeInterval) -> String {
+        guard let clock = clock(remaining: remaining) else { return "Ping" }
+        return "Ping · \(clock)"
+    }
+
+    /// M:SS (seconds always two digits), or nil once the cooldown has lapsed. Rounded UP so the
+    /// label never shows 0:00 on a button that is still disabled.
+    static func clock(remaining: TimeInterval) -> String? {
+        guard remaining.isFinite else { return nil }
+        let seconds = Int(remaining.rounded(.up))
+        guard seconds > 0 else { return nil }
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
 
@@ -843,6 +1155,57 @@ enum SwitchGate {
     }
 }
 
+/// (v102-r2) THE update-check allowlist, as a decision rather than a string.
+///
+/// The app makes exactly one network request, to one document. "One endpoint" was enforced by
+/// pinning the URL literal — but the system URL loader follows redirects by default, so a 302
+/// from that literal would have taken the connection (and the product/version User-Agent, and
+/// this machine's IP) to whatever host the response named. Nothing secret rides along; the point
+/// is that the boundary the app claims is the boundary it actually has.
+///
+/// So the allowlist is a predicate, applied twice: to the URL before the request is made (an
+/// edited literal disables the check instead of retargeting it) and to the URL that actually
+/// answered. Redirects are refused outright at the session delegate, which is what makes the
+/// second check a belt to the first's braces rather than the only guard.
+enum UpdateEndpoint {
+    static let host = "api.github.com"
+    static let path = "/repos/ronit111/quotabar/releases/latest"
+
+    /// HTTPS, that exact host, that exact path, and nothing else: no query, no userinfo, no
+    /// non-default port. Case-insensitive on scheme and host because URLs are; exact on path
+    /// because paths are not.
+    static func isAllowed(_ url: URL?) -> Bool {
+        guard let url,
+              url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == host,
+              url.path == path,
+              url.query == nil, url.user == nil, url.password == nil,
+              url.port == nil || url.port == 443
+        else { return false }
+        return true
+    }
+}
+
+/// (v102-r2) The one gate that has to exist app-side rather than script-side, because a pinned
+/// launch is the one action that does NOT go through the FIFO: it opens a Terminal and returns,
+/// so the queue that serializes every other actuator against an un-seed never sees it.
+///
+/// The scripts close the real hole — `claude-acct` records a launch admission under the same lock
+/// un-seed takes, and un-seed refuses while one is live — so the worst this gate prevents is an
+/// owner clicking "Pinned session…" and watching the Terminal fail with "no READY home". That is
+/// still the wrong thing to show someone who just asked for a session, and offering both controls
+/// as live while one is tearing down the very home the other would open reads as a UI that does
+/// not know what it is doing. Blocked across ALL cards, not just the one being un-seeded: while a
+/// teardown is in flight the whole homes tree is under the seeding barrier anyway.
+enum PinnedLaunchGate {
+    /// `AppModel.ActionKind.unseedAccount.rawValue`.
+    static let unseedKind = "unseed"
+
+    static func isBlocked(busyKinds: some Sequence<String>) -> Bool {
+        busyKinds.contains(unseedKind)
+    }
+}
+
 /// Card copy for a failed swap. swap-account.sh exits 3 when its `--expect-active` guard finds a
 /// different active account under the lock: another swap landed first, so this click was built
 /// from a stale view. Its stderr is a lock diagnostic; the card says what to do instead.
@@ -877,13 +1240,30 @@ struct Health: Decodable, Sendable {
             case count
         }
     }
+    /// (v102) The one NON-anomaly entry on this pipe: a plan-tier change the poll already
+    /// HEALED. It rides the health payload because that is the only channel the app reads, and
+    /// because the change has to stay visible now that the UNLINKED chip it used to surface as
+    /// is gone. Present only while a notice is pending; it self-expires after 24h.
+    struct HealedPlanChange: Decodable, Sendable {
+        let fromPlan: String?
+        let toPlan: String?
+        let email: String?
+        let ts: Int?
+        enum CodingKeys: String, CodingKey {
+            case fromPlan = "from"
+            case toPlan = "to"
+            case email, ts
+        }
+    }
     let archiver: Archiver?
     let forkDrift: [String: [String]]?
     let seedAudit: SeedAudit?
+    let healedPlanChange: HealedPlanChange?
     enum CodingKeys: String, CodingKey {
         case archiver
         case forkDrift = "fork_drift"
         case seedAudit = "seed_audit"
+        case healedPlanChange = "healed_plan_change"
     }
 }
 
@@ -933,11 +1313,41 @@ enum HealthPresentation {
         return (ts, sa.latestLinkedCount ?? 0)
     }
 
-    /// True when NOTHING is anomalous — the popover shows no health chrome at all.
-    static func isHealthy(_ health: Health?, epoch: EpochState, seedAuditAckTs: Int) -> Bool {
+    /// (v102) A plan-tier change the poll already re-banked. Deliberately NOT epoch-gated, unlike
+    /// every other row here: the archiver/registry rows describe v2 machinery, but a subscription
+    /// can change under a v1 user just as easily, and the heal that follows runs in the same poll
+    /// either way. Reports settled fact, so the view styles it as information, not as a warning.
+    /// Dismissal is remembered by timestamp app-side as well as acknowledged script-side, so a
+    /// failed ack can't turn a one-time notice into permanent chrome.
+    static func healedPlanChange(_ health: Health?, ackedTs: Int) -> (ts: Int, text: String)? {
+        guard let change = health?.healedPlanChange,
+              let ts = change.ts, ts > ackedTs,
+              let email = change.email, !email.isEmpty,
+              let to = PlanCapsulePresentation.text(for: change.toPlan)
+        else { return nil }
+        // Kept to one line at 11pt in a 320-wide popover. The prose form ("is now X (was Y)")
+        // wrapped and broke "re-banked" across lines, which reads as a defect in a row whose
+        // whole job is to be unalarming; the transition arrow says the same thing in half the
+        // width and is the idiom this app already uses for compact status.
+        let who = RemoveAccountPolicy.shortEmail(email)
+        if let from = PlanCapsulePresentation.text(for: change.fromPlan), from != to {
+            return (ts, "\(who) \(from) → \(to) · re-banked")
+        }
+        return (ts, "\(who) is now \(to) · re-banked")
+    }
+
+    /// True when NOTHING on this pipe has anything to show — the popover renders no health
+    /// chrome at all. (v102-r2) The plan-change notice counts. It is not an anomaly, but it IS a
+    /// row, and a "healthy" verdict that ignored it would be a second opinion disagreeing with
+    /// the one the view acts on (AppModel.hasHealthAnomaly) — exactly the drift that let the
+    /// notice be emitted with nowhere to land in the first place.
+    static func isHealthy(
+        _ health: Health?, epoch: EpochState, seedAuditAckTs: Int, healNoticeAckTs: Int = 0
+    ) -> Bool {
         archiverWarning(health, epoch: epoch) == nil
             && forkDriftLine(health, epoch: epoch) == nil
             && seedAuditReview(health, epoch: epoch, ackedTs: seedAuditAckTs) == nil
+            && healedPlanChange(health, ackedTs: healNoticeAckTs) == nil
     }
 
     private static func plural(_ n: Int) -> String { n == 1 ? "" : "s" }
@@ -958,6 +1368,124 @@ enum RestartOutcomeText {
         }
         let trimmed = (line ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return (trimmed.isEmpty || l == "script failed") ? "failed" : trimmed
+    }
+}
+
+// MARK: - (v102) update-available hint
+
+/// A `major.minor.patch` version, for comparing this build against the newest published release.
+/// Deliberately strict: an optional leading `v` and exactly three numeric components, nothing else.
+/// A tag that doesn't match — a pre-release, a date stamp, anything hand-typed — parses to nil and
+/// the hint stays hidden, because offering an upgrade we can't reason about is worse than silence.
+struct SemanticVersion: Comparable, Equatable, CustomStringConvertible, Sendable {
+    let major: Int
+    let minor: Int
+    let patch: Int
+
+    var description: String { "\(major).\(minor).\(patch)" }
+
+    static func parse(_ raw: String?) -> SemanticVersion? {
+        guard let raw else { return nil }
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("v") || text.hasPrefix("V") { text.removeFirst() }
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        let numbers = parts.compactMap { part -> Int? in
+            guard !part.isEmpty, part.allSatisfy(\.isNumber) else { return nil }
+            return Int(part)
+        }
+        guard numbers.count == 3 else { return nil }
+        return SemanticVersion(major: numbers[0], minor: numbers[1], patch: numbers[2])
+    }
+
+    static func < (lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
+        (lhs.major, lhs.minor, lhs.patch) < (rhs.major, rhs.minor, rhs.patch)
+    }
+}
+
+/// When the once-a-day update check is allowed to fire. The timestamp is persisted, so quitting and
+/// relaunching all afternoon does not turn "once a day" into "once a launch" — the cadence belongs
+/// to the machine, not the process. A failed check counts as an attempt for exactly the same
+/// reason: an endpoint that is down should be retried tomorrow, not on every relaunch in between.
+enum UpdateCheckSchedule {
+    static let interval: TimeInterval = 86_400
+
+    static func shouldCheck(enabled: Bool, lastCheck: Date?, now: Date) -> Bool {
+        guard enabled else { return false }
+        guard let lastCheck else { return true }
+        let elapsed = now.timeIntervalSince(lastCheck)
+        // A timestamp in the future means the clock moved backwards; treat it as due rather than
+        // waiting for wall time to catch up to a reading that was never real.
+        if elapsed < 0 { return true }
+        return elapsed >= interval
+    }
+}
+
+/// The footer hint's copy and the decision to show it at all. Everything here is a pure function of
+/// three strings, so the version comparison, the per-version dismissal and the exact line are
+/// contract tests rather than something you have to publish a release to see.
+enum UpdateHint {
+    /// The newest version worth telling the owner about, or nil to stay silent. Nil covers every
+    /// ordinary case: no check has run, the tag is unparseable, we are current (or ahead of a
+    /// re-tagged release), or the owner already dismissed exactly this version.
+    static func availableVersion(
+        current: String?,
+        latestTag: String?,
+        dismissedVersion: String?
+    ) -> SemanticVersion? {
+        guard let current = SemanticVersion.parse(current),
+              let latest = SemanticVersion.parse(latestTag),
+              latest > current
+        else { return nil }
+        // Dismissal is per-version, compared as versions rather than strings, so dismissing
+        // "v1.0.3" also silences "1.0.3" — and neither silences 1.0.4 when it lands.
+        if let dismissed = SemanticVersion.parse(dismissedVersion), dismissed == latest {
+            return nil
+        }
+        return latest
+    }
+
+    /// One line, in the footer caption idiom: what is available, and the one command that gets it.
+    static func line(version: SemanticVersion) -> String {
+        "\(version) available · brew upgrade --cask quotabar"
+    }
+
+    /// The User-Agent the check identifies itself with. Honest and inert: the product, the version
+    /// it is, and nothing that identifies the machine or the person running it.
+    static func userAgent(version: String?) -> String {
+        let version = (version?.isEmpty == false) ? version! : "unknown"
+        return "QuotaBar/\(version)"
+    }
+
+    /// `tag_name` out of the releases payload. Anything else in the response is ignored — the tag
+    /// is the only field this feature has any use for.
+    static func tagName(fromJSON data: Data) -> String? {
+        struct Release: Decodable { let tagName: String?
+            enum CodingKeys: String, CodingKey { case tagName = "tag_name" }
+        }
+        guard let release = try? JSONDecoder().decode(Release.self, from: data),
+              let tag = release.tagName, !tag.isEmpty
+        else { return nil }
+        return tag
+    }
+}
+
+/// (v102) The inner shell command a Terminal window is opened on. Both Terminal launches the app
+/// performs — the guided add-account flow and a pinned session — go through here, so the quoting
+/// rule lives in one place and is a contract test rather than a string built at two call sites.
+enum TerminalLaunch {
+    static func addAccountCommand(bash: String, claudeAcct: String, email: String) -> String {
+        "\(bash) \(quote(claudeAcct)) --add \(quote(email))"
+    }
+
+    static func pinnedSessionCommand(bash: String, claudeAcct: String, email: String) -> String {
+        "\(bash) \(quote(claudeAcct)) \(quote(email))"
+    }
+
+    /// Single-quote for `sh`: everything inside is literal, and an embedded quote is closed,
+    /// escaped and reopened. An address is not trusted input just because it looks like one.
+    static func quote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 

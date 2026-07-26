@@ -14,6 +14,9 @@ import tempfile
 import time
 
 REG_NAME = "registry.json"
+# (v102-r2) set on an entry whose home un-seeding is in the middle of removing. See
+# mark_unseeding: it is the ONE reason a not-READY entry is still a legal delete target.
+UNSEEDING = "unseeding"
 
 
 class RegistryError(Exception):
@@ -72,6 +75,46 @@ def publish_ready(accounts_dir, email, home, account_uuid):
                   "seeded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     save(accounts_dir, reg)
     return reg[email]
+
+
+def mark_unseeding(accounts_dir, email):
+    """(v102-r2) Take an entry OUT of service before un-seeding destroys its home, and mark
+    WHY. Caller holds the bank lock (writes here always do) and the admission lock, so this is
+    the moment new launches stop being possible: every consumer of a READY entry — ready_home,
+    is_ready_home, usage.py's v2 discovery, launchadmit — requires `ready is True`, so a
+    launcher that arrives after this write refuses instead of pinning a home that is about to
+    be deleted.
+
+    `unseeding` is what keeps that fail-closed marking from being a one-way trap: un-seed's own
+    resolver accepts a not-READY entry ONLY when this flag is on it (a re-run finishes an
+    interrupted removal), while a not-READY entry with no flag stays refused — that one is a
+    half-published seeding, not our own in-flight work. Returns the updated entry, or None when
+    there is no entry to mark."""
+    reg = load(accounts_dir)
+    ent = reg.get(email)
+    if not isinstance(ent, dict):
+        return None
+    ent["ready"] = False
+    ent[UNSEEDING] = True
+    reg[email] = ent
+    save(accounts_dir, reg)
+    return ent
+
+
+def clear_unseeding(accounts_dir, email):
+    """Undo mark_unseeding — used only when the removal refused BEFORE destroying anything, so
+    a refusal (a locked keychain, an unarchivable credential) does not leave a perfectly intact
+    home permanently unlaunchable. Once anything has been destroyed the mark STAYS: that home
+    is no longer something to launch, it is something to finish removing."""
+    reg = load(accounts_dir)
+    ent = reg.get(email)
+    if not isinstance(ent, dict) or not ent.get(UNSEEDING):
+        return None
+    ent.pop(UNSEEDING, None)
+    ent["ready"] = True
+    reg[email] = ent
+    save(accounts_dir, reg)
+    return ent
 
 
 def ready_home(accounts_dir, email):

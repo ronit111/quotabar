@@ -26,7 +26,8 @@ struct PopoverView: View {
                 claudeAccounts: model.claudeAccounts.count,
                 reloginAccounts: reloginCount,
                 hasCodex: model.codexAccount != nil,
-                isStale: model.isStale
+                isStale: model.isStale,
+                hasHealthBanner: model.hasHealthAnomaly
             ) {
                 ScrollView {
                     accountRegion
@@ -35,7 +36,8 @@ struct PopoverView: View {
                     claudeAccounts: model.claudeAccounts.count,
                     reloginAccounts: reloginCount,
                     hasCodex: model.codexAccount != nil,
-                    isStale: model.isStale
+                    isStale: model.isStale,
+                    hasHealthBanner: model.hasHealthAnomaly
                 ))
             } else {
                 accountRegion
@@ -85,7 +87,12 @@ struct PopoverView: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.top, model.isStale ? 0 : 12)
+        // Zero once anything sits above the cards, so a health banner is one card-gap away from
+        // the first card instead of an inset plus a stack gap. PopoverLayout owns the rule because
+        // the ScrollView's frame estimate has to add the same number.
+        .padding(.top, PopoverLayout.topInset(
+            isStale: model.isStale, hasHealthBanner: model.hasHealthAnomaly
+        ))
         .padding(.bottom, 2)
     }
 }
@@ -176,6 +183,10 @@ private struct ClaudeAccountCard: View {
                 RemoveConfirmationStrip(account: account, model: model)
             }
 
+            if model.isArmedForUnseed(account) {
+                UnseedConfirmationStrip(account: account, model: model)
+            }
+
             if let fiveHour = account.fiveHour, let util = fiveHour.utilization {
                 UsageGaugeRow(
                     label: "5h", utilization: util, resetsAt: fiveHour.resetsAt,
@@ -212,21 +223,27 @@ private struct ClaudeAccountCard: View {
             if account.isUnresolved {
                 // The one meaningful action for an unlinked login is banking it; Ping
                 // would bill an account we can't name, Switch would target the sentinel.
-                Text("This login isn't linked to a tracked account yet. Link it to attribute usage.")
+                // (v102) Under v2 there is no such action — the slot is a leftover the epoch
+                // fences, so the card explains what it is instead of offering a refused button.
+                Text(UnresolvedCardPresentation.caption(
+                    epoch: model.currentEpoch, displayName: account.displayName
+                ))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("quotabar.unresolvedHint")
-                HStack(alignment: .center, spacing: 7) {
-                    CardActionButton(
-                        title: "Link account",
-                        showSpinner: isRunning("rebank"),
-                        queued: isQueued("rebank"),
-                        disabled: model.isBusy(email: account.email),
-                        identifier: "quotabar.link.\(safeIdentifier(account.email))",
-                        action: { model.rebank(account) }
-                    )
-                    Spacer(minLength: 2)
+                if UnresolvedCardPresentation.showsLinkButton(epoch: model.currentEpoch) {
+                    HStack(alignment: .center, spacing: 7) {
+                        CardActionButton(
+                            title: "Link account",
+                            showSpinner: isRunning("rebank"),
+                            queued: isQueued("rebank"),
+                            disabled: model.isBusy(email: account.email),
+                            identifier: "quotabar.link.\(safeIdentifier(account.email))",
+                            action: { model.rebank(account) }
+                        )
+                        Spacer(minLength: 2)
+                    }
                 }
             } else {
                 HStack(alignment: .center, spacing: 7) {
@@ -259,6 +276,8 @@ private struct ClaudeAccountCard: View {
 
                     AutoPingToggle(account: account, model: model)
                 }
+
+                CardSecondaryActions(account: account, model: model)
             }
 
             if let error = model.cardError(email: account.email) {
@@ -335,9 +354,7 @@ private struct ClaudeAccountCard: View {
     }
 
     private var pingTitle: String {
-        let remaining = model.pingRemaining(for: account)
-        guard remaining > 0 else { return "Ping" }
-        return "Ping · \(shortDuration(remaining))"
+        PingCountdown.title(remaining: model.pingRemaining(for: account))
     }
 
     private var freshness: CardFreshness {
@@ -375,7 +392,10 @@ private struct CardActionButton: View {
                     ProgressView()
                         .controlSize(.mini)
                 }
+                // (v102) The ping countdown ticks every second; monospaced digits keep the button
+                // from breathing in and out as the seconds change width.
                 Text(queued ? "Queued" : title)
+                    .monospacedDigit()
             }
         }
         .buttonStyle(.bordered)
@@ -508,24 +528,74 @@ private struct RemoveConfirmationStrip: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
+        InlineConfirmStrip(
+            prompt: RemoveAccountPolicy.inlinePrompt(email: account.email),
+            confirmTitle: RemoveAccountPolicy.confirmButtonTitle,
+            help: RemoveAccountPolicy.confirmationMessage,
+            disabled: model.isBusy(email: account.email),
+            identifierPrefix: "quotabar.remove",
+            email: account.email,
+            onCancel: { model.cancelRemovalConfirmation() },
+            onConfirm: { model.confirmRemoval(account) }
+        )
+        .accessibilityIdentifier("quotabar.removeConfirm.\(safeIdentifier(account.email))")
+    }
+}
+
+/// (v102) The un-seed twin of the remove strip, on a v2 monitor-only card. Deliberately the SAME
+/// two-step shape — a prompt naming the account, Cancel, then a red confirm — because it is the
+/// same kind of decision, and a second, differently-shaped confirmation would make the popover feel
+/// like two apps. Only the verb and the wording of what happens differ.
+private struct UnseedConfirmationStrip: View {
+    let account: UsageAccount
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        InlineConfirmStrip(
+            prompt: UnseedPolicy.inlinePrompt(email: account.email),
+            confirmTitle: UnseedPolicy.confirmButtonTitle,
+            help: UnseedPolicy.confirmationMessage,
+            disabled: model.isBusy(email: account.email),
+            identifierPrefix: "quotabar.unseed",
+            email: account.email,
+            onCancel: { model.cancelRemovalConfirmation() },
+            onConfirm: { model.confirmUnseed(account) }
+        )
+        .accessibilityIdentifier("quotabar.unseedConfirm.\(safeIdentifier(account.email))")
+    }
+}
+
+/// The shared body of both inline confirmations: a red-tinted panel inside the card, no modal, no
+/// presentation binding that can outlive the popover.
+private struct InlineConfirmStrip: View {
+    let prompt: String
+    let confirmTitle: String
+    let help: String
+    let disabled: Bool
+    let identifierPrefix: String
+    let email: String
+    let onCancel: () -> Void
+    let onConfirm: () -> Void
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(RemoveAccountPolicy.inlinePrompt(email: account.email))
+            Text(prompt)
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
                 .truncationMode(.middle)
 
             HStack(spacing: 7) {
-                Button("Cancel") { model.cancelRemovalConfirmation() }
+                Button("Cancel", action: onCancel)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .accessibilityIdentifier("quotabar.remove.cancel.\(safeIdentifier(account.email))")
+                    .accessibilityIdentifier("\(identifierPrefix).cancel.\(safeIdentifier(email))")
 
-                Button(RemoveAccountPolicy.confirmButtonTitle) { model.confirmRemoval(account) }
+                Button(confirmTitle, action: onConfirm)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .tint(.red)
-                    .disabled(model.isBusy(email: account.email))
-                    .accessibilityIdentifier("quotabar.remove.confirm.\(safeIdentifier(account.email))")
+                    .disabled(disabled)
+                    .accessibilityIdentifier("\(identifierPrefix).confirm.\(safeIdentifier(email))")
             }
         }
         .padding(9)
@@ -535,9 +605,86 @@ private struct RemoveConfirmationStrip: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.red.opacity(0.22), lineWidth: 0.75)
         }
-        .help(RemoveAccountPolicy.confirmationMessage)
+        .help(help)
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("quotabar.removeConfirm.\(safeIdentifier(account.email))")
+    }
+}
+
+/// (v102) The card's secondary shelf: actions that are real but rare, kept out of the primary
+/// button row so Ping and Swap stay the two things you see. Plain 10pt text that fills in on hover
+/// — the same resting/hover pair as the footer glyphs and the per-card ✕ — rather than more
+/// bordered buttons, which at this size would read as equal in weight to the actions above them.
+/// Renders nothing at all when neither action applies, which is every card under v1.
+private struct CardSecondaryActions: View {
+    let account: UsageAccount
+    @ObservedObject var model: AppModel
+
+    private var showsPinned: Bool {
+        PinnedSessionPolicy.canOpen(account, epoch: model.currentEpoch)
+    }
+    private var showsUnseed: Bool { UnseedPolicy.canUnseed(account) }
+
+    var body: some View {
+        if showsPinned || showsUnseed {
+            HStack(spacing: 7) {
+                if showsPinned {
+                    QuietTextButton(
+                        title: PinnedSessionPolicy.actionTitle,
+                        help: model.isUnseedInFlight
+                            ? PinnedSessionPolicy.blockedHelp : PinnedSessionPolicy.help,
+                        identifier: "quotabar.pinnedSession.\(safeIdentifier(account.email))",
+                        // (v102-r2) An un-seed in flight is tearing down a home under the seeding
+                        // barrier; a launch started now would race it (and the scripts would
+                        // refuse it). The control goes quiet for the few seconds that takes.
+                        disabled: model.isUnseedInFlight,
+                        action: { model.openPinnedSession(account) }
+                    )
+                }
+                if showsPinned && showsUnseed {
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+                if showsUnseed {
+                    QuietTextButton(
+                        title: UnseedPolicy.actionTitle,
+                        help: UnseedPolicy.confirmationMessage,
+                        identifier: "quotabar.unseed.\(safeIdentifier(account.email))",
+                        disabled: model.isBusy(email: account.email),
+                        action: { model.toggleUnseedConfirmation(account) }
+                    )
+                }
+                Spacer(minLength: 2)
+            }
+        }
+    }
+}
+
+/// A text-weight affordance for the secondary shelf: muted at rest, primary on hover.
+private struct QuietTextButton: View {
+    let title: String
+    let help: String
+    let identifier: String
+    var disabled: Bool = false
+    let action: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 10))
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .foregroundStyle(hovering && !disabled ? Color.primary : Color.secondary)
+        .onHover { hovering = $0 }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: hovering)
+        .help(help)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(identifier)
     }
 }
 
@@ -648,8 +795,11 @@ private struct UsageGaugeRow: View {
         freshness == .stale || freshness == .updating
     }
 
+    /// Cached numbers go grey (they aren't the live reading); live ones take the continuous ramp,
+    /// so the bar's colour moves with the quantity instead of stepping once at 60% and once at 85%.
+    /// The card's status dot and the menu bar icon keep Severity's three steps — see `GaugeRamp`.
     private var gaugeTint: Color {
-        numbersAreCached ? Color.secondary : Severity.forPercent(utilization).color
+        numbersAreCached ? Color.secondary : GaugeRamp.color(forPercent: utilization)
     }
 
     private var contentOpacity: Double {
@@ -876,6 +1026,15 @@ private struct FooterView: View {
                     )
                     .accessibilityIdentifier("quotabar.launchAtLogin")
 
+                    Toggle(
+                        "Check for Updates",
+                        isOn: Binding(
+                            get: { model.updateCheckEnabled },
+                            set: { model.setUpdateCheckEnabled($0) }
+                        )
+                    )
+                    .accessibilityIdentifier("quotabar.updateCheckToggle")
+
                     Divider()
 
                     Button("Quit") {
@@ -901,7 +1060,47 @@ private struct FooterView: View {
                     .lineLimit(2)
                     .accessibilityIdentifier("quotabar.loginItemError")
             }
+
+            if let hint = model.updateHintLine {
+                UpdateHintLine(text: hint, onDismiss: { model.dismissUpdateHint() })
+            }
         }
+    }
+}
+
+/// (v102) "1.0.3 available · brew upgrade --cask quotabar", under the footer row. A caption, not a
+/// banner: no colour, no icon, no button — the same tertiary hairline weight as the rest of the
+/// footer, because a new version is news, not a problem. Dismissing hides this version for good;
+/// the next release says its piece once and then goes quiet again too.
+private struct UpdateHintLine: View {
+    let text: String
+    let onDismiss: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(text)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+
+            Spacer(minLength: 2)
+
+            Button(action: onDismiss) {
+                Image(systemName: hovering ? "xmark.circle.fill" : "xmark.circle")
+                    .font(.system(size: 10))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(hovering ? Color.secondary : Color.secondary.opacity(0.55))
+            .onHover { hovering = $0 }
+            .help("Hide this version")
+            .accessibilityLabel("Hide this update notice")
+            .accessibilityIdentifier("quotabar.update.dismiss")
+        }
+        .accessibilityIdentifier("quotabar.update")
     }
 }
 
@@ -920,6 +1119,16 @@ private struct HealthSection: View {
             if let drift = model.forkDriftLine {
                 HealthRow(symbol: "arrow.triangle.branch", tint: .orange,
                           text: drift, emphasized: true, identifier: "quotabar.health.forkDrift")
+            }
+            // (v102) A plan change the poll already fixed. Informational styling, not the
+            // orange warning treatment above it — nothing here needs the owner to act.
+            if let healed = model.healedPlanChange {
+                HealthRow(
+                    symbol: "arrow.triangle.2.circlepath", tint: .secondary,
+                    text: healed.text,
+                    identifier: "quotabar.health.planChange",
+                    onDismiss: { model.acknowledgeHealedPlanChange(ts: healed.ts) }
+                )
             }
             if let review = model.seedAuditReview {
                 HealthRow(
@@ -1090,12 +1299,6 @@ private func clamped(_ value: Double) -> Double {
 
 private func wholePercent(_ value: Double) -> Int {
     Int(value.rounded())
-}
-
-private func shortDuration(_ interval: TimeInterval) -> String {
-    let seconds = max(0, Int(interval.rounded(.up)))
-    let minutes = max(1, Int(ceil(Double(seconds) / 60)))
-    return "\(minutes)m"
 }
 
 private func isScopedLimit(_ kind: String) -> Bool {

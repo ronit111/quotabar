@@ -29,8 +29,36 @@ test:
 	"$(BUILD_DIR)/QuotaBarTests"
 
 audit:
-	@# Forbidden everywhere: networking, credentials/keychain, analytics, structured logging.
-	@! /usr/bin/grep -En 'URLSession|NWConnection|Network\.framework|import Security|SecItem|Keychain|analytics|telemetry|OSLog|Logger\(' App.swift Models.swift Services.swift Views.swift
+	@# Forbidden everywhere: credentials/keychain, analytics, structured logging, and every
+	@# networking API other than the single allowlisted update check pinned below.
+	@! /usr/bin/grep -En 'URLSession|NWConnection|Network\.framework|import Security|SecItem|Keychain|analytics|telemetry|OSLog|Logger\(' App.swift Models.swift Views.swift
+	@! /usr/bin/grep -En 'NWConnection|Network\.framework|import Security|SecItem|Keychain|analytics|telemetry|OSLog|Logger\(' Services.swift
+	@# (v102) THE update-check allowlist. The app gained exactly one network call: an
+	@# unauthenticated GET of this project's own public "latest release" document, at most once a
+	@# day, so a released tool can tell its owner a new version exists instead of leaving them on
+	@# a stale build indefinitely. Weakening the audit to "Services.swift may do networking" would
+	@# have retired the guarantee the rule exists for, so the callsite is PINNED instead: exactly
+	@# one URLSession in the whole app, and no URL literal anywhere in Services.swift other than
+	@# this endpoint. Adding a second endpoint, or moving the call into another file, fails here.
+	@test "$$(/usr/bin/grep -Ec 'URLSession\(' Services.swift)" = "1"
+	@test "$$(/usr/bin/grep -Ec 'URLSession' Services.swift)" = "4"
+	@/usr/bin/grep -F 'https://api.github.com/repos/ronit111/quotabar/releases/latest' Services.swift >/dev/null
+	@test "$$(/usr/bin/grep -Ec 'https?://' Services.swift)" = "$$(/usr/bin/grep -cF 'https://api.github.com/repos/ronit111/quotabar/releases/latest' Services.swift)"
+	@# (v102-r2) ONE ENDPOINT MEANS ONE HOST AND ONE PATH, not one string literal. URLSession
+	@# follows redirects by default, so the pinned literal above bounded only the FIRST request:
+	@# a 302 from it could carry the connection, and the product/version User-Agent, to any host.
+	@# The runtime now refuses redirects at the task delegate and applies UpdateEndpoint.isAllowed
+	@# to the URL it sends AND the URL that answered. Those three parts are what the endpoint
+	@# boundary actually consists of, so each is pinned here — and the allowlist itself is pinned
+	@# to the same host+path the literal spells, in Models.swift where it lives.
+	@/usr/bin/grep -F 'willPerformHTTPRedirection' Services.swift >/dev/null
+	@test "$$(/usr/bin/grep -Ec 'completionHandler\(nil\)' Services.swift)" = "1"
+	@test "$$(/usr/bin/grep -Ec 'UpdateEndpoint\.isAllowed\(' Services.swift)" = "2"
+	@/usr/bin/grep -F 'delegate: RefuseRedirects()' Services.swift >/dev/null
+	@/usr/bin/grep -Fx '    static let host = "api.github.com"' Models.swift >/dev/null
+	@/usr/bin/grep -Fx '    static let path = "/repos/ronit111/quotabar/releases/latest"' Models.swift >/dev/null
+	@# The request must stay anonymous: no auth header, no cookies, no credentialed session.
+	@! /usr/bin/grep -En 'Authorization|setHTTPCookie|httpCookieStorage *= *HTTPCookieStorage|URLCredential' Services.swift
 	@# Filesystem-mutating APIs: create/copy/move forbidden everywhere; removeItem forbidden in
 	@# App/Models/Views (allowed in Services ONLY for the runtime-marker teardown, asserted below).
 	@# (\.moveItem so the pattern does not match the 'moveItem' substring inside removeItem.)

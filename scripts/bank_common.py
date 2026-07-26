@@ -217,6 +217,24 @@ def plan_tier(raw):
     return None
 
 
+def effective_tier(oauth_account, oauth):
+    """(v102-r3) THE tier of an account, from the two places a plan is ever recorded, in the
+    one order the codebase has settled on: oauthAccount.organizationType FIRST (~/.claude.json
+    for the live identity, the record's own oauthAccount for a banked one — rewritten every
+    session), and the credential's subscriptionType only as a FALLBACK (cached at /login, so
+    after a plan change it is routinely stale and sometimes absent). That preference is Shashi
+    Jangra's fix (#1) and it is what usage.process_claude already computes the displayed,
+    autopick-consulted `plan` with.
+
+    It lives here so no comparison can quietly disagree with it. The plan-drift checks reached
+    for subscriptionType alone, which meant the ONE source that reliably moves on a plan change
+    was the one they did not look at: a pro-downgraded account whose keychain still said `max`
+    read as no drift at all, and the heal that exists for exactly that case never ran.
+    Returns max|pro|free, or None when neither source says anything usable."""
+    return plan_tier((oauth_account or {}).get("organizationType")) \
+        or plan_tier((oauth or {}).get("subscriptionType"))
+
+
 def hook_rebank_refusal(kc, rec):
     """(v101-confirm) Why the SessionStart hook must NOT re-bank this credential drift by
     itself, or "" when the drift is provably the banked account's own credential and a
@@ -242,22 +260,30 @@ def hook_rebank_refusal(kc, rec):
     that could equally be A's rotation or B's login, and only the poll's live G9 lookup can
     tell those apart. Everything else defers there.
 
-    A plan-tier change defers too, even with a matching access token, because a tier change is
-    a distinct event with its own reporting and it is also write_bank_record's positive tell
-    for crossed identities — this function refuses on it rather than deciding it."""
+    A plan-tier change defers too, even with a matching access token: it is a distinct event
+    with its own reporting, and this hook has no way to report it beyond the line it prints.
+    (v102) The poll now HEALS an oracle-confirmed plan change and raises a healed_plan_change
+    notice on the health pipe, so deferring it here no longer leaves it stranded — the hook
+    announces, the poll repairs and reports."""
     if not valid_oauth(kc):
         return "the live credential is incomplete"
     if not isinstance(rec, dict):
         return "the banked record has no credential to compare against"
+    # (v102-r2) THE TIER TEST COMES FIRST, and deliberately does not go through the credential
+    # fingerprint. cred_fingerprint excludes subscriptionType on purpose (issue 7), so an
+    # unchanged-token max -> pro change is "the same credential" to same_credentials — and
+    # classifying it as "no drift to re-bank" put a real, reportable event behind the label for
+    # a non-event. It is a plan change whichever fields moved with it; say so, and let the
+    # oracle-gated poll be the thing that repairs it.
+    kt, rt = plan_tier(kc.get("subscriptionType")), plan_tier(rec.get("subscriptionType"))
+    if kt and rt and kt != rt:
+        return "the plan tier changed"
     if same_credentials(kc, rec):
         return "no drift to re-bank"
     live_at, banked_at = kc.get("accessToken"), rec.get("accessToken")
     if not isinstance(live_at, str) or not live_at or live_at != banked_at:
         return ("the access token changed, which is offline-indistinguishable from a "
                 "different account's /login")
-    kt, rt = plan_tier(kc.get("subscriptionType")), plan_tier(rec.get("subscriptionType"))
-    if kt and rt and kt != rt:
-        return "the plan tier changed"
     return ""
 
 

@@ -58,9 +58,31 @@ python3 - "$ACC" "$HOME_PATH" "$EMAIL" "$S" <<'PY'
 import json, os, subprocess, sys, time, hashlib, threading
 acc, home, email, S = sys.argv[1:5]
 sys.path.insert(0, S)
-import identity, isolated_refresh, bank_common, homewrite, seedflow
+import identity, isolated_refresh, bank_common, homewrite, launchadmit, seedflow
 # (seat) the home's credential is read/written through seedflow.seat_read/seat_write below —
 # file OR migrated per-config-dir slot — never a hard-coded .credentials.json path.
+
+# (v102-r2) This gate LAUNCHES the real CLI against a real seeded home, which makes it a
+# launcher — and every launcher records a launch admission, or un-seed cannot see it. Without
+# this, `claude-acct --un-seed <email>` run during a morning gate would find no session (the
+# trials are not registered sessions) and delete the home mid-gate. Same fence, same lock.
+#
+# (v102-r3) Through admit_ready, the SAME lock-held resolve-and-record `claude-acct` uses —
+# not the low-level admit(). This gate necessarily resolves its home early (argv[2], staged
+# before the harness is built), and taking the lock only to record that stale answer left the
+# gap the fence exists to close: un-seed could take the lock, see no admission, mark the home
+# not-READY, release, and start deleting, all between the resolve and this write. admit_ready
+# re-resolves under the lock and REFUSES when the answer is no longer the directory this
+# harness was staged against, so a gate can never launch into a home being removed.
+try:
+    home = launchadmit.admit_ready(acc, email, os.getpid(), expect_home=home, timeout=10)
+except launchadmit.AdmissionContended as e:
+    print(f"G8 FAIL: {e} — refusing to launch")
+    sys.exit(70)
+except launchadmit.AdmissionRefused as e:
+    print(f"G8 FAIL: the home is no longer admissible ({e})")
+    sys.exit(64)
+
 cbin = isolated_refresh.resolve_claude_bin()
 # (r9 #4) sample the keychain through the three-valued fail-closed reader: a read that
 # FAILS (locked/denied) or is EMPTY must NEVER become a hashable value. Two failed reads

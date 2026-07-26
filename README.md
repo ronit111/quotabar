@@ -29,8 +29,9 @@ onto a different account's rate limit without logging out and back in by hand.
 
 It has two parts:
 
-- **`app/`** — the SwiftUI menu bar app (the UI). It makes no network calls of its
-  own; everything it shows comes from the scripts.
+- **`app/`** — the SwiftUI menu bar app (the UI). Every usage number it shows comes
+  from the scripts; its only network call of its own is a once-a-day, anonymous check
+  for a newer release, which you can turn off (see [Security](#security-and-privacy)).
 - **`scripts/`** — a set of bash + Python scripts (the "account bank") that read
   usage from the providers, store per-account credentials locally, and perform the
   account switches. These also work on their own from the command line, or as a
@@ -260,19 +261,40 @@ live under `~/.claude/accounts` — the bank directory, overridable with `BANK_D
 Nothing sensitive is written inside this repo or anywhere world-readable. The app's
 log is `~/Library/Logs/QuotaBar.log` and never contains token values.
 
-**Network.** The app itself makes **no** network connections — the `make audit`
-target greps the app's Swift sources (`App.swift`, `Models.swift`, `Services.swift`,
-`Views.swift`) and fails the build if any networking, keychain, analytics, or
-structured-logging API appears in them. It is a source-level check, not binary
-analysis. The scripts contact exactly two hosts, both the
-providers' own usage endpoints:
+**Network.** Three hosts are contacted in total. The scripts read the two providers'
+own usage endpoints:
 
 - Anthropic's usage API, using your existing Claude token.
 - `chatgpt.com/backend-api/wham/usage`, using your existing Codex token.
 
-There is **no telemetry, no analytics, no third-party server, no phone-home.**
-Nothing is sent anywhere except those two provider endpoints, and only to read your
-own usage.
+The app makes exactly one network request of its own, added in v1.0.2: **the update
+check.** At most once every 24 hours it does an unauthenticated `GET` of
+
+```
+https://api.github.com/repos/ronit111/quotabar/releases/latest
+```
+
+and compares the release tag against its own `CFBundleShortVersionString`. If a newer
+version exists, the footer shows one line — `1.0.3 available · brew upgrade --cask
+quotabar` — which you can dismiss per version. The request sends no account address,
+no machine identifier and no usage data; it carries no cookies and no credentials
+(the session is ephemeral), and its only header of note is a `User-Agent` of
+`QuotaBar/<version>`. Nothing distinguishes your copy from anyone else's on the same
+version. A failed check is silent and simply retried in the next 24-hour window. It is
+**on by default** and can be turned off in the gear menu → **Check for Updates**; off
+means no request is made at all.
+
+The `make audit` target greps the app's Swift sources (`App.swift`, `Models.swift`,
+`Services.swift`, `Views.swift`) and fails the build if any networking, keychain,
+analytics, or structured-logging API appears in them. Rather than relax that rule for
+the update check, the audit **pins** it: exactly one `URLSession` call site, in
+`Services.swift`, and no URL literal in that file other than the endpoint above. A
+second endpoint, or the same call moved elsewhere, fails the build. It is a
+source-level check, not binary analysis.
+
+There is **no telemetry, no analytics, no third-party server, no phone-home.** Nothing
+is sent anywhere except the two provider endpoints — to read your own usage — and the
+public release listing above, to ask what the newest version number is.
 
 **Both usage endpoints are undocumented.** Neither Anthropic nor OpenAI publishes
 the usage endpoint this tool reads. They can change response shapes, move, or

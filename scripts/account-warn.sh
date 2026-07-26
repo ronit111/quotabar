@@ -46,6 +46,9 @@ CACHE = os.path.join(BANK, ".usage-cache.json")
 CONFIG = os.path.join(BANK, ".config.json")
 CLAUDE_JSON = os.environ.get("CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
 FAILLOG = os.path.join(BANK, ".hook-failures.log")
+# (v102) last-announced deferral fingerprint. A DOTfile so the bank-record `*.json` glob
+# never renders it as an account.
+DRIFTSTATE = os.path.join(BANK, ".drift-announce.json")
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 KEYCHAIN_ACCOUNT = os.environ.get("KEYCHAIN_ACCOUNT") or pwd.getpwuid(os.getuid()).pw_name
 
@@ -77,6 +80,68 @@ def diag(msg):
             os.chmod(FAILLOG, 0o600)
     except Exception:
         pass
+
+# --- (v102) deferral-line debounce -------------------------------------------
+# The deferral announcement is NEWS the first time and NOISE from then on: until the poll
+# heals the drift (or the owner runs bank-account.sh) the state is unchanged, and before
+# v102 every SessionStart re-printed the same paragraph — which is every session, all day,
+# on a machine where QuotaBar is not running to do the healing.
+#
+# Debounce on the DRIFT ITSELF, not on time: a fingerprint over the account, both credential
+# fingerprints and the refusal reason. Same fingerprint => already said, stay silent. Any
+# NEW drift (a further rotation, a different account, a different refusal) is a different
+# fingerprint and speaks again, so nothing can be silently swallowed. A healed/undrifted
+# state clears the record, so the next real drift is news again.
+#
+# (v102-r2) The PLAN is part of the drift's identity, and it was missing. Credential
+# fingerprints exclude subscriptionType by design (bank_common issue 7), so a tier change with
+# unchanged tokens moved NOTHING in the old fingerprint: max -> pro announced, and the pro ->
+# free that followed hashed identically and was swallowed — the debounce silencing the exact
+# class of news it was never meant to touch. The fingerprint now carries the announcement CLASS
+# (a plan line and a credential line are different news even about the same drift) and both the
+# normalized tiers and the raw plan strings, so max_5x -> max_20x is distinct too.
+#
+# Cost inside the 5s hook budget: one small file read, and a write only when we announce.
+# No subprocess, no network. Fail OPEN — if the state file cannot be read or written we
+# announce, because an unreadable debounce must never be the reason the owner is not told.
+def _drift_fingerprint(email, kc, rec, refusal, kind):
+    import hashlib
+    h = hashlib.sha256()
+    _old, _new = (rec or {}).get("subscriptionType"), (kc or {}).get("subscriptionType")
+    for part in (email or "", kind or "",
+                 bank_common.cred_fingerprint(kc or {}),
+                 bank_common.cred_fingerprint(rec or {}), refusal or "",
+                 bank_common.plan_tier(_old) or "", bank_common.plan_tier(_new) or "",
+                 str(_old or ""), str(_new or "")):
+        h.update(part.encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def drift_already_announced(fp):
+    try:
+        d = json.load(open(DRIFTSTATE))
+        return isinstance(d, dict) and d.get("fp") == fp
+    except Exception:
+        return False
+
+
+def drift_record_announced(fp):
+    try:
+        with open(DRIFTSTATE, "w") as f:
+            json.dump({"fp": fp, "ts": int(time.time())}, f)
+        os.chmod(DRIFTSTATE, 0o600)
+    except Exception:
+        pass
+
+
+def drift_clear():
+    """A resolved state forgets what it announced — the NEXT drift is news again."""
+    try:
+        os.remove(DRIFTSTATE)
+    except OSError:
+        pass
+
 
 def _security_bin():
     o = os.environ.get("ACCOUNT_BANK_SECURITY_BIN")
@@ -204,20 +269,31 @@ else:
                                              budget=min(remaining(), 4))
                 if rc != 0 and st != "timeout-detached":
                     diag(f"login-sync re-bank did not succeed (status={st}, rc={rc})")
-            else:
-                old_plan, new_plan = rec.get("subscriptionType"), kc.get("subscriptionType")
-                if old_plan and new_plan and old_plan != new_plan:
-                    note(f"{act}: plan change detected ({old_plan} -> {new_plan}). The bank "
-                         f"record is UNCHANGED for now — re-banking is deferred to the "
-                         f"identity-verified poll, which confirms the credential's owner "
-                         f"before writing. Run bank-account.sh to link it immediately.")
                 else:
-                    note(f"{act}: the active credential no longer matches its bank record "
-                         f"({refusal}). Not re-banked from this hook — deferred to the "
-                         f"identity-verified poll. The bank record is untouched; if the "
-                         f"account shows as unlinked, /swap still works and bank-account.sh "
-                         f"re-links it.")
+                    drift_clear()      # (v102) the drift is gone; the next one is news again
+            else:
+                # (v102) announce ONCE per distinct drift. diag() still records EVERY
+                # deferral — the debounce suppresses the owner-facing line, never the log.
+                old_plan, new_plan = rec.get("subscriptionType"), kc.get("subscriptionType")
+                is_plan_news = bool(old_plan and new_plan and old_plan != new_plan)
+                fp = _drift_fingerprint(act, kc, rec, refusal,
+                                        "plan" if is_plan_news else "cred")
+                if not drift_already_announced(fp):
+                    if is_plan_news:
+                        note(f"{act}: plan change detected ({old_plan} -> {new_plan}). The bank "
+                             f"record is UNCHANGED for now — re-banking is deferred to the "
+                             f"identity-verified poll, which confirms the credential's owner "
+                             f"before writing. Run bank-account.sh to link it immediately.")
+                    else:
+                        note(f"{act}: the active credential no longer matches its bank record "
+                             f"({refusal}). Not re-banked from this hook — deferred to the "
+                             f"identity-verified poll. The bank record is untouched; if the "
+                             f"account shows as unlinked, /swap still works and bank-account.sh "
+                             f"re-links it.")
+                    drift_record_announced(fp)
                 diag(f"login-sync DEFERRED to the poll heal: {refusal}")
+        else:
+            drift_clear()              # (v102) in sync — nothing outstanding to remember
     except Exception as e:
         diag(f"login-sync error: {type(e).__name__}")
 

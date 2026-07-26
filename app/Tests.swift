@@ -28,6 +28,10 @@ struct QuotaBarTests {
         try testFreshnessCaptionMatrix()
         try testPopoverFreshnessDecision()
         try testPlanCapsuleFallback()
+        try testPlanCapsuleFriendlyNames()
+        try testGaugeRampAnchoring()
+        try testPingCountdownFormatting()
+        try testHealthBannerCollapsesAccountInset()
         try testUsagePollEnvironment()
         try testStarredRefreshDebounce()
         try testPendingRefreshMerge()
@@ -55,6 +59,20 @@ struct QuotaBarTests {
         try testScriptsLocationResolution()
         try testNullUtilizationDecodesTolerantly()
         try testRestartOutcomeMapping()
+        try testUnseedPolicy()
+        try testInlineConfirmationKinds()
+        try testUnseedSummaryCaption()
+        try testUnseedFailureText()
+        try testPinnedSessionPolicyAndCommand()
+        try testUnresolvedCardPresentation()
+        try testHealedPlanChangeNotice()
+        try testHealedPlanNoticeIsRendered()
+        try testPinnedLaunchGate()
+        try testUpdateEndpointAllowlist()
+        try testSemanticVersionParsing()
+        try testUpdateCheckSchedule()
+        try testUpdateHintVisibility()
+        try testUpdateHintCopyAndPayload()
         try await testLargeStderrDrain()
         try await testScriptRunnerEnvironmentPropagation()
         try await testNonzeroStderr()
@@ -835,6 +853,49 @@ struct QuotaBarTests {
             PlanCapsulePresentation.text(for: "") == nil,
             "empty plan must hide the capsule"
         )
+        try expect(
+            PlanCapsulePresentation.text(for: "   ") == nil,
+            "a whitespace-only plan must hide the capsule too"
+        )
+    }
+
+    // (v102 d) The plan chip maps the backend's vocabulary onto the names people use for their
+    // subscriptions. Anything not in the table still passes through uppercased, exactly as before —
+    // the mapping is additive, so an unfamiliar tier degrades to the old behaviour, never to blank.
+    private static func testPlanCapsuleFriendlyNames() throws {
+        try expect(PlanCapsulePresentation.text(for: "max") == "MAX", "max maps to MAX")
+        try expect(PlanCapsulePresentation.text(for: "pro") == "PRO", "pro maps to PRO")
+        try expect(PlanCapsulePresentation.text(for: "free") == "FREE", "free maps to FREE")
+        try expect(
+            PlanCapsulePresentation.text(for: "max_5x") == "MAX 5×",
+            "the 5x tier reads as MAX 5× (a real multiplication sign, not the letter x)"
+        )
+        try expect(
+            PlanCapsulePresentation.text(for: "max_20x") == "MAX 20×",
+            "the 20x tier reads as MAX 20×"
+        )
+        // The key is normalised, so a variant reaching the app in any spelling still lands.
+        try expect(
+            PlanCapsulePresentation.text(for: "MAX-20X") == "MAX 20×",
+            "case and hyphen-vs-underscore must not defeat the mapping"
+        )
+        try expect(
+            PlanCapsulePresentation.text(for: "claude_max_20x") == "MAX 20×",
+            "the raw organizationType spelling maps too"
+        )
+        try expect(
+            PlanCapsulePresentation.text(for: " max ") == "MAX",
+            "surrounding whitespace must not defeat the mapping"
+        )
+        // Unknown values keep the old behaviour verbatim.
+        try expect(
+            PlanCapsulePresentation.text(for: "team") == "TEAM",
+            "an unmapped plan passes through uppercased, as today"
+        )
+        try expect(
+            PlanCapsulePresentation.text(for: "enterprise_v2") == "ENTERPRISE_V2",
+            "an unmapped plan is not reformatted, only uppercased"
+        )
     }
 
     private static func testActiveAccountDriftDebounce() throws {
@@ -971,23 +1032,145 @@ struct QuotaBarTests {
     private static func testPopoverLayoutBranches() throws {
         // 3 Claude accounts (no codex) stays under the cap → no scroll (ideal-height collapse).
         try expect(
-            !PopoverLayout.needsScroll(claudeAccounts: 3, reloginAccounts: 0, hasCodex: false, isStale: false),
+            !PopoverLayout.needsScroll(claudeAccounts: 3, reloginAccounts: 0, hasCodex: false,
+                                       isStale: false, hasHealthBanner: false),
             "3 accounts must render without a ScrollView"
         )
         // The live shape (2 Claude + Codex) must also collapse identically.
         try expect(
-            !PopoverLayout.needsScroll(claudeAccounts: 2, reloginAccounts: 0, hasCodex: true, isStale: false),
+            !PopoverLayout.needsScroll(claudeAccounts: 2, reloginAccounts: 0, hasCodex: true,
+                                       isStale: false, hasHealthBanner: false),
             "2 Claude + Codex must render without a ScrollView"
         )
         // 5 accounts overflow → bounded ScrollView clamped to the cap.
         try expect(
-            PopoverLayout.needsScroll(claudeAccounts: 5, reloginAccounts: 0, hasCodex: false, isStale: false),
+            PopoverLayout.needsScroll(claudeAccounts: 5, reloginAccounts: 0, hasCodex: false,
+                                      isStale: false, hasHealthBanner: false),
             "5 accounts must scroll"
         )
         let height = PopoverLayout.regionHeight(
-            claudeAccounts: 5, reloginAccounts: 0, hasCodex: false, isStale: false
+            claudeAccounts: 5, reloginAccounts: 0, hasCodex: false, isStale: false,
+            hasHealthBanner: false
         )
         try expect(height == PopoverLayout.maxAccountRegionHeight, "scrolling region must clamp to the cap")
+    }
+
+    // (v102 a) The account region's top inset exists to clear the popover's top edge, so anything
+    // rendered ABOVE the cards — the cached badge, the health banner — must zero it, leaving the
+    // 10pt card rhythm instead of inset + stack spacing. The estimator must agree with the view, or
+    // the ScrollView's frame is short by exactly the inset it forgot.
+    private static func testHealthBannerCollapsesAccountInset() throws {
+        try expect(
+            PopoverLayout.topInset(isStale: false, hasHealthBanner: false) == 12,
+            "with nothing above them, the cards keep their 12pt top inset"
+        )
+        try expect(
+            PopoverLayout.topInset(isStale: false, hasHealthBanner: true) == 0,
+            "a health banner above the cards collapses the inset to the card rhythm"
+        )
+        try expect(
+            PopoverLayout.topInset(isStale: true, hasHealthBanner: false) == 0,
+            "the cached badge already collapsed the inset and still does"
+        )
+        try expect(
+            PopoverLayout.topInset(isStale: true, hasHealthBanner: true) == 0,
+            "badge AND banner is still one collapse, not two"
+        )
+
+        let withoutBanner = PopoverLayout.estimatedHeight(
+            claudeAccounts: 2, reloginAccounts: 0, hasCodex: false, isStale: false,
+            hasHealthBanner: false
+        )
+        let withBanner = PopoverLayout.estimatedHeight(
+            claudeAccounts: 2, reloginAccounts: 0, hasCodex: false, isStale: false,
+            hasHealthBanner: true
+        )
+        try expect(
+            withoutBanner - withBanner == 12,
+            "the estimator must drop exactly the inset the view dropped (got \(withoutBanner - withBanner))"
+        )
+        try expect(
+            PopoverLayout.estimatedHeight(claudeAccounts: 0, reloginAccounts: 0, hasCodex: false,
+                                          isStale: false, hasHealthBanner: true) == 0,
+            "no cards means no region, banner or not"
+        )
+    }
+
+    // (v102 b) The gauge ramp is continuous, but it is anchored ON Severity's thresholds so the
+    // bar and the status dot can never disagree at the boundaries that carry meaning.
+    private static func testGaugeRampAnchoring() throws {
+        try expect(
+            GaugeRamp.stop(forPercent: 0) == GaugeRamp.Stop(from: .healthy, to: .healthy, fraction: 0),
+            "an empty window is flat green"
+        )
+        try expect(
+            GaugeRamp.stop(forPercent: 40) == GaugeRamp.Stop(from: .healthy, to: .healthy, fraction: 1),
+            "green holds flat to 40% — a quarter-full window is not a soft warning"
+        )
+        try expect(
+            GaugeRamp.stop(forPercent: 60) == GaugeRamp.Stop(from: .healthy, to: .warning, fraction: 1),
+            "at Severity's warning threshold the ramp IS the warning colour"
+        )
+        try expect(
+            GaugeRamp.stop(forPercent: 85) == GaugeRamp.Stop(from: .warning, to: .critical, fraction: 1),
+            "at Severity's critical threshold the ramp IS the critical colour"
+        )
+        try expect(
+            GaugeRamp.stop(forPercent: 100) == GaugeRamp.Stop(from: .critical, to: .critical, fraction: 1),
+            "a full window is flat red"
+        )
+        let midpoint = GaugeRamp.stop(forPercent: 50)
+        try expect(
+            midpoint.from == .healthy && midpoint.to == .warning
+                && abs(midpoint.fraction - 0.5) < 0.0001,
+            "halfway between the anchors is halfway through the blend"
+        )
+        // Out-of-range and nonsense values clamp rather than escaping the ramp.
+        try expect(
+            GaugeRamp.stop(forPercent: -5) == GaugeRamp.stop(forPercent: 0),
+            "a negative percentage clamps to empty"
+        )
+        try expect(
+            GaugeRamp.stop(forPercent: 140) == GaugeRamp.stop(forPercent: 100),
+            "an over-100 percentage clamps to full"
+        )
+        try expect(
+            GaugeRamp.stop(forPercent: .nan) == GaugeRamp.stop(forPercent: 0),
+            "a non-finite percentage must not produce a colour out of nowhere"
+        )
+        // Severity itself is untouched: the model's three steps are still the icon/dot semantics.
+        try expect(
+            Severity.forPercent(59.999) == .healthy && Severity.forPercent(85.001) == .critical,
+            "the presentation ramp must not have changed Severity's thresholds"
+        )
+    }
+
+    // (v102 c) The ping cooldown ticks in M:SS instead of sitting on the same whole minute for
+    // sixty seconds. Same format on the Claude cards and the Codex card.
+    private static func testPingCountdownFormatting() throws {
+        try expect(PingCountdown.title(remaining: 0) == "Ping", "a lapsed cooldown is just 'Ping'")
+        try expect(PingCountdown.title(remaining: -5) == "Ping", "a negative remainder is not a countdown")
+        try expect(PingCountdown.clock(remaining: 0) == nil, "no clock once the cooldown lapses")
+        try expect(
+            PingCountdown.title(remaining: 1_800) == "Ping · 30:00",
+            "a full 30-minute cooldown reads 30:00"
+        )
+        try expect(
+            PingCountdown.title(remaining: 720) == "Ping · 12:00",
+            "whole minutes still show their seconds, so the field width never changes"
+        )
+        try expect(
+            PingCountdown.title(remaining: 544) == "Ping · 9:04",
+            "seconds are always two digits"
+        )
+        try expect(
+            PingCountdown.title(remaining: 0.4) == "Ping · 0:01",
+            "a sub-second remainder rounds UP — the button is still disabled, so it must not read 0:00"
+        )
+        try expect(
+            CodexPing.buttonTitle(remaining: 544) == PingCountdown.title(remaining: 544),
+            "the Codex card uses the same countdown as the Claude cards"
+        )
     }
 
     // Codex ping availability/cooldown/title — pure logic, no ping is ever fired.
@@ -1001,7 +1184,10 @@ struct QuotaBarTests {
         try expect(CodexPing.remaining(lastPing: now.addingTimeInterval(-1_799), now: now) == 1, "1799s in → 1s left")
         try expect(CodexPing.remaining(lastPing: now.addingTimeInterval(-1_800), now: now) == 0, "1800s in → ready")
         try expect(CodexPing.buttonTitle(remaining: 0) == "Ping", "ready title must be 'Ping'")
-        try expect(CodexPing.buttonTitle(remaining: 720) == "Ping · 12m", "cooldown title must show minutes")
+        try expect(
+            CodexPing.buttonTitle(remaining: 720) == "Ping · 12:00",
+            "cooldown title must show the live M:SS countdown (v102)"
+        )
     }
 
     private static func testCancellation() async throws {
@@ -1351,6 +1537,597 @@ struct QuotaBarTests {
         try expect(home.sevenDay?.utilization == nil, "the seven_day null variant also decodes tolerantly")
         try expect(snapshot.accounts[1].fiveHour?.utilization == 42,
                    "a real utilization still decodes intact")
+    }
+
+    // MARK: - (v102) un-seed, pinned sessions, epoch-specific card surfaces
+
+    // The un-seed affordance exists exactly where Remove deliberately does not: a v2 monitor-only
+    // home, which has no v1 bank record for remove-account.sh to act on. The two must never both
+    // appear on one card, and neither may target the account currently serving requests.
+    private static func testUnseedPolicy() throws {
+        let home = makeAccount(email: "home@x.com", active: false, fetchedAt: 1_000, monitorOnly: true)
+        let activeHome = makeAccount(email: "home@x.com", active: true, fetchedAt: 1_000, monitorOnly: true)
+        let bankedParked = makeAccount(email: "parked@x.com", active: false, fetchedAt: 1_000)
+        let codexHome = makeAccount(provider: "codex", email: "codex@x.com", active: false,
+                                    fetchedAt: 1_000, monitorOnly: true)
+        let unresolvedHome = UsageAccount(
+            provider: "claude", email: "(active/unresolved)", active: false, plan: nil,
+            status: nil, error: nil, fiveHour: nil, sevenDay: nil, worstLimit: nil, modelCap: nil,
+            staleEntry: nil, fetchedAt: nil, unresolved: true, metadataEmail: nil,
+            monitorOnly: true, cooldownUntil: nil
+        )
+
+        try expect(UnseedPolicy.canUnseed(home), "a parked v2 home must offer Un-seed")
+        try expect(!UnseedPolicy.canUnseed(activeHome), "the active account must NEVER offer Un-seed")
+        try expect(!UnseedPolicy.canUnseed(bankedParked), "a v1 banked account has no home to un-seed")
+        try expect(!UnseedPolicy.canUnseed(codexHome), "Codex must NEVER offer Un-seed")
+        try expect(!UnseedPolicy.canUnseed(unresolvedHome), "an unresolved login has no home to name")
+
+        // Remove and Un-seed are mutually exclusive by construction, on every card.
+        for account in [home, activeHome, bankedParked, codexHome, unresolvedHome] {
+            try expect(
+                !(RemoveAccountPolicy.canRemove(account) && UnseedPolicy.canUnseed(account)),
+                "no card may offer both Remove and Un-seed (\(account.email))"
+            )
+        }
+
+        try expect(
+            UnseedPolicy.inlinePrompt(email: "home.person@example.com") == "Un-seed home.person?",
+            "the prompt uses the short local part, like the remove strip"
+        )
+        try expect(UnseedPolicy.confirmButtonTitle == "Un-seed", "confirm button reads 'Un-seed'")
+        try expect(UnseedPolicy.actionTitle == "Un-seed…", "the shelf action ellipsis promises a confirmation")
+    }
+
+    // Both inline confirmations share one slot, so arming either closes the other — the "only one
+    // strip open anywhere" invariant survives having two kinds of destructive action.
+    private static func testInlineConfirmationKinds() throws {
+        var confirm = InlineRemovalConfirmation()
+        confirm.toggle(email: "a@x.com", kind: .remove)
+        try expect(confirm.isArmed(email: "a@x.com", kind: .remove), "remove arms its own kind")
+        try expect(
+            !confirm.isArmed(email: "a@x.com", kind: .unseed),
+            "an armed remove strip must not read as an armed un-seed strip"
+        )
+
+        // Same card, other verb: the strip switches rather than opening a second one.
+        confirm.toggle(email: "a@x.com", kind: .unseed)
+        try expect(confirm.isArmed(email: "a@x.com", kind: .unseed), "un-seed takes the slot")
+        try expect(!confirm.isArmed(email: "a@x.com", kind: .remove), "remove gives the slot up")
+        try expect(confirm.armedEmail == "a@x.com", "the card is still the armed one")
+
+        // Re-tapping the same verb on the same card disarms it.
+        confirm.toggle(email: "a@x.com", kind: .unseed)
+        try expect(!confirm.isArmed, "a second tap on the same action disarms")
+
+        // A different card takes the slot outright.
+        confirm.toggle(email: "a@x.com", kind: .unseed)
+        confirm.toggle(email: "b@x.com", kind: .remove)
+        try expect(confirm.isArmed(email: "b@x.com", kind: .remove), "another card moves the strip")
+        try expect(!confirm.isArmed(email: "a@x.com"), "the first card is no longer armed at all")
+
+        confirm.reset()
+        try expect(!confirm.isArmed && confirm.armedEmail == nil, "a popover close clears every kind")
+
+        // The default remains Remove, so every existing call site keeps its meaning.
+        var legacy = InlineRemovalConfirmation()
+        legacy.toggle(email: "c@x.com")
+        try expect(legacy.isArmed(email: "c@x.com", kind: .remove), "toggle defaults to the remove kind")
+    }
+
+    // The caption after an un-seed is the command's own report of what it tore down, parsed from
+    // `unseed.py --json` (the form its author documents for QuotaBar). A shape change on the
+    // scripts side must degrade to a duller caption, never to a wrong or blank one.
+    private static func testUnseedSummaryCaption() throws {
+        // The full result dict unseed.py emits on a successful --yes --json run.
+        let full = #"""
+        {
+          "email": "home@x.com",
+          "home": "/acc/homes/home-x",
+          "home_removed": true,
+          "registry_entry_removed": true,
+          "keychain_slot": "Claude Code-credentials-ab12cd34",
+          "keychain_slot_deleted": true,
+          "archived_credential": "/acc/archive/home@x.com.1790000000.json",
+          "archived_home_history": "/acc/archive/unseeded-home@x.com.1790000000",
+          "warnings": []
+        }
+        """#
+        try expect(
+            UnseedSummary.caption(fromStdout: full)
+                == "removed home, keychain slot, registry entry · archived credential, history",
+            "the caption names what went and what was kept"
+        )
+
+        // A home whose credential seat was already empty: nothing to archive, still a real removal.
+        let noSeat = #"""
+        {"email": "h@x.com", "home_removed": true, "registry_entry_removed": true,
+         "keychain_slot_deleted": false, "archived_credential": null,
+         "archived_home_history": null, "warnings": []}
+        """#
+        try expect(
+            UnseedSummary.caption(fromStdout: noSeat) == "removed home, registry entry",
+            "nothing archived means no archived clause, not an empty one"
+        )
+
+        // The clean no-op unseed.py reports with exit 0 when there was nothing there.
+        try expect(
+            UnseedSummary.caption(
+                fromStdout: #"{"email": "h@x.com", "would_remove": false, "reason": "absent"}"#
+            ) == "nothing to un-seed",
+            "an already-absent home reads as a no-op, not a failure"
+        )
+        try expect(
+            UnseedSummary.caption(fromStdout: #"{"email": "h@x.com", "warnings": []}"#)
+                == "nothing to un-seed",
+            "a result dict reporting no action taken says so"
+        )
+
+        // A warning rides along with the inventory — today, the v1 dangling-pointer note.
+        let warned = #"""
+        {"email": "h@x.com", "home_removed": true, "registry_entry_removed": true,
+         "keychain_slot_deleted": true, "archived_credential": "/acc/archive/h.json",
+         "archived_home_history": null,
+         "warnings": ["pointer left dangling at a removed home; it is registry-gated"]}
+        """#
+        try expect(
+            UnseedSummary.caption(fromStdout: warned)
+                == "removed home, keychain slot, registry entry · archived credential · "
+                 + "pointer left dangling at a removed home; it is registry-gated",
+            "a warning is carried verbatim after the inventory"
+        )
+
+        // Fallback: the FIRST line, never the last. The human rendering ends on a "recover:"
+        // hint, so the last line would caption the card with recovery advice as the outcome.
+        try expect(
+            UnseedSummary.caption(fromStdout:
+                "un-seeded h@x.com\n  home removed:      /acc/homes/h\n"
+                + "  recover:           the archived copies above are the ONLY remaining trace\n")
+                == "un-seeded h@x.com",
+            "non-JSON output falls back to the command's FIRST line, not its recover hint"
+        )
+        try expect(
+            UnseedSummary.caption(fromStdout: "") == "Un-seeded",
+            "a silent command still confirms something happened"
+        )
+        try expect(
+            UnseedSummary.caption(fromStdout: "   \n\n") == "Un-seeded",
+            "whitespace-only output is treated as silence"
+        )
+    }
+
+    // A refused un-seed changed nothing (unseed.py computes refusals before touching anything),
+    // so the card explains the cause in one line instead of printing a terminal paragraph.
+    private static func testUnseedFailureText() throws {
+        // rc 74 covers two situations needing two different actions; the refusal sentence
+        // distinguishes them, so the card names the action rather than the diagnostic.
+        try expect(
+            UnseedFailureText.message(exitCode: 74, stderrLine:
+                "un-seed: session abc-123 (pid 4111) is BUSY on this home. UNKNOWN counts as live — exit that session first.")
+                == "A session is still live on this home — quit it first",
+            "a live session reads as 'quit the session'"
+        )
+        try expect(
+            UnseedFailureText.message(exitCode: 74, stderrLine:
+                "un-seed: accounts/current points at this home and the epoch is v2, so future launches would resolve to it. Repoint first (claude-acct --switch <other-email>), then un-seed.")
+                == "Future launches still point here — switch to another account first",
+            "a pointer refusal reads as 'switch first', which is the different action it needs"
+        )
+        try expect(
+            UnseedFailureText.message(exitCode: 74, stderrLine:
+                "un-seed: a restart lease is HELD on session abc-123 pinned to this home")
+                == "A session is still live on this home — quit it first",
+            "a held restart lease falls in with the session case"
+        )
+        // (v102-r2) the third cause of rc 74: a launch the fence admitted but no session record
+        // exists for yet. "A session" would send the owner looking for something not in the list.
+        try expect(
+            UnseedFailureText.message(exitCode: 74, stderrLine:
+                "un-seed: a pinned launch (pid 4111) was admitted on this home and its process is still alive. Quit that session — or let the launch fail — and re-run.")
+                == "A pinned session is starting on this home — quit that window first",
+            "an admitted-but-unregistered launch names the Terminal window, not a session"
+        )
+        try expect(
+            UnseedFailureText.message(exitCode: 78, stderrLine: "un-seed: a SEEDING transaction is in flight")
+                == "Seeding in flight — try again once it finishes",
+            "rc 78 names the thing to wait for"
+        )
+        try expect(
+            UnseedFailureText.message(exitCode: 70, stderrLine: "un-seed: barrier contended")
+                == "Bank busy — try again in a moment",
+            "rc 70 is transient and says so"
+        )
+        try expect(
+            UnseedFailureText.message(exitCode: 73, stderrLine: "un-seed: confirmation required")
+                == "Needs confirmation — try again",
+            "rc 73 should be unreachable (we always pass --yes), but must not read as a crash"
+        )
+        try expect(
+            UnseedFailureText.message(exitCode: 75, stderrLine: "un-seed: the home is gone but the registry is unreadable")
+                == "un-seed: the home is gone but the registry is unreadable",
+            "a mid-flight failure keeps its own detail — the owner needs it"
+        )
+        try expect(
+            UnseedFailureText.message(exitCode: nil, stderrLine: "Script failed") == "Script failed",
+            "a launch/timeout failure with no exit status is untouched"
+        )
+    }
+
+    // "Pinned session…" opens a Terminal running claude-acct <email>; it only exists where homes
+    // do (shadow|v2), and only for an account the registry could map.
+    private static func testPinnedSessionPolicyAndCommand() throws {
+        let account = makeAccount(email: "a@x.com", active: false, fetchedAt: 1_000)
+        let relogin = UsageAccount(
+            provider: "claude", email: "dead@x.com", active: false, plan: nil,
+            status: "needs-relogin", error: nil, fiveHour: nil, sevenDay: nil, worstLimit: nil,
+            modelCap: nil, staleEntry: nil, fetchedAt: nil, unresolved: nil, metadataEmail: nil,
+            monitorOnly: nil, cooldownUntil: nil
+        )
+        let unresolved = UsageAccount(
+            provider: "claude", email: "(active/unresolved)", active: true, plan: nil,
+            status: nil, error: nil, fiveHour: nil, sevenDay: nil, worstLimit: nil, modelCap: nil,
+            staleEntry: nil, fetchedAt: nil, unresolved: true, metadataEmail: nil,
+            monitorOnly: nil, cooldownUntil: nil
+        )
+        let codex = makeAccount(provider: "codex", email: "c@x.com", active: false, fetchedAt: 1_000)
+
+        try expect(PinnedSessionPolicy.canOpen(account, epoch: .shadow), "shadow has homes to pin to")
+        try expect(PinnedSessionPolicy.canOpen(account, epoch: .v2), "v2 has homes to pin to")
+        try expect(!PinnedSessionPolicy.canOpen(account, epoch: .v1), "v1 has no homes at all")
+        try expect(!PinnedSessionPolicy.canOpen(account, epoch: .unknown), "a broken epoch offers nothing")
+        try expect(!PinnedSessionPolicy.canOpen(relogin, epoch: .v2), "a dead login would open a dead session")
+        try expect(!PinnedSessionPolicy.canOpen(unresolved, epoch: .v2), "an unnameable login can't be mapped")
+        try expect(!PinnedSessionPolicy.canOpen(codex, epoch: .v2), "Codex has no pinned-session flow")
+
+        // Both Terminal launches quote their arguments; an address is not trusted just because
+        // it looks like one.
+        try expect(
+            TerminalLaunch.pinnedSessionCommand(bash: "/bin/bash", claudeAcct: "/s/claude-acct",
+                                                email: "a@x.com")
+                == "/bin/bash '/s/claude-acct' 'a@x.com'",
+            "the pinned-session command is the launcher plus the address, quoted"
+        )
+        try expect(
+            TerminalLaunch.addAccountCommand(bash: "/bin/bash", claudeAcct: "/s/claude-acct",
+                                             email: "a@x.com")
+                == "/bin/bash '/s/claude-acct' --add 'a@x.com'",
+            "the add-account command is unchanged by the refactor"
+        )
+        try expect(
+            TerminalLaunch.quote("it's") == #"'it'\''s'"#,
+            "an embedded quote is closed, escaped and reopened"
+        )
+        try expect(
+            TerminalLaunch.pinnedSessionCommand(bash: "/bin/bash", claudeAcct: "/s/claude-acct",
+                                                email: "a@x.com; rm -rf /")
+                == "/bin/bash '/s/claude-acct' 'a@x.com; rm -rf /'",
+            "shell metacharacters stay inside the quotes"
+        )
+    }
+
+    // The UNLINKED card is epoch-specific: under v1/shadow it offers the link, under v2 it explains
+    // itself instead, because a re-bank there is fenced (rc 78) and the button would be a lie.
+    private static func testUnresolvedCardPresentation() throws {
+        try expect(UnresolvedCardPresentation.showsLinkButton(epoch: .v1), "v1 can link")
+        try expect(UnresolvedCardPresentation.showsLinkButton(epoch: .shadow), "shadow can link")
+        try expect(UnresolvedCardPresentation.showsLinkButton(epoch: .unknown),
+                   "an unknown epoch keeps the safe v1 surface; the script fences a real mutation")
+        try expect(!UnresolvedCardPresentation.showsLinkButton(epoch: .v2),
+                   "v2 must not offer a flow its own epoch refuses")
+        try expect(
+            UnresolvedCardPresentation.caption(epoch: .v1, displayName: "a@x.com")
+                == "This login isn't linked to a tracked account yet. Link it to attribute usage.",
+            "the v1 caption is unchanged"
+        )
+        try expect(
+            UnresolvedCardPresentation.caption(epoch: .v2, displayName: "a@x.com")
+                == "pre-cutover login — drains a@x.com, expires with old sessions",
+            "under v2 the card says what the leftover slot actually is"
+        )
+    }
+
+    // (v102) The healed plan-change notice: the one entry on the health pipe that reports a fix
+    // rather than a problem. It must survive under v1 (a subscription can change in any epoch —
+    // unlike the archiver rows, which describe v2 machinery), use the friendly plan names, and
+    // go quiet once dismissed.
+    private static func testHealedPlanChangeNotice() throws {
+        func health(_ json: String) throws -> Health {
+            try JSONDecoder().decode(Health.self, from: Data(json.utf8))
+        }
+        let healed = try health(#"""
+        {"healed_plan_change": {"from": "pro", "to": "max_20x", "email": "person@example.com", "ts": 500}}
+        """#)
+        guard let notice = HealthPresentation.healedPlanChange(healed, ackedTs: 0) else {
+            throw TestFailure.failed("a pending plan-change notice must surface")
+        }
+        try expect(
+            notice.text == "person PRO → MAX 20× · re-banked",
+            "the notice uses the friendly plan names and says no action is needed (got: \(notice.text))"
+        )
+        try expect(notice.ts == 500, "the notice carries its timestamp for the ack")
+
+        // Deliberately NOT epoch-gated, unlike every other health row.
+        try expect(
+            HealthPresentation.healedPlanChange(healed, ackedTs: 0) != nil,
+            "a plan change is reportable in any epoch — the heal runs in the same poll"
+        )
+        // Dismissal is by timestamp: this one goes quiet, a later one does not.
+        try expect(
+            HealthPresentation.healedPlanChange(healed, ackedTs: 500) == nil,
+            "acknowledging the notice silences exactly it"
+        )
+        try expect(
+            HealthPresentation.healedPlanChange(healed, ackedTs: 499) != nil,
+            "an older ack does not silence a newer notice"
+        )
+        // Degrade quietly rather than rendering a half-sentence.
+        let empty = try health("{}")
+        let noEmail = try health(#"{"healed_plan_change": {"to": "max", "ts": 9}}"#)
+        let noTier = try health(#"{"healed_plan_change": {"from": "pro", "email": "a@x.com", "ts": 9}}"#)
+        let noPrior = try health(#"{"healed_plan_change": {"to": "max", "email": "a@x.com", "ts": 9}}"#)
+        try expect(
+            HealthPresentation.healedPlanChange(empty, ackedTs: 0) == nil,
+            "no notice on the pipe means no row"
+        )
+        try expect(
+            HealthPresentation.healedPlanChange(noEmail, ackedTs: 0) == nil,
+            "a notice naming no account is not rendered"
+        )
+        try expect(
+            HealthPresentation.healedPlanChange(noTier, ackedTs: 0) == nil,
+            "a notice with no destination tier is not rendered"
+        )
+        // An unknown prior tier still yields a clean sentence, just a shorter one.
+        guard let noFrom = HealthPresentation.healedPlanChange(noPrior, ackedTs: 0)
+        else { throw TestFailure.failed("a notice with a known destination must still render") }
+        try expect(
+            noFrom.text == "a is now MAX · re-banked",
+            "with no prior tier the sentence drops the parenthetical (got: \(noFrom.text))"
+        )
+        // The other health rows must be unaffected by the new key.
+        try expect(
+            HealthPresentation.archiverWarning(healed, epoch: .v2) == nil
+                && HealthPresentation.forkDriftLine(healed, epoch: .v2) == nil,
+            "a payload carrying only a plan notice raises no anomaly rows"
+        )
+    }
+
+    // (v102-r2) The notice has to REACH a surface, not merely decode. The row lives inside the
+    // health section, and that whole section is gated — so a payload carrying ONLY a plan notice
+    // has to count as something to show, in both places that answer that question. It did not:
+    // HealthPresentation.isHealthy ignored the key entirely, which is the same drift (a new
+    // health field with nowhere to land) one layer up from the one that dropped it originally.
+    private static func testHealedPlanNoticeIsRendered() throws {
+        let onlyNotice = try JSONDecoder().decode(Health.self, from: Data(#"""
+        {"healed_plan_change": {"from": "max", "to": "pro", "email": "a@x.com", "ts": 700}}
+        """#.utf8))
+        try expect(
+            HealthPresentation.healedPlanChange(onlyNotice, ackedTs: 0) != nil,
+            "premise: the payload carries a pending notice"
+        )
+        try expect(
+            !HealthPresentation.isHealthy(onlyNotice, epoch: .v2, seedAuditAckTs: 0),
+            "a pending plan notice is NOT the healthy state — the section that renders it must open"
+        )
+        try expect(
+            !HealthPresentation.isHealthy(onlyNotice, epoch: .v1, seedAuditAckTs: 0),
+            "...in v1 too, where the row is deliberately not epoch-gated"
+        )
+        try expect(
+            HealthPresentation.isHealthy(onlyNotice, epoch: .v2, seedAuditAckTs: 0,
+                                         healNoticeAckTs: 700),
+            "once acknowledged the same payload is healthy again — the notice is one-time"
+        )
+        let quiet = try JSONDecoder().decode(Health.self, from: Data("{}".utf8))
+        try expect(
+            HealthPresentation.isHealthy(quiet, epoch: .v2, seedAuditAckTs: 0),
+            "an empty health payload still renders no chrome at all"
+        )
+    }
+
+    // (v102-r2) A pinned launch opens a Terminal directly — the ONE actuator outside the FIFO —
+    // so nothing in the queue can stop it racing an un-seed of the home it would open.
+    private static func testPinnedLaunchGate() throws {
+        try expect(!PinnedLaunchGate.isBlocked(busyKinds: [String]()),
+                   "an idle app offers pinned sessions")
+        try expect(!PinnedLaunchGate.isBlocked(busyKinds: ["ping", "switch", "remove"]),
+                   "other actions do not block a launch — they are all serialized already")
+        try expect(PinnedLaunchGate.isBlocked(busyKinds: ["unseed"]),
+                   "an un-seed in flight blocks every pinned launch")
+        try expect(PinnedLaunchGate.isBlocked(busyKinds: ["ping", "unseed"]),
+                   "...including alongside unrelated work on other cards")
+        try expect(PinnedLaunchGate.unseedKind == "unseed",
+                   "the gate keys on the un-seed ActionKind's raw value")
+        try expect(PinnedSessionPolicy.blockedHelp != PinnedSessionPolicy.help,
+                   "a disabled control says why it is disabled")
+    }
+
+    // MARK: - (v102) update-available hint
+
+    // (v102-r2) The update-check boundary is a host and a path, not a string literal: the loader
+    // follows redirects, so "we only talk to this URL" was only true of the first request.
+    private static func testUpdateEndpointAllowlist() throws {
+        let endpoint = URL(string: "https://\(UpdateEndpoint.host)\(UpdateEndpoint.path)")
+        try expect(UpdateEndpoint.isAllowed(endpoint), "the endpoint itself is allowed")
+        try expect(
+            UpdateEndpoint.isAllowed(URL(string: "HTTPS://API.GITHUB.COM\(UpdateEndpoint.path)")),
+            "scheme and host compare case-insensitively, as URLs do"
+        )
+        // The redirect targets a cross-host response could name.
+        try expect(
+            !UpdateEndpoint.isAllowed(URL(string: "https://evil.example.com\(UpdateEndpoint.path)")),
+            "another host is refused even at the same path — this is the redirect case"
+        )
+        try expect(
+            !UpdateEndpoint.isAllowed(URL(string: "https://api.github.com.evil.example.com\(UpdateEndpoint.path)")),
+            "a suffix-extended host is a different host"
+        )
+        try expect(
+            !UpdateEndpoint.isAllowed(URL(string: "https://\(UpdateEndpoint.host)/repos/someone/else/releases/latest")),
+            "another path on the SAME host is refused too — the allowlist is host AND path"
+        )
+        try expect(
+            !UpdateEndpoint.isAllowed(URL(string: "http://\(UpdateEndpoint.host)\(UpdateEndpoint.path)")),
+            "plaintext is refused"
+        )
+        try expect(
+            !UpdateEndpoint.isAllowed(URL(string: "https://\(UpdateEndpoint.host)\(UpdateEndpoint.path)?token=x")),
+            "a query string is not part of the one request this app makes"
+        )
+        try expect(
+            !UpdateEndpoint.isAllowed(URL(string: "https://user:pw@\(UpdateEndpoint.host)\(UpdateEndpoint.path)")),
+            "credentials in the URL are refused — the request is unauthenticated by contract"
+        )
+        try expect(
+            !UpdateEndpoint.isAllowed(URL(string: "https://\(UpdateEndpoint.host):8443\(UpdateEndpoint.path)")),
+            "a non-default port is a different endpoint"
+        )
+        try expect(!UpdateEndpoint.isAllowed(nil), "no URL is not an allowed URL")
+    }
+
+    private static func testSemanticVersionParsing() throws {
+        try expect(SemanticVersion.parse("1.0.2")?.description == "1.0.2", "a bare version parses")
+        try expect(SemanticVersion.parse("v1.0.2")?.description == "1.0.2", "a v-prefixed tag parses")
+        try expect(SemanticVersion.parse(" v1.0.2 ")?.description == "1.0.2", "surrounding space is trimmed")
+        try expect(SemanticVersion.parse("1.10.0")! > SemanticVersion.parse("1.9.9")!,
+                   "comparison is numeric, not lexicographic — 1.10 beats 1.9")
+        try expect(SemanticVersion.parse("2.0.0")! > SemanticVersion.parse("1.99.99")!,
+                   "major wins over minor and patch")
+        try expect(SemanticVersion.parse("1.0.2")! == SemanticVersion.parse("v1.0.2")!,
+                   "the v prefix is not part of the version")
+        // Anything we cannot reason about parses to nil, and nil means the hint stays hidden.
+        try expect(SemanticVersion.parse(nil) == nil, "absent input parses to nil")
+        try expect(SemanticVersion.parse("") == nil, "empty input parses to nil")
+        try expect(SemanticVersion.parse("1.0") == nil, "a two-component version is not accepted")
+        try expect(SemanticVersion.parse("1.0.2.3") == nil, "a four-component version is not accepted")
+        try expect(SemanticVersion.parse("1.0.2-beta.1") == nil,
+                   "a pre-release tag must never be offered as an upgrade over a stable build")
+        try expect(SemanticVersion.parse("nightly") == nil, "a non-numeric tag parses to nil")
+        try expect(SemanticVersion.parse("1..2") == nil, "an empty component parses to nil")
+    }
+
+    private static func testUpdateCheckSchedule() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        try expect(
+            UpdateCheckSchedule.shouldCheck(enabled: true, lastCheck: nil, now: now),
+            "a machine that has never checked checks now"
+        )
+        try expect(
+            !UpdateCheckSchedule.shouldCheck(enabled: false, lastCheck: nil, now: now),
+            "the toggle is the first gate — off means no request, ever"
+        )
+        try expect(
+            !UpdateCheckSchedule.shouldCheck(
+                enabled: true, lastCheck: now.addingTimeInterval(-86_399), now: now
+            ),
+            "under 24h since the last attempt, nothing fires — this is what survives relaunches"
+        )
+        try expect(
+            UpdateCheckSchedule.shouldCheck(
+                enabled: true, lastCheck: now.addingTimeInterval(-86_400), now: now
+            ),
+            "exactly 24h is due"
+        )
+        try expect(
+            UpdateCheckSchedule.shouldCheck(
+                enabled: true, lastCheck: now.addingTimeInterval(3_600), now: now
+            ),
+            "a timestamp from the future (clock moved back) is due, not a 24h lockout"
+        )
+    }
+
+    private static func testUpdateHintVisibility() throws {
+        // The ordinary case, and by far the most common one: nothing to say.
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "v1.0.2", dismissedVersion: nil) == nil,
+            "being current shows no hint"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: nil, dismissedVersion: nil) == nil,
+            "before any successful check there is nothing to compare against"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.3", latestTag: "v1.0.2", dismissedVersion: nil) == nil,
+            "a local build ahead of the published release is not 'behind'"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "v1.0.3", dismissedVersion: nil)?
+                .description == "1.0.3",
+            "a newer published release surfaces"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "1.0.3", dismissedVersion: nil)?
+                .description == "1.0.3",
+            "the tag's v prefix is optional"
+        )
+        // Comparison is numeric, so the hint can't miss the release that matters most.
+        try expect(
+            UpdateHint.availableVersion(current: "1.9.0", latestTag: "v1.10.0", dismissedVersion: nil)?
+                .description == "1.10.0",
+            "1.10.0 must register as newer than 1.9.0 (string equality would have missed it)"
+        )
+        // Dismissal is per version: this one goes quiet, the next one does not.
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "v1.0.3", dismissedVersion: "1.0.3") == nil,
+            "dismissing a version silences exactly that version"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "v1.0.3", dismissedVersion: "v1.0.3") == nil,
+            "dismissal is compared as a version, so the v prefix doesn't defeat it"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "v1.0.4", dismissedVersion: "1.0.3")?
+                .description == "1.0.4",
+            "a LATER release reappears after an earlier one was dismissed"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "v1.0.3", dismissedVersion: "garbage")?
+                .description == "1.0.3",
+            "an unparseable dismissal record must not silence a real update"
+        )
+        // Nonsense from the endpoint is silence, never a hint we can't justify.
+        try expect(
+            UpdateHint.availableVersion(current: "1.0.2", latestTag: "nightly", dismissedVersion: nil) == nil,
+            "an unparseable tag shows nothing"
+        )
+        try expect(
+            UpdateHint.availableVersion(current: nil, latestTag: "v1.0.3", dismissedVersion: nil) == nil,
+            "with no version of our own to compare, we say nothing"
+        )
+    }
+
+    private static func testUpdateHintCopyAndPayload() throws {
+        try expect(
+            UpdateHint.line(version: SemanticVersion(major: 1, minor: 0, patch: 3))
+                == "1.0.3 available · brew upgrade --cask quotabar",
+            "the footer line names the version and the one command that gets it"
+        )
+        // The User-Agent is the whole identity of the request: product, version, nothing else.
+        try expect(
+            UpdateHint.userAgent(version: "1.0.2") == "QuotaBar/1.0.2",
+            "the User-Agent is honest and carries nothing about the machine"
+        )
+        try expect(
+            UpdateHint.userAgent(version: nil) == "QuotaBar/unknown",
+            "a missing bundle version must not produce a malformed header"
+        )
+        try expect(
+            UpdateHint.tagName(fromJSON: Data(#"{"tag_name": "v1.0.3", "name": "QuotaBar 1.0.3"}"#.utf8))
+                == "v1.0.3",
+            "tag_name is the only field read out of the release payload"
+        )
+        try expect(
+            UpdateHint.tagName(fromJSON: Data(#"{"message": "Not Found"}"#.utf8)) == nil,
+            "an error payload yields no tag"
+        )
+        try expect(
+            UpdateHint.tagName(fromJSON: Data(#"{"tag_name": ""}"#.utf8)) == nil,
+            "an empty tag is no tag"
+        )
+        try expect(
+            UpdateHint.tagName(fromJSON: Data("not json".utf8)) == nil,
+            "a malformed response yields no tag"
+        )
     }
 
     private static func makeAccount(

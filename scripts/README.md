@@ -44,11 +44,16 @@ this for parked-account refresh (below). *Verified empirically 2026-07-19.*
   account-warn.sh     SessionStart hook: AUTO-PICK the best Claude account for
                       future sessions (plan-tiered ladder); falls back to a warn
                       note when it cannot pick
+  unseed.py <e>       remove a seeded READY home — the inverse of add-account.sh
+                      (archive-before-delete; --yes gates every destructive step)
 
 $BANK_DIR/                          the "bank" (chmod 700; default ~/.claude/accounts)
   <email>.json                      full account record (chmod 600)
   .keychain-snapshots/              pre-write keychain backups (last 20)
   .usage-cache.json                 last-good usage output + backoff state
+  .unlinked-heal.json               poll-heal backoff window + pending notice
+  .drift-announce.json              last-announced SessionStart deferral (debounce)
+  archive/                          pre-overwrite credential copies + un-seed keeps
   .lock/                            mkdir lock
 ```
 
@@ -150,6 +155,40 @@ QuotaBar surfaces this as a trailing `…` control on **parked** Claude cards on
 runs `remove-account.sh` through the same global action queue as ping/switch/toggle;
 the card disappears on the next poll.
 
+## Un-seeding a home (the inverse of seeding)
+
+`remove-account.sh` above is the **v1** removal: it forgets a bank record. A home seeded for
+launch pinning (`claude-acct --add`, ISOLATION-DESIGN.md §7) is a different object — a real
+directory under `accounts/homes/`, a READY registry entry, and an OAuth grant living in that
+home's own keychain slot. Nothing undid that until v1.0.2.
+
+```
+claude-acct --un-seed <email>                  # print the plan, change nothing (exit 73)
+claude-acct --un-seed <email> --yes [--json]   # do it
+```
+
+The order below **is** the recovery story, so it is worth stating plainly. The home's current
+credential is archived into `$BANK_DIR/archive/` **first** — outside the home, so it survives
+what follows — and the home's own `archive/` history (the archiver's accumulated copies, which
+live *inside* the home) is moved out alongside it. Then the per-config-dir keychain slot is
+deleted through the seat abstraction (`seedflow.seat_delete`, never a hand-rolled service
+name), then the home tree, and the **registry entry last**. Every consumer of a READY entry
+also requires `isdir(home)`, so an entry left behind by a crash mid-way is inert — nothing can
+launch on it — and re-running finishes the job. The archived copies are the only remaining
+trace, and they are what makes un-seeding recoverable rather than final.
+
+It **refuses** rather than guesses: while a `SEEDING` transaction is in flight (78); while the
+launch pointer targets the home under `shadow`/`v2`, where repointing is possible and future
+launches would resolve to it (74 — under `v1` the pointer is inert *and* repoint refuses to
+move it, so the removal proceeds and reports the dangling pointer instead of stranding the
+home forever); while a session is live on the home or a restart lease is held on one, with
+UNKNOWN liveness counted as live (74); and if the credential seat cannot be READ, because
+nothing should be deleted that could not first be archived (75). Everything runs under the
+seeding barrier (bank → pointer → homes, the §8 total order).
+
+`--yes` gates every destructive step, which is how QuotaBar drives it: show the plan in its
+own confirmation UI, then re-run with `--yes --json`.
+
 ## Auto-ping (opt-in, piggybacked on the poll — no new scheduler)
 
 Auto-ping keeps a 5-hour window running for opted-in accounts: when the SwiftBar
@@ -239,14 +278,43 @@ auto-pick pool." So **adding an account is just `/login` once** — the next
 session banks it automatically. Fail-soft (a lock-busy bank just retries next
 session).
 
-## Login-sync (automatic re-bank)
+## Login-sync (automatic re-bank) and the poll heal
 
-At every session start the hook compares the live keychain blob (token + plan)
-to the active account's bank record; on any drift it re-banks silently — so a
-routine `/login` needs no manual Re-bank and the plan chip stays accurate. A
-plan change is announced ("plan change detected (pro -> max)"). The Re-bank
-button in QuotaBar remains only for **needs-relogin** recovery of parked
-accounts.
+At every session start the hook compares the live keychain blob (token + plan) to the active
+account's bank record. It re-banks only the **one case it can prove offline**: an access token
+that is byte-identical to the banked one, with a rotated refresh token or expiry. An access
+token is issued to exactly one account, so that is proof of ownership without a network call —
+and the hook has a 5s budget in which a network call is the historical false-death hazard.
+Everything else is **deferred, and announced**: a changed access token is offline-
+indistinguishable from a different account's keychain-first `/login`, and re-banking it
+blindly would write B's tokens into A's record.
+
+What the hook defers, the **poll heals**. `usage.py` re-runs the same comparison holding the
+bank lock, and where the hook had no oracle it asks the live G9 profile endpoint who the
+credential actually belongs to; it re-banks only on `RESOLVED`-and-equal. Every non-answer
+(offline, timeout, 429, 5xx) is a refusal, so an offline poll can never heal at all. The
+UNLINKED chip is therefore only ever up for states that genuinely need attention.
+
+**Plan changes (v1.0.2).** A plan-tier change used to be refused by *both* paths, which left
+the owner with an alarming chip and a manual `bank-account.sh` for what is a routine upgrade.
+Now that the oracle positively names the account, a tier change is a benign same-account event:
+the poll heals it and raises a one-time `health.healed_plan_change` notice — `{from, to, email,
+ts}` on the same pipe QuotaBar already reads — so the state is repaired *and* reported instead
+of one at the cost of the other. It clears via `usage.py --ack-heal-notice`, or on its own
+after `ACCOUNT_BANK_HEAL_NOTICE_TTL` (default 24h). The hook still announces the change when it
+sees it first; it just no longer has the last word.
+
+**Announced once, not every session (v1.0.2).** A deferral is news the first time and noise
+after that — until something heals it, the same paragraph printed at every single SessionStart,
+which is worst on exactly the machines where QuotaBar is not running to do the healing. The
+hook now debounces on the *drift itself* (a fingerprint over the account, both credential
+fingerprints and the refusal reason, kept in `$BANK_DIR/.drift-announce.json`, 0600). The same
+drift stays silent; any new drift speaks again; a healed or in-sync state clears the record so
+the next real one is news. The diagnostics log still records every deferral — the debounce
+hides the owner-facing line, never the log — and an unreadable record fails **open** and
+announces, because silence must never be a failure mode.
+
+The Re-bank button in QuotaBar remains only for **needs-relogin** recovery of parked accounts.
 
 ## Auto-pick (SessionStart hook — plan-tiered account selection)
 

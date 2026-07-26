@@ -345,8 +345,21 @@ never through raw path construction (r4 MINOR).
 
 banklock mkdir protocol (token-owned, PID+start-time owner record, rename-away stale
 reclaim — as implemented) at: bank `accounts/.lock/`, pointer `accounts/.pointer.lock/`,
-per-home `<home>/.lock/`. Shell mkdir / Python banklock / Swift via helper script.
-No flock anywhere. Ordering per §8.
+per-home `<home>/.lock/`, sessions `accounts/.sessions.lock/`, and (v102-r2) launch
+admission `accounts/.admit.lock/`. Shell mkdir / Python banklock / Swift via helper
+script. No flock anywhere. Ordering per §8.
+
+**Launch admission (v102-r2).** `claude-acct` takes ONLY `.admit.lock`, and holds it just
+long enough to re-read the READY entry and write `accounts/.admissions/<pid>.json` naming
+the home it is about to `exec` onto. Un-seeding takes it LAST in the §8 order (bank →
+pointer → homes → admit), refuses while any admission's process is alive, and marks the
+registry entry not-READY before releasing it — after which no launcher can resolve the home
+at all, so the destructive work runs outside the admission lock. A launcher takes one lock
+and never the bank lock, so a pinned launch cannot queue behind a poll holding it across a
+network call, and no cycle is possible. An admission lives exactly as long as its pid
+(`exec` preserves both pid and start time); DEAD ones are swept on sight, UNKNOWN counts as
+live, and an unparseable one refuses. `gate-g8.sh --live` admits through the same fence —
+it launches the real CLI too.
 
 ### 10. QuotaBar app changes
 

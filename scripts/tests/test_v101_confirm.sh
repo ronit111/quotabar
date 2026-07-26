@@ -204,7 +204,14 @@ if [ ! -f "$REPO/app/Info.plist" ] || [ ! -f "$REPO/release.sh" ]; then
 fi
 V_SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$REPO/app/Info.plist")"
 V_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$REPO/app/Info.plist")"
-assert_eq "1.0.1" "$V_SHORT" "(#3) the shipped Info.plist reports 1.0.1"
+# (v102) assert the SHAPE, not the literal. This pinned "1.0.1" and so failed the moment the
+# app was bumped for the next release — a version bump is not a regression, and a test that
+# has to be edited on every release trains people to edit tests. The guard below is the real
+# subject; it is exercised with synthetic versions.
+case "$V_SHORT" in
+  [0-9]*.[0-9]*.[0-9]*) pass "(#3) the shipped Info.plist carries an x.y.z version ($V_SHORT)" ;;
+  *) fail "(#3) the shipped Info.plist carries an x.y.z version (got [$V_SHORT])" ;;
+esac
 assert_ne "1" "$V_BUILD" "(#3) CFBundleVersion was bumped too (upgrades need a higher build)"
 
 # Extract release.sh's version-guard block verbatim so the test exercises the SHIPPED code.

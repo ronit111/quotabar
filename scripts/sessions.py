@@ -141,6 +141,33 @@ def _load(acc):
         return {}
 
 
+class StoreUnreadable(Exception):
+    """A PRESENT sessions.json that could not be read or parsed."""
+
+
+def load_strict(acc):
+    """(v102-r2) The DESTRUCTIVE-GATE reader. Same store, opposite failure posture to _load.
+
+    _load answers a display question — "what should the popover show?" — and a torn store there
+    is safely rebuilt from live hooks, so it returns {}. Read as an answer to "is anything using
+    this home?", that {} is a lie in the one direction that matters: it turns "the session set is
+    unknown" into "there are no sessions", and un-seed would delete a home out from under a live
+    CLI. Every caller about to destroy something reads through here instead, where an ABSENT
+    store is {} (nothing has ever registered — provable) and a present-but-unreadable one
+    RAISES."""
+    p = os.path.join(acc, STORE)
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception as e:
+        raise StoreUnreadable(f"{STORE} is present but unreadable ({type(e).__name__}: {e})")
+    if not isinstance(d, dict):
+        raise StoreUnreadable(f"{STORE} is not an object")
+    return d
+
+
 def _save(acc, d):
     fd, tmp = tempfile.mkstemp(dir=acc, prefix=".sessions.")
     with os.fdopen(fd, "w") as f:

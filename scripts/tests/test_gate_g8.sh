@@ -39,6 +39,31 @@ out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_FAKE_KEYCHAIN="$T/kc2.
 # (r13 #8) G8 must hold the per-home lock across its backdate read-modify-writes.
 grep -q "BankLock(home)" "$AB/gate-g8.sh" && ok 0 "gate-g8 acquires the per-home lock for trials (r13 #8)" || ok 1 "gate-g8 takes the home lock (r13 #8)"
 
+# (v102-r2) G8 --live LAUNCHES the real CLI on a seeded home, so it is a launcher and must
+# record a launch admission — otherwise an un-seed run during a morning gate sees no session
+# (the trials are not registered sessions) and deletes the home underneath it. The live body
+# is maintainer-only, so this is pinned structurally: it admits, under the admission lock,
+# BEFORE it resolves the binary it is about to run.
+# (v102-r3) And it admits through admit_ready, the lock-held resolve-AND-record both launchers
+# share — never the low-level admit(), which would only record the home G8 resolved before the
+# lock existed. The pre-resolved path is passed as expect_home so a home taken out of service
+# in that gap REFUSES instead of being launched into.
+python3 - "$AB/gate-g8.sh" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+live = src[src.index('python3 - "$ACC" "$HOME_PATH" "$EMAIL" "$S"'):]
+compile(live[live.index("\n") + 1:live.index("\nPY\n")], "g8-live", "exec")   # it must parse
+assert "launchadmit.admit_ready(acc, email, os.getpid(), expect_home=home" in live, \
+    "the live gate must admit through the lock-held admit_ready, revalidating its home"
+assert "launchadmit.admit(acc," not in live, \
+    "the live gate must NOT call the low-level admit() — that records a pre-lock resolution"
+assert "launchadmit.AdmissionContended" in live and "launchadmit.AdmissionRefused" in live, \
+    "a contended lock and a refused home must both stop the gate, and be distinguishable"
+assert live.index("admit_ready(") < live.index("resolve_claude_bin()"), \
+    "the admission must be recorded BEFORE the launch path is set up"
+PY
+ok $? "gate-g8 --live admits through the lock-held admit_ready before launching (v102-r3)"
+
 # (seat) the STRUCTURAL (non-live) check must pass on BOTH seat kinds — it resolves the READY
 # home + checks the tier-1 writer is importable, never reading the credential, so a slot-seat
 # home (no .credentials.json file) passes just like a file-seat home.

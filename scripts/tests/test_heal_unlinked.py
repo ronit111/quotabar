@@ -109,10 +109,10 @@ def main():
     ok(usage._benign_drift_refusal("nobody@x.com", rotated) == "active identity is not banked",
        "an unbanked active identity REFUSES the heal")
 
-    # a plan-tier change is the hook's job (it announces it) and is also the crossed-identity
-    # tell write_bank_record.py uses
-    ok(usage._benign_drift_refusal("a@x.com", cred("v2", plan="pro")) == "plan tier changed",
-       "a plan-tier change REFUSES the heal")
+    # (v102) a plan-tier change is no longer a refusal — see test_v102_plan_heal.py for the
+    # heal + notice. Asserted here only so this file's refusal list stays honest about it.
+    ok(usage._benign_drift_refusal("a@x.com", cred("v2", plan="pro")) == "",
+       "(v102) an oracle-confirmed plan-tier change is NOT a refusal any more")
 
     # nothing to heal: the keychain already matches the record
     ok(usage._benign_drift_refusal("a@x.com", banked) == "no drift to heal",

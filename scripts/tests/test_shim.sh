@@ -10,7 +10,10 @@ ok() { if [ "$1" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $2"; else FAILS=$(
 T="$(mktemp -d)"
 ACC="$T/accounts"
 mkdir -p "$ACC/bin" "$ACC/homes/a-at-x.com" "$T/realbin" "$T/scripts"
-for f in registry.py epoch.py repoint.py banklock.py sessions.py _authenv.sh; do cp "$HERE/$f" "$T/scripts/"; done
+# (v102-r3) bank_common.py is staged too: launchadmit validates a marker's email through
+# bank_common.safe_email, so it is now a launch-path dep. The installer ditto's the whole
+# scripts dir, so this list is the one place that has to be told.
+for f in registry.py epoch.py repoint.py banklock.py sessions.py launchadmit.py bank_common.py _authenv.sh; do cp "$HERE/$f" "$T/scripts/"; done
 
 # stub "real" claude: proves exec reached it + echoes its view of the env
 cat > "$T/realbin/claude" <<'EOF'
@@ -142,6 +145,53 @@ out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" ACCOUNT_BAN
 out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" ACCOUNT_BANK_SCRIPTS_DIR="$T/scripts" "$HERE/claude-acct" a@x.com hi 2>&1)"
 echo "$out" | grep -q "cfg=$CHOME marker=1 args=hi" && ok 0 "claude-acct READY email -> pinned exec (canonical cfg)" || ok 1 "claude-acct READY email -> pinned exec (got: $out)"
 
+# (v102-r2) THE LAUNCH ADMISSION FENCE. The launch above must have left a marker naming the
+# home and the pid that became the CLI — that marker is the only thing that makes an
+# in-flight launch visible to un-seed before SessionStart registers a session.
+adm="$(ls "$ACC/.admissions"/*.json 2>/dev/null | head -1)"
+[ -n "$adm" ] && ok 0 "a pinned launch records a launch ADMISSION" || ok 1 "a pinned launch records a launch ADMISSION (none found)"
+python3 - "$adm" "$CHOME" <<'EOF' && ok 0 "...naming the resolved home and a pid" || ok 1 "...naming the resolved home and a pid"
+import json, os, sys
+r = json.load(open(sys.argv[1]))
+sys.exit(0 if os.path.realpath(r["home"]) == sys.argv[2] and isinstance(r["pid"], int)
+         and r["email"] == "a@x.com" else 1)
+EOF
+[ "$(stat -f %Lp "$adm" 2>/dev/null)" = "600" ] && ok 0 "...at 0600" || ok 1 "...at 0600 (got $(stat -f %Lp "$adm" 2>/dev/null))"
+
+# an entry un-seed has taken out of service refuses the launch: this is the mid-un-seed race,
+# closed at the launcher rather than left to be discovered after the home is deleted.
+python3 - "$ACC" "$HERE" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[2])
+import registry
+registry.mark_unseeding(sys.argv[1], "a@x.com")
+EOF
+out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" ACCOUNT_BANK_SCRIPTS_DIR="$T/scripts" "$HERE/claude-acct" a@x.com hi 2>&1)"; rc=$?
+[ $rc -eq 65 ] && ok 0 "a home being UN-SEEDED refuses the launch -> exit 65 (v102-r2)" || ok 1 "un-seeding home refuses the launch (got $rc: $out)"
+echo "$out" | grep -q "REAL-CLI" && ok 1 "...and nothing was exec'd" || ok 0 "...and nothing was exec'd"
+
+# while the un-seeder HOLDS the admission lock, a launch waits and then refuses distinctly (70)
+# rather than resolving a home the un-seeder is about to take away.
+python3 - "$ACC" "$HERE" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[2])
+import registry
+registry.clear_unseeding(sys.argv[1], "a@x.com")
+EOF
+python3 - "$ACC" "$HERE" <<'EOF'
+import os, sys
+sys.path.insert(0, sys.argv[2])
+import launchadmit
+lk = launchadmit.lock(sys.argv[1])           # take it and leak it: the owner pid is THIS
+os.makedirs(lk.lock_dir, exist_ok=True)      # process, which exits — banklock reclaims it
+open(os.path.join(lk.lock_dir, "owner"), "w").write('{"pid": 1, "start": "x"}')
+EOF
+out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" ACCOUNT_BANK_SCRIPTS_DIR="$T/scripts" ACCOUNT_BANK_LOCK_WAIT=1 "$HERE/claude-acct" a@x.com hi 2>&1)"; rc=$?
+[ $rc -eq 70 ] && ok 0 "a HELD admission lock refuses the launch -> exit 70, not a race (v102-r2)" || ok 1 "held admission lock -> 70 (got $rc: $out)"
+rm -rf "$ACC/.admit.lock"
+out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" ACCOUNT_BANK_SCRIPTS_DIR="$T/scripts" "$HERE/claude-acct" a@x.com hi 2>&1)"
+echo "$out" | grep -q "cfg=$CHOME marker=1" && ok 0 "...and the same launch succeeds once the lock frees" || ok 1 "launch after lock release (got: $out)"
+
 # claude-acct --current maps pointer -> email
 out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" ACCOUNT_BANK_SCRIPTS_DIR="$T/scripts" "$HERE/claude-acct" --current 2>&1)"
 [ "$out" = "a@x.com" ] && ok 0 "claude-acct --current -> email" || ok 1 "claude-acct --current -> email (got: $out)"
@@ -220,7 +270,7 @@ out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" ACCOUNT_BAN
 SELFDIR="$T/installed-here"
 mkdir -p "$SELFDIR"
 cp "$HERE/claude-acct" "$SELFDIR/"
-for f in registry.py repoint.py banklock.py epoch.py sessions.py; do cp "$HERE/$f" "$SELFDIR/"; done
+for f in registry.py repoint.py banklock.py epoch.py sessions.py launchadmit.py bank_common.py; do cp "$HERE/$f" "$SELFDIR/"; done
 # add-account.sh presence not required for --current; registry.py (the primary dep) is.
 out="$(env -i HOME="$T" PATH="/usr/bin:/bin" ACCOUNT_BANK_DIR="$ACC" "$SELFDIR/claude-acct" --current 2>&1)"; rc=$?
 [ "$out" = "a@x.com" ] && ok 0 "claude-acct resolves scripts from its OWN dir (no env override) (r10 #4)" || ok 1 "claude-acct self-dir resolution (got rc $rc: $out)"

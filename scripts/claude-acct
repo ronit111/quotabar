@@ -4,16 +4,25 @@
 #   claude-acct <email> [claude args...]   launch pinned to <email>'s READY home
 #   claude-acct --back                     undo the last committed pointer switch
 #   claude-acct --current                  print the current pointer target's email
+#   claude-acct --un-seed <email> [--yes]  (v102) remove a READY home — the inverse of --add
 #
 # Pinning NEVER touches the pointer: the email maps through the READY registry to a
 # real home path (r4: registry-mapped, never path construction), and the real home
 # path — never the pointer — becomes CLAUDE_CONFIG_DIR.
 #
 # Exit codes: 64 usage · 65 email unknown / home not READY · 67 real binary
-# unresolved · 78 epoch fence. Success never returns (exec).
+# unresolved · 70 launch-admission lock busy (an un-seed is in flight) · 78 epoch fence.
+# Success never returns (exec).
 set -u
 
-ACCOUNTS_DIR="${ACCOUNT_BANK_DIR:-$HOME/.claude/accounts}"
+# (v102) THE bank-directory rule — BANK_DIR -> ACCOUNT_BANK_DIR -> default — the same one
+# lib.sh:22, bank_common.resolve_bank_dir, account-warn.sh and session-hook.sh already share.
+# This launcher was the last entry point still starting at ACCOUNT_BANK_DIR, so on a
+# BANK_DIR-only setup it resolved homes, the pointer and the registry from a DIFFERENT bank
+# than the one the locks, the poll and the app use. The v101 confirmation review fixed exactly
+# this class of split-brain in the two hooks; --un-seed is destructive, so it cannot be the
+# one command still able to act on the wrong bank.
+ACCOUNTS_DIR="${BANK_DIR:-${ACCOUNT_BANK_DIR:-$HOME/.claude/accounts}}"
 # (r10 #4) resolve the scripts dir like the shim (bin/claude) does: explicit env override,
 # else THIS script's own directory (so an installed claude-acct finds its sibling
 # add-account.sh / registry.py wherever it was installed — e.g. the XDG path — not a
@@ -103,6 +112,14 @@ EOF
         # this the child defaults to the legacy path and seeding exits 64 on the import.
         export ACCOUNT_BANK_SCRIPTS_DIR="$SCRIPTS_DIR"
         exec bash "$SCRIPTS_DIR/add-account.sh" "$2" ;;
+    --un-seed)
+        # (v102) the inverse of --add. Every destructive step is behind --yes; without it
+        # unseed.py prints the plan and exits 73, which is how QuotaBar drives it: show the
+        # plan in its own confirmation UI, then re-run with --yes --json.
+        # Exit codes are unseed.py's (documented in its module docstring), passed through.
+        [ $# -ge 2 ] || fail 64 "usage: claude-acct --un-seed <email> [--yes] [--json]"
+        _email="$2"; shift 2
+        exec python3 "$SCRIPTS_DIR/unseed.py" "$ACCOUNTS_DIR" "$_email" "$@" ;;
     --*)
         fail 64 "unknown option $1" ;;
 esac
@@ -155,8 +172,23 @@ if [ -n "$RESUME_SID" ]; then
     esac
 fi
 
-HOME_PATH="$(python3 "$SCRIPTS_DIR/registry.py" ready-home "$ACCOUNTS_DIR" "$EMAIL")" \
-    || fail 65 "no READY home for $EMAIL (seed it: claude-acct --add coming via QuotaBar add-account flow)"
+# (v102-r2) Resolve the home through the LAUNCH ADMISSION fence, not a bare registry read.
+# launchadmit takes the admission lock, re-checks the READY entry inside it, and records THIS
+# shell's pid (which `exec` below turns into the CLI process) against the home before printing
+# it. un-seed takes the same lock and refuses while a live admission names the home, so the
+# window between "the registry said READY" and "SessionStart registers the session" — during
+# which a launch was invisible to every check un-seed makes — is closed from both ends.
+# rc 3 is the lock being held by an un-seed that is about to take this home out of service;
+# rc 1 is "no READY home"; anything else is the fence itself failing to run, which refuses too
+# (an unrecorded admission is one un-seed cannot see).
+HOME_PATH="$(python3 "$SCRIPTS_DIR/launchadmit.py" admit "$ACCOUNTS_DIR" "$EMAIL" $$)"
+_admit_rc=$?
+case "$_admit_rc" in
+    0) ;;
+    3) fail 70 "the launch-admission lock is busy (an un-seed is in flight for this bank); try again in a moment" ;;
+    1) fail 65 "no READY home for $EMAIL (seed it: claude-acct --add coming via QuotaBar add-account flow)" ;;
+    *) fail 65 "the launch-admission fence could not run (rc $_admit_rc); refusing to launch un-fenced" ;;
+esac
 
 export CLAUDE_ACCT_SHIM=1 CLAUDE_CONFIG_DIR="$HOME_PATH"
 exec "$SHIM" "$@"

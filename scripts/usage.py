@@ -100,6 +100,11 @@ AUTOPING_DRYRUN = os.environ.get("ACCOUNT_BANK_AUTOPING_DRYRUN", "0") == "1"
 HEAL_UNLINKED = os.environ.get("ACCOUNT_BANK_HEAL_UNLINKED", "1") == "1"
 HEAL_BACKOFF = float(os.environ.get("ACCOUNT_BANK_HEAL_BACKOFF", "600"))
 HEAL_MARKER = os.path.join(BANK_DIR, ".unlinked-heal.json")
+# (v102) how long a healed_plan_change notice stays on the health pipe when nobody
+# acknowledges it. The notice is the SIGNAL a plan change used to carry by refusing the
+# heal; it must not become permanent chrome, and it must not vanish before the owner sees
+# it, so it self-expires instead of relying on an ack that may never come.
+HEAL_NOTICE_TTL = float(os.environ.get("ACCOUNT_BANK_HEAL_NOTICE_TTL", "86400"))
 _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 # force-fresh: bypass parked-cache AND burst-guard for this email (post-switch trust)
 _ff = os.environ.get("ACCOUNT_BANK_FORCE_FRESH", "")
@@ -336,9 +341,9 @@ def _norm_plan(raw):
 def process_claude(email, oauth, is_active, bank_path, status, oauth_account=None):
     # organizationType (from ~/.claude.json, refreshed each session) preferred over
     # Keychain subscriptionType (cached at login, stale after a plan change) —
-    # Shashi Jangra's fix (#1). Both normalized so every tier variant maps.
-    plan = _norm_plan((oauth_account or {}).get("organizationType")) \
-        or _norm_plan((oauth or {}).get("subscriptionType"))
+    # Shashi Jangra's fix (#1), spelled once in bank_common.effective_tier so the drift
+    # checks below read the tier the same way this displayed, autopick-consulted value does.
+    plan = bank_common.effective_tier(oauth_account, oauth)
     res = {"provider": "claude", "email": email, "active": is_active,
            "five_hour": None, "seven_day": None, "worst_limit": None, "model_cap": None,
            "status": status, "fetched_at": now(),
@@ -944,11 +949,62 @@ def _identity_oracle(token):
     return _identity.resolve(token, timeout=max(1.0, min(HTTP_TIMEOUT, DEADLINE - now())))
 
 
-def _benign_drift_refusal(act, kc):
+def _live_tier(kc):
+    """The tier the LIVE account is actually on: ~/.claude.json's organizationType first (it is
+    rewritten every session, so it is where a plan change shows up), the keychain credential's
+    subscriptionType only as a fallback."""
+    return bank_common.effective_tier(active_oauth_account(), kc)
+
+
+def _banked_tier(br):
+    """The tier a bank RECORD claims, read exactly the way the record's own displayed plan is
+    read — organizationType first, subscriptionType as fallback. This is the value autopick's
+    is_max() ends up consulting, so it is the one a drift check has to compare against."""
+    return bank_common.effective_tier((getattr(br, "record", None) or {}).get("oauthAccount"),
+                                      br.oauth)
+
+
+def _banked_plan_is_stale(act, kc):
+    """(v102-r2) True when the ACTIVE account's bank record names a different plan TIER than the
+    credential currently in the keychain — the drift the identity resolver is blind to by
+    design, since credential fingerprints exclude subscriptionType.
+
+    (v102-r3) Through the effective-tier rule on BOTH sides, not subscriptionType alone. The
+    keychain's subscriptionType is cached at /login: on the plan change this check exists to
+    catch it is the field most likely NOT to move, and comparing two stale copies of it made a
+    real downgrade read as no drift, so the heal was never attempted and autopick kept ranking
+    the account on a tier it no longer had.
+
+    This decides only whether the heal is ATTEMPTED. Everything that decides whether it HAPPENS
+    stays in _benign_drift_refusal (epoch gate, lock ownership, record validity, foreign-owner
+    check, and the live identity oracle), so a stale tier buys no shortcut past any of them.
+    Local reads only — no network — and never raises."""
+    try:
+        if not (act and kc):
+            return False
+        if bank_common.safe_email(act) is None:
+            return False
+        path = os.path.join(BANK_DIR, f"{act}.json")
+        if not os.path.exists(path):
+            return False
+        br = bank_common.load_bank_record(path, expected_email=act)
+        if not br.ok:
+            return False
+        kt, rt = _live_tier(kc), _banked_tier(br)
+        return bool(kt and rt and kt != rt)
+    except Exception:
+        return False
+
+
+def _benign_drift_refusal(act, kc, note=None):
     """Why the current UNRESOLVED keychain must NOT be auto-re-banked, or "" when it IS the
     benign case (the active account's credential rotated ahead of its own bank record).
     Every check is phrased as a REFUSAL: an unknown, unreadable or ambiguous state returns a
     reason, never "". Never raises.
+
+    `note` is an optional dict the caller passes to collect what the heal should ANNOUNCE if
+    it goes ahead (currently only healed_plan_change). It is only meaningful when the return
+    value is "" — a refusal means nothing was healed and nothing is announced.
 
     (r15 #1) The offline checks below are all ABSENCE OF CONTRADICTION, and no amount of them
     is identity proof: a keychain-first /login installing an UNBANKED, SAME-PLAN account while
@@ -993,25 +1049,45 @@ def _benign_drift_refusal(act, kc):
     live_fp = bank_common.cred_fingerprint(kc)
     if not live_fp:
         return "live credential has no fingerprint"
-    if live_fp == bank_common.cred_fingerprint(br.oauth):
+    # (v102-r2) The tier comparison happens HERE, above the fingerprint short-circuits, because
+    # cred_fingerprint deliberately ignores subscriptionType (issue 7). A plan change with
+    # unchanged tokens is therefore fingerprint-identical to no change at all, and both
+    # short-circuits below read it as nothing to do: "no drift to heal" for the record compare,
+    # "belongs to another banked account" for the owner compare — which is `act` itself, since
+    # the credential IS still act's banked one. The result was the one drift class with no path
+    # to the healer at all: the bank record kept a stale tier (auto-pick's is_max reads it) and
+    # nothing ever announced. Neither short-circuit may fire on a tier change; everything below
+    # them, up to and including the identity oracle, still has to pass.
+    # (v102-r3) Both sides through the ONE effective-tier rule (organizationType first,
+    # subscriptionType as fallback) — the same one _banked_plan_is_stale triggers on and
+    # process_claude displays. Reading only subscriptionType here would have let a change the
+    # trigger did see fall through this comparison as no change, so the heal could run and
+    # announce nothing.
+    _kt, _rt = _live_tier(kc), _banked_tier(br)
+    _plan_change = {"from": _rt, "to": _kt} if (_kt and _rt and _kt != _rt) else None
+    if live_fp == bank_common.cred_fingerprint(br.oauth) and _plan_change is None:
         return "no drift to heal"              # UNRESOLVED for some other reason entirely
-    if bank_common.fp_owner(BANK_DIR, kc) is not None:
+    _owner = bank_common.fp_owner(BANK_DIR, kc)
+    if _owner is not None and _owner != act:
         # The live credential is the CURRENT credential of a DIFFERENT banked account: a
         # genuinely different account is in the slot, not a rotation. Never auto-link.
         return "credential belongs to another banked account"
-    # A plan-tier change is a distinct event, and a tier disagreement is also the positive tell
-    # write_bank_record.py uses for crossed identities — so it is never healed silently. Only a
-    # KNOWN-vs-KNOWN disagreement refuses (mirroring that cross-check): an absent
-    # subscriptionType on either side is no evidence.
-    # (v101-confirm) The SessionStart hook used to be the one that re-banked this case; it now
-    # ANNOUNCES the tier change and defers, so a plan change is the one drift class neither
-    # path writes automatically. That is deliberate: it is rare, it is user-initiated, and the
-    # hook's message names the one-line fix (bank-account.sh). Do not relax this into an
-    # automatic write without a reason stronger than convenience.
-    _kt, _rt = (_norm_plan((kc or {}).get("subscriptionType")),
-                _norm_plan((br.oauth or {}).get("subscriptionType")))
-    if _kt and _rt and _kt != _rt:
-        return "plan tier changed"
+    # (v102) A PLAN-TIER CHANGE IS NO LONGER A REFUSAL — it is healed and announced.
+    # It used to refuse for two reasons, and the r15 #1 oracle answered both. (1) "A tier
+    # disagreement is write_bank_record's positive tell for crossed identities": that tell
+    # compares the credential against ~/.claude.json's organizationType, i.e. LIVE-vs-LIVE,
+    # and it still runs inside the writer below. THIS comparison is live-vs-RECORD, which on
+    # an upgraded account is exactly what a legitimate plan change looks like. (2) "It is a
+    # distinct event that deserves reporting": true, and refusing the write was a crude way
+    # to report it — it left the owner with an alarming UNLINKED chip and a manual
+    # bank-account.sh to run. With the oracle positively naming `act` as the credential's
+    # owner, a tier change is a benign SAME-ACCOUNT event; we heal it and carry the signal
+    # forward as a notice instead of as a refusal. Only a KNOWN-vs-KNOWN difference is a
+    # change at all — a side with no tier from EITHER source is no evidence.
+    # If ~/.claude.json's organizationType has not caught up with the credential yet, the
+    # writer's live-vs-live check refuses and the heal simply fails: backoff, chip stands,
+    # retry next cycle. That is the correct conservative outcome, not a bug to route around.
+    # (_plan_change is computed above the fingerprint short-circuits — see v102-r2 there.)
     # (r15 #1) POSITIVE IDENTITY CONFIRMATION — the decisive gate, deliberately last so the
     # free offline refusals above short-circuit before we spend a network call. Ask the live
     # credential itself who it belongs to (identity.py's G9 /api/oauth/profile: read-only,
@@ -1027,31 +1103,104 @@ def _benign_drift_refusal(act, kc):
         return "live identity unconfirmed"
     if r.email != act:
         return "live identity is a different account"
+    if _plan_change is not None and isinstance(note, dict):
+        note["healed_plan_change"] = dict(_plan_change, email=act)
     return ""
+
+
+# The heal marker carries TWO independent things and must never lose one while writing the
+# other: the post-failure BACKOFF window, and the healed_plan_change NOTICE (v102). Both are
+# read-modify-written through these helpers, which is why _heal_clear_backoff drops a field
+# rather than the file.
+def _heal_marker_read():
+    try:
+        d = json.load(open(HEAL_MARKER))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _heal_marker_write(d):
+    try:
+        if not d:
+            try:
+                os.remove(HEAL_MARKER)
+            except OSError:
+                pass
+            return
+        with open(HEAL_MARKER, "w") as f:
+            json.dump(d, f)
+        os.chmod(HEAL_MARKER, 0o600)
+    except Exception:
+        pass
 
 
 def _heal_backoff_active():
     try:
-        return float(json.load(open(HEAL_MARKER)).get("until", 0) or 0) > now()
+        return float(_heal_marker_read().get("until", 0) or 0) > now()
     except Exception:
         return False
 
 
 def _heal_mark_failure():
     """One backoff window per failed heal — no retry storm when a state is unhealable."""
-    try:
-        with open(HEAL_MARKER, "w") as f:
-            json.dump({"until": now() + HEAL_BACKOFF, "ts": int(now())}, f)
-        os.chmod(HEAL_MARKER, 0o600)
-    except Exception:
-        pass
+    d = _heal_marker_read()
+    d["until"] = now() + HEAL_BACKOFF
+    d["ts"] = int(now())
+    _heal_marker_write(d)
 
 
 def _heal_clear_backoff():
+    d = _heal_marker_read()
+    d.pop("until", None)
+    d.pop("ts", None)
+    _heal_marker_write(d)      # keeps a pending notice; removes the file when nothing is left
+
+
+def _heal_note_plan_change(change):
+    """(v102) Record the one-time notice for a plan change we just healed. Written only AFTER
+    the writer succeeded, so the notice can never describe a write that did not happen."""
+    d = _heal_marker_read()
+    d["healed_plan_change"] = dict(change, ts=int(now()))
+    _heal_marker_write(d)
+
+
+def _heal_notice():
+    """(v102) The pending healed_plan_change notice for the health pipe, or None. Expires on
+    its own after HEAL_NOTICE_TTL so an app that never acknowledges it does not display the
+    same plan change forever."""
+    n = _heal_marker_read().get("healed_plan_change")
+    if not isinstance(n, dict):
+        return None
     try:
-        os.remove(HEAL_MARKER)
-    except OSError:
-        pass
+        if HEAL_NOTICE_TTL > 0 and now() - float(n.get("ts", 0) or 0) > HEAL_NOTICE_TTL:
+            return None
+    except Exception:
+        return None
+    return n
+
+
+def _ack_heal_notice():
+    """(v102) `usage.py --ack-heal-notice` — the app clears the notice once it has shown it,
+    making the announcement genuinely one-time rather than TTL-bounded. Takes the bank lock
+    because it mutates a bank dotfile; a contended lock is a soft failure (the notice simply
+    stays up and can be acked on the next attempt).
+
+    The wait is the house default (ACCOUNT_BANK_LOCK_WAIT, 12s), not a token one. QuotaBar
+    drives this through its mutating-action queue with a 90s non-SIGKILL budget, so giving up
+    after a couple of seconds would just lose to any poll holding the lock across a network
+    call — turning a cheap dotfile edit into a routine no-op for no gain."""
+    if not acquire_lock(timeout=float(os.environ.get("ACCOUNT_BANK_LOCK_WAIT", "12") or 12)):
+        sys.stderr.write("usage.py --ack-heal-notice: bank lock contended; notice retained\n")
+        return 1
+    try:
+        d = _heal_marker_read()
+        had = d.pop("healed_plan_change", None) is not None
+        _heal_marker_write(d)
+        print("acknowledged" if had else "no notice pending")
+        return 0
+    finally:
+        release_lock()
 
 
 def _heal_unlinked(act, kc):
@@ -1174,6 +1323,12 @@ def _health_surface():
       archiver: {heartbeat_age, epoch_parked, blind_homes:[...]}  from archiver.status.json
       fork_drift: {home: [files...]}                              non-empty homes only
       seed_audit: {latest_ts, latest_linked_count, count}          newest seeding event
+      healed_plan_change: {from, to, email, ts}                   (v102) pending notice only
+
+    (v102) healed_plan_change is the one NON-anomaly entry here: it reports something the
+    poll already fixed. It rides this pipe because it is the only channel the app reads, and
+    because a plan change must stay visible after the UNLINKED chip it used to appear as is
+    gone. It clears on `usage.py --ack-heal-notice` or, failing that, after HEAL_NOTICE_TTL.
     """
     health = {}
     try:
@@ -1220,6 +1375,12 @@ def _health_surface():
         if count:
             health["seed_audit"] = {"latest_ts": latest_ts,
                                     "latest_linked_count": latest_linked, "count": count}
+    except Exception:
+        pass
+    try:
+        n = _heal_notice()
+        if n:
+            health["healed_plan_change"] = n
     except Exception:
         pass
     return health
@@ -1309,10 +1470,24 @@ def main():
         # payload — no transient "healing" state ever reaches the app. On failure we stamp a
         # backoff marker so an unhealable state cannot re-run the writer every cycle, and the
         # chip stands (correctly: it now means something needs attention).
-        if (LOCKED and not identity_resolved and not _heal_backoff_active()
-                and not _benign_drift_refusal(act, kc)):
+        # (v102) A PLAN-TIER change now heals here too, and the signal it used to carry by
+        # refusing becomes a one-time `health.healed_plan_change` notice — the state is
+        # repaired AND the owner is told, instead of one at the cost of the other.
+        # (v102-r2) RESOLVED IS NOT THE SAME AS UP TO DATE. resolve_identity compares credential
+        # fingerprints, which exclude subscriptionType, so a plan-only change resolves cleanly —
+        # and `not identity_resolved` then skipped this whole block, leaving the one drift class
+        # v102 added a healer for as the one drift class the healer never saw. A stale banked
+        # tier is not cosmetic: autopick reads it. So the heal is also attempted when the banked
+        # plan disagrees with the live credential's, and takes the SAME road as every other heal
+        # from there — _benign_drift_refusal's gauntlet, ending at the live identity oracle.
+        _plan_stale = _banked_plan_is_stale(act, kc)
+        _heal_note = {}
+        if (LOCKED and (not identity_resolved or _plan_stale) and not _heal_backoff_active()
+                and not _benign_drift_refusal(act, kc, _heal_note)):
             if _heal_unlinked(act, kc):
                 _heal_clear_backoff()
+                if _heal_note.get("healed_plan_change"):
+                    _heal_note_plan_change(_heal_note["healed_plan_change"])
                 identity_resolved = bool(act and kc
                                          and bank_common.resolve_identity(BANK_DIR, kc, act) == act)
             else:
@@ -1423,8 +1598,7 @@ def main():
                     results.append({"provider": "claude", "email": email, "active": is_active,
                                     "status": status, "error": "skipped (ONLY mode)",
                                     "worst_limit": None, "fetched_at": now(),
-                                    "plan": _norm_plan((oauth_account or {}).get("organizationType"))
-                                            or _norm_plan((oauth or {}).get("subscriptionType"))})
+                                    "plan": bank_common.effective_tier(oauth_account, oauth)})
                 continue
             # per-provider backoff: serve claude from cache without touching network
             if claude_backed_off and not _force_fresh(email):
@@ -1615,4 +1789,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # (v102) the ONE argv this poll accepts; everything else is env-configured as before.
+    if len(sys.argv) > 1 and sys.argv[1] == "--ack-heal-notice":
+        raise SystemExit(_ack_heal_notice())
     main()

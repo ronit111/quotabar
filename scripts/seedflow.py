@@ -250,6 +250,38 @@ def seat_read(home):
     return None, None, "absent", "none"
 
 
+def seat_read_forms(home):
+    """(v102-r2, seat) Read BOTH seat forms INDEPENDENTLY: {"file": (blob, raw, status),
+    "slot": (blob, raw, status)}.
+
+    seat_read answers "which credential does this home use?" and returns exactly one seat, by
+    precedence. Un-seeding asks the other question — "what will be destroyed?" — and
+    seat_delete's answer is BOTH forms, unconditionally, because a home interrupted mid-
+    migration legitimately has a file the CLI has not yet removed alongside the slot it has
+    already written. Archiving through seat_read therefore preserved the FILE (precedence) and
+    then destroyed a SLOT that, in exactly that interrupted state, holds the NEWER credential.
+
+    Two reads, two archives, no precedence: the never-destroy rule applies per seat, not per
+    home. `status` is the same three-valued one everywhere else — an "error" on either form is
+    UNKNOWN and its caller fails closed."""
+    cred = os.path.join(home, ".credentials.json")
+    file_seat = (None, None, "absent")
+    if os.path.exists(cred):
+        try:
+            raw = open(cred).read()
+        except Exception:
+            file_seat = (None, None, "error")
+        else:
+            if raw.strip() == "":
+                file_seat = (None, None, "absent")      # an empty file is not a credential
+            else:
+                try:
+                    file_seat = (json.loads(raw), raw, "present")
+                except ValueError:
+                    file_seat = (None, raw, "present")  # non-JSON is still a present credential
+    return {"file": file_seat, "slot": _sh_keychain_read(service=config_slot_service(home))}
+
+
 def seat_fingerprint(home):
     """(seat) Stable fingerprint of the home's current seat content, or None when the seat read
     ERRORED (UNKNOWN — callers fail-closed). '<empty>' for a provably-absent seat."""
@@ -315,6 +347,41 @@ def seat_write(home, oauth, reason, expected_email=None, identity_check=None):
     homewrite.write_credential(home, oauth, reason, expected_email=expected_email,
                                identity_check=identity_check)
     return "file"
+
+
+def seat_delete(home, expect_slot=None):
+    """(v102, seat) Remove a home's credential from BOTH possible seats — the counterpart of
+    seat_write, used by un-seeding. Returns {"file_removed": bool, "slot_deleted": bool}.
+
+    (v102-r2) `expect_slot` is the caller's independently-derived slot service name, and a
+    mismatch RAISES. The slot is keyed on the home path STRING, so a caller that verified one
+    spelling of the home and then handed us another would silently delete a different account's
+    grant — un-seed cross-checks its verified target against this module's derivation here
+    rather than trusting that the two agree.
+
+    Deliberately NOT seat_read-precedence-driven. seat_read names the ONE authoritative seat;
+    un-seeding needs the opposite guarantee — that no copy of this home's credential is left
+    behind anywhere — and a home mid-migration can legitimately have a file the CLI has not
+    yet removed alongside a slot it has already written. So: delete the file if present, and
+    clear the per-config-dir slot unconditionally (the keychain delete treats "not found" as
+    success, so clearing an already-empty slot is a clean no-op).
+
+    Archiving is the CALLER's responsibility and must happen first — this destroys.
+    Raises on a file unlink that fails, so a caller can fail closed; a failed SLOT delete is
+    reported as slot_deleted=False rather than raised (the keychain can be locked, and the
+    caller decides whether that blocks the rest of the operation)."""
+    slot = config_slot_service(home)
+    if expect_slot is not None and expect_slot != slot:
+        raise RuntimeError(f"seat_delete: the caller's verified slot ({expect_slot}) is not the "
+                           f"one this home derives ({slot}); refusing to delete a slot nobody "
+                           f"verified")
+    out = {"file_removed": False, "slot_deleted": False}
+    cred = os.path.join(home, ".credentials.json")
+    if os.path.exists(cred):
+        os.remove(cred)
+        out["file_removed"] = True
+    out["slot_deleted"] = bool(_sh_keychain_delete(slot))
+    return out
 
 
 # ---- barrier + journal ------------------------------------------------------

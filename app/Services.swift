@@ -346,8 +346,10 @@ final class AppModel: ObservableObject {
         case rebank
         case toggleAutoPing = "autoping"
         case removeAccount = "remove"
+        case unseedAccount = "unseed"
         case codexPing = "codexping"
         case restartSession = "restart"
+        case ackHealNotice = "ackheal"
     }
 
     /// A single mutating action queued through the global FIFO. `key` names the card whose
@@ -366,6 +368,10 @@ final class AppModel: ObservableObject {
         // repoint both do (keychain resp. pointer drive "active"); a SHADOW repoint does NOT —
         // the keychain still names the active account, the repoint only sets future launches.
         var flipsActive: Bool = true
+        // (v102) Whether this action's own stdout becomes the card's caption. Only un-seed does:
+        // it reports what it tore down, and that report is the answer to the question the owner
+        // has right after confirming. Every other action's success is self-evident from the card.
+        var capturesSummary: Bool = false
     }
 
     private enum PendingWork {
@@ -441,6 +447,14 @@ final class AppModel: ObservableObject {
     /// Newest seed-audit ts the owner has acknowledged (persisted). A seeding event newer than
     /// this surfaces the review line; dismissing sets this to the latest ts.
     @Published private(set) var seedAuditAckTs: Int = 0
+    /// (v102) Newest healed-plan-change notice the owner has dismissed (persisted).
+    @Published private(set) var healNoticeAckTs: Int = 0
+    /// (v102) Whether the once-a-day update check runs at all (persisted, ON by default).
+    @Published private(set) var updateCheckEnabled: Bool = true
+    /// (v102) The newest release tag the last successful check saw, or nil if none has succeeded.
+    @Published private(set) var latestReleaseTag: String?
+    /// (v102) The version whose hint the owner dismissed (persisted); a later one shows again.
+    @Published private(set) var dismissedUpdateVersion: String?
 
     private var lastSuccessfulUpdate: Date?
     private var pendingRefreshRequest: PendingRefreshRequest?
@@ -455,11 +469,25 @@ final class AppModel: ObservableObject {
     private static let usagePollKey = "__usage_poll__"
 
     private static let seedAuditAckKey = "seedAuditAckTs"
+    private static let healNoticeAckKey = "healNoticeAckTs"
+    /// Synthetic FIFO key: the ack is bank work, but it belongs to no card.
+    private static let healNoticeKey = "__heal_notice__"
+
+    // (v102) update-check prefs. `updateCheckEnabled` is registered as a default rather than read
+    // with `bool(forKey:)` alone, because an unset key reads false — which would silently ship the
+    // feature OFF for everyone who never opened the menu.
+    private static let updateCheckEnabledKey = "updateCheckEnabled"
+    private static let updateLastCheckKey = "updateLastCheck"
+    private static let updateDismissedVersionKey = "updateDismissedVersion"
 
     init() {
         refreshLoginItemStatus()
         codexLastPing = Self.loadCodexLastPing()
         seedAuditAckTs = UserDefaults.standard.integer(forKey: Self.seedAuditAckKey)
+        healNoticeAckTs = UserDefaults.standard.integer(forKey: Self.healNoticeAckKey)
+        UserDefaults.standard.register(defaults: [Self.updateCheckEnabledKey: true])
+        updateCheckEnabled = UserDefaults.standard.bool(forKey: Self.updateCheckEnabledKey)
+        dismissedUpdateVersion = UserDefaults.standard.string(forKey: Self.updateDismissedVersionKey)
 
         // (v2 wiring) mark THIS running pid epoch-aware so attest-cutover.sh can distinguish the
         // new build from an old one still in memory; removed on a clean quit.
@@ -483,15 +511,16 @@ final class AppModel: ObservableObject {
                 // keep the runtime marker fresh (and re-create it if something removed it).
                 RuntimeMarker.write(path: Paths.runtimeMarker, pid: getpid())
                 self?.refresh()
+                await self?.checkForUpdateIfDue()
             }
         }
 
-        tickerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled else { break }
-                self?.currentDate = Date()
-            }
+        Task { [weak self] in
+            // Let the launch burst (first usage poll, the login-shell codex probe) clear before
+            // opening a connection. The check is a background courtesy with nothing waiting on
+            // it, so competing with startup for a cold TLS handshake buys nothing.
+            try? await Task.sleep(nanoseconds: 15 * 1_000_000_000)
+            await self?.checkForUpdateIfDue()
         }
     }
 
@@ -579,6 +608,7 @@ final class AppModel: ObservableObject {
     func popoverOpened() {
         popoverIsOpen = true
         removalConfirmation.reset()
+        startTicker()
         if let accounts = snapshot?.accounts {
             let now = Date()
             if AccountFreshness.shouldPollOnOpen(accounts: accounts, now: now),
@@ -597,7 +627,30 @@ final class AppModel: ObservableObject {
         // that guarantees a half-armed card can never re-render pre-armed when the popover reopens
         // (this is what the old `.confirmationDialog` failed to do — its binding outlived the close).
         removalConfirmation.reset()
+        stopTicker()
         updateStaleRetrySchedule()
+    }
+
+    /// (v102) The one-second clock behind every relative caption in the popover — the ping
+    /// countdown, "Updated 22s ago", the reset captions — runs ONLY while the popover is open.
+    /// Nothing outside the popover reads it (the menu bar icon is tinted from the snapshot, not the
+    /// clock), so a ticker running against a closed window was a wakeup a second for nobody. This
+    /// is also what "invalidated when the popover closes" means for the live ping countdown.
+    private func startTicker() {
+        currentDate = Date()
+        guard tickerTask == nil else { return }
+        tickerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, let self, self.popoverIsOpen else { break }
+                self.currentDate = Date()
+            }
+        }
+    }
+
+    private func stopTicker() {
+        tickerTask?.cancel()
+        tickerTask = nil
     }
 
     // MARK: Inline remove-account confirmation
@@ -615,7 +668,25 @@ final class AppModel: ObservableObject {
     }
 
     func isArmedForRemoval(_ account: UsageAccount) -> Bool {
-        removalConfirmation.isArmed(email: account.email)
+        removalConfirmation.isArmed(email: account.email, kind: .remove)
+    }
+
+    /// (v102) Toggle the inline "Un-seed <email>?" strip on a v2 monitor-only card. Shares the one
+    /// confirmation slot with Remove, so arming either closes the other.
+    func toggleUnseedConfirmation(_ account: UsageAccount) {
+        guard UnseedPolicy.canUnseed(account) else { return }
+        removalConfirmation.toggle(email: account.email, kind: .unseed)
+    }
+
+    func isArmedForUnseed(_ account: UsageAccount) -> Bool {
+        removalConfirmation.isArmed(email: account.email, kind: .unseed)
+    }
+
+    /// Un-seed button in the inline strip: disarms, then routes the teardown through the same
+    /// global FIFO (and the same non-SIGKILL mutating policy) as every other actuator.
+    func confirmUnseed(_ account: UsageAccount) {
+        removalConfirmation.disarm()
+        unseedAccount(account)
     }
 
     /// Remove button in the inline strip: routes through the existing `removeAccount` FIFO path
@@ -717,6 +788,21 @@ final class AppModel: ObservableObject {
                       arguments: [Paths.removeAccount, account.email], successMessage: nil)
     }
 
+    /// (v102) Tear down a v2 monitor-only home via `claude-acct --un-seed <email> --yes --json`.
+    /// `--yes` is what makes it non-interactive: the card has already taken the owner's
+    /// confirmation inline, and without the flag unseed.py prints a plan and exits 73 by design.
+    /// `--json` is the form its author documents for QuotaBar — the result dict on stdout, human
+    /// text on stderr — which is what `UnseedSummary` turns into the card's caption.
+    /// Guarded by UnseedPolicy (homes only, never the active account, never an unresolved login);
+    /// every destructive gate (live session, pointer, seeding barrier) is enforced script-side.
+    func unseedAccount(_ account: UsageAccount) {
+        guard UnseedPolicy.canUnseed(account) else { return }
+        enqueueAction(.unseedAccount, key: account.email, executable: Paths.bash,
+                      arguments: [Paths.claudeAcct, "--un-seed", account.email, "--yes", "--json"],
+                      successMessage: nil, environment: scriptEnvironment,
+                      capturesSummary: true)
+    }
+
     func codexPing() {
         guard let codex = codexBinaryPath, !codex.isEmpty, !isCodexPingCoolingDown else { return }
         enqueueAction(.codexPing, key: Self.codexCardKey, executable: codex,
@@ -732,6 +818,13 @@ final class AppModel: ObservableObject {
     /// disabled for the duration (SwitchGate).
     var isSwitchInFlight: Bool {
         SwitchGate.isBlocked(busyKinds: busyActions.values.map(\.rawValue))
+    }
+
+    /// (v102-r2) True while ANY card's un-seed is queued or running. A pinned launch is the one
+    /// action that leaves the FIFO (it opens a Terminal), so it is gated here instead —
+    /// PinnedLaunchGate carries the reasoning.
+    var isUnseedInFlight: Bool {
+        PinnedLaunchGate.isBlocked(busyKinds: busyActions.values.map(\.rawValue))
     }
 
     func busyAction(email: String) -> String? {
@@ -968,8 +1061,26 @@ final class AppModel: ObservableObject {
     func addAccount(email: String) {
         let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.contains("@") else { return }
-        let inner = "\(Paths.bash) \(shellQuote(Paths.claudeAcct)) --add \(shellQuote(trimmed))"
-        let script = "tell application \"Terminal\" to do script \(appleScriptString(inner))"
+        openInTerminal(TerminalLaunch.addAccountCommand(
+            bash: Paths.bash, claudeAcct: Paths.claudeAcct, email: trimmed
+        ))
+    }
+
+    /// (v102) Open a Terminal running `claude-acct <email>` — a Claude Code session pinned to that
+    /// account's home for the life of the window, leaving the shared rail (and every session on it)
+    /// exactly where it is. This is the affordance for the hybrid the app actually ships: seamless
+    /// swapping by default, an opt-in pinned session when you want one account held still.
+    /// Same launch mechanism as add-account: the app opens the Terminal and stops there.
+    func openPinnedSession(_ account: UsageAccount) {
+        guard PinnedSessionPolicy.canOpen(account, epoch: currentEpoch),
+              !isUnseedInFlight else { return }
+        openInTerminal(TerminalLaunch.pinnedSessionCommand(
+            bash: Paths.bash, claudeAcct: Paths.claudeAcct, email: account.email
+        ))
+    }
+
+    private func openInTerminal(_ command: String) {
+        let script = "tell application \"Terminal\" to do script \(appleScriptString(command))"
         Task.detached {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -979,6 +1090,131 @@ final class AppModel: ObservableObject {
             try? task.run()
             task.waitUntilExit()
         }
+    }
+
+    // MARK: - (v102) update-available hint
+
+    /// This build's version, as shipped in Info.plist. The hint compares against exactly this — not
+    /// a constant in the source — so a forgotten version bump can't make an upgraded app keep
+    /// advertising the release it already is.
+    var appVersion: String? {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+    }
+
+    /// The version to advertise in the footer, or nil to say nothing. Nil is the overwhelmingly
+    /// common case, and it renders no chrome at all.
+    var updateHintVersion: SemanticVersion? {
+        guard updateCheckEnabled else { return nil }
+        return UpdateHint.availableVersion(
+            current: appVersion,
+            latestTag: latestReleaseTag,
+            dismissedVersion: dismissedUpdateVersion
+        )
+    }
+
+    var updateHintLine: String? {
+        updateHintVersion.map(UpdateHint.line(version:))
+    }
+
+    /// Hide this version's hint for good. Dismissal is stored per version, so the next release
+    /// says its piece; this one doesn't ask twice.
+    func dismissUpdateHint() {
+        guard let version = updateHintVersion else { return }
+        dismissedUpdateVersion = version.description
+        UserDefaults.standard.set(version.description, forKey: Self.updateDismissedVersionKey)
+    }
+
+    /// The settings toggle. Turning it off stops the check immediately and hides any hint already
+    /// on screen; turning it back on lets the next due window check again.
+    func setUpdateCheckEnabled(_ enabled: Bool) {
+        updateCheckEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.updateCheckEnabledKey)
+        if enabled {
+            Task { [weak self] in await self?.checkForUpdateIfDue() }
+        }
+    }
+
+    /// Ask GitHub, at most once a day, whether a newer release exists.
+    ///
+    /// This is the app's ONLY network call, and it is deliberately the smallest one that can answer
+    /// the question: an unauthenticated GET of a public releases endpoint, no cookies or cache (an
+    /// ephemeral session), no query parameters, no body, and a User-Agent that says the product and
+    /// its version and nothing else. It sends no account address, no machine identifier, no usage
+    /// data — there is nothing in the request that distinguishes this copy of QuotaBar from any
+    /// other of the same version. Failure is silent by design: a released tool must not put error
+    /// chrome in front of someone because a version check couldn't reach the internet.
+    private func checkForUpdateIfDue() async {
+        let lastCheck = Self.loadUpdateLastCheck()
+        guard UpdateCheckSchedule.shouldCheck(
+            enabled: updateCheckEnabled, lastCheck: lastCheck, now: Date()
+        ) else { return }
+        // Record the attempt before making it: a failing endpoint gets retried tomorrow, not on
+        // every relaunch between now and then.
+        recordUpdateCheckAttempt()
+
+        // (v102-r2) The pinned literal is checked against the allowlist BEFORE anything is sent:
+        // an edit that points it elsewhere turns the update check OFF rather than turning it into
+        // a request to somewhere else.
+        guard let url = URL(string: Self.releasesEndpoint), UpdateEndpoint.isAllowed(url)
+        else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        // Generous on purpose. Nothing waits on this check — it is invisible until it has an
+        // answer — so the only thing a tight timeout buys is a spurious failure. Measured at
+        // launch, a COLD DNS+TLS connection from this process can take several seconds, and a
+        // 10s leash turned that into a silent miss and a whole day's wait for the retry.
+        request.timeoutInterval = 30
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue(UpdateHint.userAgent(version: appVersion), forHTTPHeaderField: "User-Agent")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.urlCache = nil
+        configuration.httpShouldSetCookies = false
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        do {
+            // (v102-r2) REDIRECTS ARE REFUSED, and the URL that actually answered is re-checked
+            // against the allowlist. A 3xx therefore ends the exchange at the allowlisted host
+            // instead of carrying the connection to whatever it names.
+            let (data, response) = try await session.data(for: request,
+                                                          delegate: RefuseRedirects())
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  UpdateEndpoint.isAllowed(http.url),
+                  let tag = UpdateHint.tagName(fromJSON: data)
+            else { return }
+            latestReleaseTag = tag
+        } catch {
+            Self.debugLog("update check failed: \(error)")
+        }
+    }
+
+    /// The single allowlisted endpoint (see the Makefile `audit` rule): the public "latest release"
+    /// document for this project's own repository. UpdateEndpoint.isAllowed is the machine-checked
+    /// form of the same statement, and this literal has to satisfy it to be used at all.
+    private static let releasesEndpoint =
+        "https://api.github.com/repos/ronit111/quotabar/releases/latest"
+
+    /// (v102-r2) Refuses every HTTP redirect by handing the loader no follow-up request. Stateless
+    /// and per-task, so it exists only for the one call it is passed to.
+    private final class RefuseRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
+    private func recordUpdateCheckAttempt() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.updateLastCheckKey)
+    }
+
+    private static func loadUpdateLastCheck() -> Date? {
+        let epoch = UserDefaults.standard.double(forKey: updateLastCheckKey)
+        return epoch > 0 ? Date(timeIntervalSince1970: epoch) : nil
     }
 
     // MARK: - Seed-audit review acknowledgement
@@ -993,6 +1229,26 @@ final class AppModel: ObservableObject {
         HealthPresentation.seedAuditReview(health, epoch: currentEpoch, ackedTs: seedAuditAckTs)
     }
 
+    // MARK: - (v102) healed plan-change notice
+
+    /// A plan-tier change the poll already re-banked, or nil once acknowledged/expired.
+    var healedPlanChange: (ts: Int, text: String)? {
+        HealthPresentation.healedPlanChange(health, ackedTs: healNoticeAckTs)
+    }
+
+    /// Dismiss the notice. Belt and braces on purpose: the timestamp is remembered app-side
+    /// immediately (so the row goes away now, and stays away even if the script call fails) and
+    /// `usage.py --ack-heal-notice` clears it at the source (so it doesn't linger for its full
+    /// 24h TTL and reappear on another surface). The ack takes the bank lock, so it goes through
+    /// the same FIFO as every other actuator rather than racing a poll.
+    func acknowledgeHealedPlanChange(ts: Int) {
+        healNoticeAckTs = max(healNoticeAckTs, ts)
+        UserDefaults.standard.set(healNoticeAckTs, forKey: Self.healNoticeAckKey)
+        enqueueAction(.ackHealNotice, key: Self.healNoticeKey, executable: Paths.python,
+                      arguments: [Paths.usage, "--ack-heal-notice"],
+                      successMessage: nil, environment: scriptEnvironment)
+    }
+
     var archiverWarning: String? { HealthPresentation.archiverWarning(health, epoch: currentEpoch) }
     var forkDriftLine: String? { HealthPresentation.forkDriftLine(health, epoch: currentEpoch) }
 
@@ -1000,6 +1256,7 @@ final class AppModel: ObservableObject {
     /// chrome at all (zero noise in the healthy state).
     var hasHealthAnomaly: Bool {
         archiverWarning != nil || forkDriftLine != nil || seedAuditReview != nil
+            || healedPlanChange != nil
     }
 
     /// True while a restart offer is pending or per-session restart outcomes are still showing.
@@ -1019,10 +1276,6 @@ final class AppModel: ObservableObject {
 
     func isPingCoolingDown(for account: UsageAccount) -> Bool {
         pingRemaining(for: account) > 0
-    }
-
-    private func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private func appleScriptString(_ s: String) -> String {
@@ -1133,7 +1386,8 @@ final class AppModel: ObservableObject {
         successMessage: String?,
         environment: [String: String] = [:],
         offersRestart: Bool = false,
-        flipsActive: Bool = true
+        flipsActive: Bool = true,
+        capturesSummary: Bool = false
     ) {
         guard busyActions[key] == nil else { return }
         busyActions[key] = kind
@@ -1143,7 +1397,7 @@ final class AppModel: ObservableObject {
         let action = PendingAction(kind: kind, key: key, executable: executable,
                                    arguments: arguments, successMessage: successMessage,
                                    environment: environment, offersRestart: offersRestart,
-                                   flipsActive: flipsActive)
+                                   flipsActive: flipsActive, capturesSummary: capturesSummary)
         scheduler.enqueue(
             key: key,
             payload: .action(action),
@@ -1194,21 +1448,28 @@ final class AppModel: ObservableObject {
 
         var failureMessage: String?
         var timedOut = false
+        var summaryCaption: String?
         do {
-            _ = try await ScriptRunner.run(
+            let result = try await ScriptRunner.run(
                 executable: action.executable,
                 arguments: action.arguments,
                 policy: .mutatingAction,
                 environment: action.environment
             )
+            if action.capturesSummary {
+                summaryCaption = UnseedSummary.caption(
+                    fromStdout: String(data: result.stdout, encoding: .utf8) ?? ""
+                )
+            }
         } catch ScriptFailure.timedOut {
             timedOut = true
         } catch let failure as ScriptFailure {
-            failureMessage = SwapFailureText.message(
-                isSwitch: isSwitch,
-                exitCode: failure.exitCode,
-                stderrLine: failure.firstStderrLine ?? failure.errorDescription ?? "Script failed"
-            )
+            let stderrLine = failure.firstStderrLine ?? failure.errorDescription ?? "Script failed"
+            failureMessage = action.kind == .unseedAccount
+                ? UnseedFailureText.message(exitCode: failure.exitCode, stderrLine: stderrLine)
+                : SwapFailureText.message(
+                    isSwitch: isSwitch, exitCode: failure.exitCode, stderrLine: stderrLine
+                )
         } catch {
             failureMessage = "Script failed"
         }
@@ -1259,7 +1520,12 @@ final class AppModel: ObservableObject {
                 snapshot = snapshot?.optimisticallyActivatingClaudeAccount(email: action.key)
                 updatingAccountID = "claude:\(action.key)"
             }
-            if let status = action.successMessage {
+            // (v102) An un-seed reports what it tore down; that report IS the confirmation, so it
+            // takes the caption slot and lingers longer than a one-word "Swapped" needs to.
+            if let summaryCaption {
+                cardStatuses[action.key] = summaryCaption
+                clearCardStatusLater(key: action.key, matching: summaryCaption, after: 10)
+            } else if let status = action.successMessage {
                 cardStatuses[action.key] = status
                 clearCardStatusLater(key: action.key, matching: status)
             }
