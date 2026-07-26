@@ -2,7 +2,25 @@
 
 Resume point. Read FULLY. Supersedes all prior handoffs.
 
-## RELEASED: v1.0.0 IS PUBLIC (2026-07-25 00:15 IST)
+## RELEASED: v1.0.1 IS PUBLIC (2026-07-26 ~15:45 IST) — current
+Binding cross-vendor audit cycle complete: r15 full audit (10 findings) +
+diff-scoped confirmation review (7 findings, incl. 1 Critical in the hook
+re-bank path) — all 17 fixed-to-clean, suites green both trees (repo-root test
+sections SKIP in the live tree by design). Deployed live same day: scripts
+synced, app 1.0.1 installed (bundled runtime now ships in Resources; canonical
+build comes from the REPO app dir — the standalone live app dir has no sibling
+scripts tree so its bundle gate refuses, by design), single archiverd on the
+new .archiverd.lock, zero drift, pipe clean. Release + cask sha-verified.
+Owner-visible change: benign UNLINKED drift now auto-heals on poll
+(oracle-gated); the Link chip only appears for real problems.
+OPEN for v1.0.2: plan-tier drift stays manual (owner to ratify auto-heal or
+keep); hook still prints a deferral line each SessionStart until the poll heals
+(only matters if QuotaBar isn't running); visual candidates; un-seed flow;
+pinned-launch affordance. NOTE: the v1.0.1 confirmation-review fixes were
+verified same-vendor only (owner-directed, token budget) — next Codex pass can
+diff-review them against 0b02fc9 as its baseline.
+
+## RELEASED: v1.0.0 (2026-07-25 00:15 IST) — superseded
 Tag v1.0.0 on main (squash-merged; leaky wip history never reached main; remote
 wip branch deleted, full history kept locally). GitHub release carries
 QuotaBar-1.0.0.zip (sha256 verified against the published cask). Homebrew tap
