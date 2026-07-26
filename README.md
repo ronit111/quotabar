@@ -132,8 +132,9 @@ not your banked data).
 
 The cask downloads the release zip and installs `QuotaBar.app` into `/Applications`.
 That's all it installs. The app is self-contained: the account-bank scripts ship inside
-`QuotaBar.app/Contents/Resources/account-bank`, and the app falls back to that copy when
-nothing is installed on disk, so usage display and account switching work out of the box.
+`QuotaBar.app/Contents/Resources/account-bank`, and the app runs that copy by default —
+so usage display and account switching work out of the box, and an upgrade always gets
+the runtime that was tested with it.
 
 The cask does **not** install the scripts anywhere you can call them from a shell, add a
 SessionStart hook, or set up the launch agent. For command-line, SwiftBar, or hook use —
@@ -190,13 +191,27 @@ the swap scripts read it without prompting every time, run this once:
 
 ```sh
 security set-generic-password-partition-list \
-  -s "Claude Code-credentials" -a "$USER" -k "" -S "apple:,apple-tool:"
+  -s "Claude Code-credentials" -a "$USER" -S "apple:,apple-tool:" \
+  ~/Library/Keychains/login.keychain-db
 ```
+
+It will prompt for your login keychain password. Type it and press return; there is
+no visible echo. Check that the command exits 0 — on failure it prints
+`SecKeychainItemCopyAccess ... errSecAuthFailed` (wrong password) or
+`The specified item could not be found in the keychain` (you have not run `/login`
+in Claude Code yet, so the item does not exist).
 
 This adds Apple-signed tools (including `/usr/bin/security`, which the scripts use)
 to that **one** keychain item's access list. It does not reveal the secret and does
-not affect any other item — it only stops the repeated GUI prompt. macOS asks for
-your login password once to apply it.
+not affect any other item — it only stops the repeated GUI prompt.
+
+Two details worth stating plainly, because earlier versions of this README got them
+wrong. Passing `-k ""` does **not** mean "no password needed" — it supplies an empty
+password, which fails on any normally-protected login keychain instead of prompting;
+`security` itself marks `-k` deprecated and says to omit it to be prompted. And the
+partition list `apple:,apple-tool:` grants access to Apple-signed binaries generally,
+not to these scripts specifically: any Apple-signed tool running as you may then read
+that one item without a prompt. That is the actual trade you are making for fast swaps.
 
 ### Adding accounts
 
@@ -289,16 +304,32 @@ Environment variables (all optional):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BANK_DIR` | `~/.claude/accounts` | Where banked records, config, cache, lock, snapshots live. (`ACCOUNT_BANK_DIR` is honoured as a fallback.) |
-| `QUOTABAR_SCRIPTS_DIR` | `~/.local/share/quotabar/account-bank` | Where the scripts are installed and where the app looks for them (falls back to the copy bundled in the app). |
+| `BANK_DIR` | `~/.claude/accounts` | Where banked records, config, cache, lock, snapshots live. Resolution order is `BANK_DIR`, then `ACCOUNT_BANK_DIR`, then the default — applied identically by the shell scripts, the Python tools and the app. |
+| `ACCOUNT_BANK_DIR` | (unset) | Second rung of the rule above. Set either one; the app exports the value it resolved to every script it runs, so they cannot disagree. |
+| `QUOTABAR_SCRIPTS_DIR` | `$XDG_DATA_HOME/quotabar/account-bank` | Where the scripts are installed and where the app looks for them first. |
 | `XDG_DATA_HOME` | `~/.local/share` | Base for the scripts install path above. |
 | `ACCOUNT_BANK_TIMEOUT` | `5` | Per-request network timeout (seconds). |
 | `ACCOUNT_BANK_PING_MODEL` | `haiku` | Model used for a ping turn. |
 | `ACCOUNT_BANK_CODEX_PING` | `0` (off) | Allow the Codex CLI to self-refresh on a 401. |
 
-The app resolves the scripts directory at launch (env override → installed location
-→ the copy bundled inside `QuotaBar.app`) and resolves the bank directory the same
-way the scripts do, so the two always agree.
+The app resolves the scripts directory at launch, in this order: `QUOTABAR_SCRIPTS_DIR`
+→ the copy bundled inside `QuotaBar.app` → the installed location → and, only if none
+of those exist, the legacy `~/.claude/scripts/account-bank` path used before v1.0.0. It
+resolves the bank directory by the same `BANK_DIR` → `ACCOUNT_BANK_DIR` → default rule
+the scripts use, and passes the resolved value to every script it runs, so the two
+always agree.
+
+The app prefers its **own bundled runtime** because the two ship as one versioned
+artifact: after `brew upgrade --cask quotabar`, an install directory left behind by an
+older version would otherwise keep serving the old credential-mutating scripts to the
+new binary, and no version check would notice. Set `QUOTABAR_SCRIPTS_DIR` when you
+deliberately want the app to run an installed or checked-out copy instead — an explicit
+override still wins over everything. Command-line use is unaffected: the scripts you
+invoke from a shell are always the ones you installed.
+
+If you have a pre-v1.0.0 copy at `~/.claude/scripts/account-bank`, it is ignored
+whenever a bundled or installed copy is present — upgrades take effect instead of
+being shadowed by the old scripts. Delete it once you have migrated.
 
 ## Uninstall
 

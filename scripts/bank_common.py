@@ -44,6 +44,22 @@ V2_CONTROL_JSON = frozenset({
 })
 
 
+def resolve_bank_dir(env=None):
+    """(r15 #4) THE bank-directory resolution rule, in one place: BANK_DIR (test/explicit)
+    -> ACCOUNT_BANK_DIR (the convention the shim, claude-acct and hooks export) ->
+    ~/.claude/accounts. Byte-identical to lib.sh:22 and README's Configuration table.
+
+    Before this, the shell mutators honoured ACCOUNT_BANK_DIR while usage.py, reconcile.py
+    and the app silently ignored it and used the default — so a user who set only the
+    DOCUMENTED variable had the swap scripts operating on one bank while the poller and
+    reconciler read (and recovered) a different one. Every Python entry point resolves here;
+    the app resolves the same order and exports the RESULT to its children so no child can
+    re-resolve differently."""
+    env = os.environ if env is None else env
+    return (env.get("BANK_DIR") or env.get("ACCOUNT_BANK_DIR")
+            or os.path.join(os.path.expanduser("~"), ".claude", "accounts"))
+
+
 # --------------------------------------------------------------------------- #
 # email / path safety (critical finding 1)
 # --------------------------------------------------------------------------- #
@@ -182,6 +198,67 @@ def same_credentials(a, b):
     compare, finding 21). Empty/invalid fingerprints never compare equal."""
     fa, fb = cred_fingerprint(a), cred_fingerprint(b)
     return bool(fa) and fa == fb
+
+
+def plan_tier(raw):
+    """Normalize a plan string from EITHER oauthAccount.organizationType ("claude_max",
+    "claude_max_20x") OR claudeAiOauth.subscriptionType ("max") to the max|pro|free tier
+    strings autopick matches EXACTLY, else None. Prefix-based so tier variants ($100 Max 5x /
+    $200 Max 20x) both collapse to "max" — a naive "claude_"-strip would yield "max_20x" and
+    break is_max()'s `== "max"`. THE tier rule; usage._norm_plan is this function."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    r = raw.lower()
+    if r.startswith("claude_"):
+        r = r[len("claude_"):]
+    for tier in ("max", "pro", "free"):
+        if r.startswith(tier):
+            return tier
+    return None
+
+
+def hook_rebank_refusal(kc, rec):
+    """(v101-confirm) Why the SessionStart hook must NOT re-bank this credential drift by
+    itself, or "" when the drift is provably the banked account's own credential and a
+    re-bank is safe with no network call. Phrased as a refusal: anything unknown, unreadable
+    or merely uncontradicted returns a reason. `kc` is the live keychain oauth object, `rec`
+    the banked record's. Never raises.
+
+    THE PROBLEM. The hook runs inside a 5s budget on a path where a network call is the
+    historical false-death hazard, so it has no identity oracle available. Offline, one
+    account's credential carries nothing that binds it to an email — which made "the keychain
+    changed" indistinguishable from "the keychain now belongs to someone else". The hook
+    re-banked on any drift its offline checks did not contradict, so a keychain-first /login
+    from A to a SAME-PLAN B (keychain already holds B, ~/.claude.json still names A, both
+    stable across repeated reads) wrote B's tokens into A.json and destroyed A's copy.
+    Selecting A afterwards authenticates as B. The oracle-gated poll heal in usage.py cannot
+    repair that if the hook won the bank lock first.
+
+    THE ONE PROVABLE CASE. An access token is issued to exactly one account, so a live
+    credential whose accessToken is BYTE-IDENTICAL to the one already banked under this email
+    IS that account's credential — no oracle required. Its refreshToken or expiresAt having
+    rotated (finding #45's drift class) changes the fingerprint but not the attribution. That
+    is the only offline identity PROOF available here; a changed accessToken is a new token
+    that could equally be A's rotation or B's login, and only the poll's live G9 lookup can
+    tell those apart. Everything else defers there.
+
+    A plan-tier change defers too, even with a matching access token, because a tier change is
+    a distinct event with its own reporting and it is also write_bank_record's positive tell
+    for crossed identities — this function refuses on it rather than deciding it."""
+    if not valid_oauth(kc):
+        return "the live credential is incomplete"
+    if not isinstance(rec, dict):
+        return "the banked record has no credential to compare against"
+    if same_credentials(kc, rec):
+        return "no drift to re-bank"
+    live_at, banked_at = kc.get("accessToken"), rec.get("accessToken")
+    if not isinstance(live_at, str) or not live_at or live_at != banked_at:
+        return ("the access token changed, which is offline-indistinguishable from a "
+                "different account's /login")
+    kt, rt = plan_tier(kc.get("subscriptionType")), plan_tier(rec.get("subscriptionType"))
+    if kt and rt and kt != rt:
+        return "the plan tier changed"
+    return ""
 
 
 # --------------------------------------------------------------------------- #

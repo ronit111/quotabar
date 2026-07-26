@@ -98,6 +98,13 @@ if [ -n "$REAL_CLAUDE" ]; then
   # (r12 #8) merge REAL_CLAUDE_BIN into .config.json UNDER THE BANK LOCK — toggle-autoping.sh
   # writes the same file under the lock; without it the installer's read-modify-write races a
   # concurrent auto_ping toggle and can discard it. Python json handles arbitrary path chars.
+  # (r15 #9) `set -e` (line 23) killed the installer the instant this merge exited 3, so the
+  # `_merge_rc` capture and the "bank lock busy, shim NOT staged" warning below were both
+  # unreachable: the promised handling never ran and the user got an abrupt exit with a
+  # partially staged install and no idea it was resumable. Suspend errexit across exactly
+  # this command so the status can be captured and handled, then restore it. A heredoc rules
+  # out the `if !` form (which would leave $? as the negation, not the merge's status).
+  set +e
   REAL_CLAUDE_BIN="$REAL_CLAUDE" CONFIG_PATH="$ACCOUNTS_DIR/.config.json" \
     ACC="$ACCOUNTS_DIR" SD="$SCRIPTS_DEST" python3 - <<'PY'
 import json, os, sys
@@ -128,6 +135,7 @@ finally:
     lk.release()
 PY
   _merge_rc=$?
+  set -e
   # (r13 #10) only stage the shim if REAL_CLAUDE_BIN was actually recorded. A skipped merge
   # (bank-lock timeout, rc 3) must NOT be reported as a recorded binary + staged shim.
   if [ "$_merge_rc" -eq 0 ]; then
@@ -159,6 +167,29 @@ fi
 # load it here — cutover (owner-driven) loads it; the daemon is epoch-gated (#8) anyway.
 ARCHIVER_TEMPLATE="$REPO_DIR/scripts/launchd/com.quotabar.archiver.plist"
 if [ -f "$ARCHIVER_TEMPLATE" ]; then
+  # (v101-confirm) UPGRADE PREFLIGHT. A daemon started before this install takes no
+  # single-instance lock, so the job we are about to write could acquire the lock cleanly and
+  # still coexist with it — two archivers alternating status writes, which is the production
+  # failure that lock exists to prevent. The daemon itself refuses to start while such a
+  # process is live, so this is a warning (the install continues and the plist is written);
+  # what it buys is that the operator learns NOW, not from a daemon that silently never runs.
+  # Ask the daemon's OWN detector rather than reimplementing the scan here: it already knows
+  # which process-table entries are real rivals (our uid, a python argv[0], an argument whose
+  # basename is archiverd.py, not a bounded one-shot, and the SAME bank). A grep would match
+  # test_archiverd.py and the pipeline itself, and a false positive tells the operator to kill
+  # processes that are not the daemon.
+  _OLD_ARCHIVERS="$(SCRIPTS_DEST="$SCRIPTS_DEST" ACC="$ACCOUNTS_DIR" python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["SCRIPTS_DEST"])
+import archiverd
+print(" ".join(str(p) for p in archiverd.other_archiverd_pids(os.environ["ACC"])))' 2>/dev/null || true)"
+  if [ -n "${_OLD_ARCHIVERS// /}" ]; then
+    echo "==> WARNING: archiverd.py is ALREADY RUNNING on $ACCOUNTS_DIR (pid(s): $_OLD_ARCHIVERS)." >&2
+    echo "    That process predates this install and holds no single-instance lock, so the" >&2
+    echo "    new daemon will REFUSE to start until it is gone. Stop it before cutover:" >&2
+    echo "      kill $_OLD_ARCHIVERS" >&2
+    echo "      launchctl bootout gui/\$(id -u)/com.quotabar.archiver   # if it was launchd-managed" >&2
+  fi
   LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
   mkdir -p "$LAUNCH_AGENTS"
   ARCHIVER_PLIST="$LAUNCH_AGENTS/com.quotabar.archiver.plist"
@@ -226,10 +257,13 @@ QuotaBar.app is in /Applications and the scripts are installed. Two things to kn
 2. Fast account swaps need a one-time Keychain authorization so the scripts can
    read Claude Code's credential item without a password prompt each time:
        security set-generic-password-partition-list \
-         -s "Claude Code-credentials" -a "$USER" -k "" -S "apple:,apple-tool:"
-   (This grants Apple-signed tools -- including /usr/bin/security -- access to
-   that one item. It does not expose the secret; it just stops the repeated GUI
-   prompt. You will be asked for your login password once to apply it.)
+         -s "Claude Code-credentials" -a "$USER" -S "apple:,apple-tool:" \
+         ~/Library/Keychains/login.keychain-db
+   It PROMPTS for your login keychain password (no echo) and must exit 0. Run it
+   after you have logged in to Claude Code at least once, or the item will not
+   exist yet. Note what it grants: Apple-signed tools -- /usr/bin/security among
+   them -- may then read that ONE item without a prompt. It does not expose the
+   secret to anything else and does not touch any other keychain item.
 
 Add accounts: run `/login` in Claude Code for each account. With the SessionStart
 hook enabled (optional, see README), the next session banks it automatically;

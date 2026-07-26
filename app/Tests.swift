@@ -1244,15 +1244,61 @@ struct QuotaBarTests {
             ScriptsLocation.choose(env: "/missing", candidates: ["/a", "/b"]) { $0 == "/b" } == "/b",
             "a missing env dir falls through to the first existing default"
         )
-        // no env -> first existing candidate (owner install before XDG).
+        // no env -> first existing candidate, in the order given.
         try expect(
             ScriptsLocation.choose(env: nil, candidates: ["/a", "/b"]) { $0 == "/a" || $0 == "/b" } == "/a",
-            "with no env, the owner install path is preferred over XDG"
+            "with no env, the first existing candidate wins"
         )
         try expect(
             ScriptsLocation.choose(env: nil, candidates: ["/a", "/b"]) { _ in false } == nil,
             "nothing exists -> nil (caller supplies a last-resort default)"
         )
+
+        // (v101-confirm) The full precedence: override, BUNDLED, XDG install, legacy LAST.
+        // The bundled-before-installed rung is the upgrade guarantee: a stale install dir left
+        // over from an older Cask must not keep serving old credential-mutating scripts to a
+        // new app binary. This test previously enshrined the opposite order.
+        let pick = ScriptsLocation.pickScriptsDir
+        try expect(
+            pick("/env", "/installed", "/bundled", "/legacy", { _ in true }) == "/env",
+            "an existing QUOTABAR_SCRIPTS_DIR still outranks everything"
+        )
+        try expect(
+            pick(nil, "/installed", "/bundled", "/legacy", { _ in true }) == "/bundled",
+            "the BUNDLED runtime beats a pre-existing install (upgrades must not run old scripts)"
+        )
+        try expect(
+            pick("", "/installed", "/bundled", "/legacy", { _ in true }) == "/bundled",
+            "an EMPTY override does not count as an override"
+        )
+        try expect(
+            pick("/missing", "/installed", "/bundled", "/legacy", { $0 != "/missing" }) == "/bundled",
+            "an override pointing at nothing falls through to the bundled runtime"
+        )
+        try expect(
+            pick(nil, "/installed", nil, "/legacy", { _ in true }) == "/installed",
+            "with NO bundled copy, the XDG install is used before the legacy path"
+        )
+        try expect(
+            pick(nil, "/installed", "/bundled", "/legacy", { $0 == "/legacy" }) == "/legacy",
+            "the legacy ~/.claude path is used ONLY when nothing else exists"
+        )
+        try expect(
+            pick(nil, "/installed", nil, "/legacy", { _ in false }) == "/installed",
+            "nothing exists -> fall back to the supported install path, never legacy"
+        )
+
+        // (r15 #4) bank-dir precedence: BANK_DIR -> ACCOUNT_BANK_DIR -> default. The middle
+        // rung is the one the app used to ignore, splitting the app off the shell mutators.
+        let bank = ScriptsLocation.pickBankDir
+        try expect(bank("/b", "/ab", "/home") == "/b", "BANK_DIR wins when set")
+        try expect(bank(nil, "/ab", "/home") == "/ab",
+                   "ACCOUNT_BANK_DIR is honoured when BANK_DIR is unset (r15 #4)")
+        try expect(bank("", "/ab", "/home") == "/ab", "an EMPTY BANK_DIR falls through, not wins")
+        try expect(bank(nil, "", "/home") == "/home/.claude/accounts",
+                   "neither set -> the shared ~/.claude/accounts default")
+        try expect(bank(nil, nil, "/home") == "/home/.claude/accounts",
+                   "absent env vars -> the shared default")
     }
 
     // (review #3) A stranded-lease restart (rc 75, "not registered / lease held") maps to a

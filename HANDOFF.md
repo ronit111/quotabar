@@ -86,12 +86,28 @@ cycle required before any build.
    labeling remain). Option B (rewriting home seats in place) documented and
    rejected — it recreates the shared-mutable-credential drift class inside v2's
    structure. r15 review asks are listed in the doc.
-5. Backlog (unchanged value, lower priority now): un-seed flow; pre-limit nudge;
+5. Backlog (unchanged value, lower priority now).
+   DONE in the v1.0.1 confirmation pass (2026-07-26), both previously listed here:
+   - SessionStart hook identity residual CLOSED. The hook no longer re-banks
+     ambiguous drift at all: it re-banks only what it can prove offline (an
+     UNCHANGED access token whose refresh/expiry rotated — an access token is
+     issued to exactly one account) via `bank_common.hook_rebank_refusal`, and
+     ANNOUNCES every deferral to the oracle-gated poll heal. No oracle HTTP call
+     was added inside the 5s hook budget; the hazard is avoided, not traded.
+     RESIDUAL (deliberate, documented in usage.py `_benign_drift_refusal`): a
+     PLAN-TIER change is now the one drift class NEITHER path writes
+     automatically — the hook announces it and names `bank-account.sh`, the poll
+     still refuses it. Rare and user-initiated; revisit only with a real reason.
+   - archiverd single-instance enforcement COMPLETE. The v101 lock coordinates
+     new-code daemons; the upgrade preflight (`archiverd.other_archiverd_pids`,
+     after lock acquisition) now also catches a PRE-upgrade daemon, which holds
+     no lock — same uid, python argv[0], an argument whose basename is
+     archiverd.py, not `--once`/`--converge`, and the SAME bank (read from the
+     candidate's own env via `ps -E`). install.sh --with-pinning warns with the
+     same detector before writing the plist.
+   Still open: un-seed flow; pre-limit nudge;
    limit-stalled restart offer; hide "Link account" under v2; legacy-login card
-   re-caption; archiverd single-instance enforcement (found 2026-07-25: a
-   manually-bootstrapped instance + the launchd one coexisted for 2 days, both
-   pre-fix, alternating status writes — kickstart couldn't kill the manual one;
-   add a pid-lock so a second instance exits) — plus v1.0.1 visual candidates from the release-eve polish pass (each
+   re-caption — plus v1.0.1 visual candidates from the release-eve polish pass (each
    needs a small logic change, deliberately deferred): collapse the health-banner
    gap (PopoverLayout.estimatedHeight couples to it), continuous gauge color ramp
    (Severity is 3-step model-side), live ticking Ping countdown (needs a timer),

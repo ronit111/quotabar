@@ -17,7 +17,12 @@
 #  - never prints token material; hook stdin JSON is consumed, not stored.
 set -u
 KIND="${1:-}"
-ACC="${ACCOUNT_BANK_DIR:-$HOME/.claude/accounts}"
+# (v101-confirm) THE bank-directory rule, byte-identical to lib.sh:22, bank_common.resolve_bank_dir
+# and ScriptsLocation.pickBankDir: BANK_DIR -> ACCOUNT_BANK_DIR -> the shared default. This hook
+# used to start at ACCOUNT_BANK_DIR, so a BANK_DIR-only setup had the lifecycle hook writing
+# sessions.json and reading epoch state in the DEFAULT bank while the swap/poll rails locked and
+# mutated the custom one — two banks, no shared lock, no coordination.
+ACC="${BANK_DIR:-${ACCOUNT_BANK_DIR:-$HOME/.claude/accounts}}"
 # (r12 #1 / sweep-a) resolve the scripts dir from THIS hook's own location (env override,
 # else self-dir, else legacy). The hooks fragment invokes us by absolute path, so self-dir
 # is where our sibling sessions.py / epoch.py live — the legacy default bricked a clean

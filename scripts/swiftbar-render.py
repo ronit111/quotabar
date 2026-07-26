@@ -15,13 +15,14 @@ SELF = os.path.dirname(os.path.abspath(__file__))
 SWAP = os.path.join(SELF, "swap-account.sh")
 PING = os.path.join(SELF, "ping-account.sh")
 TOGGLE = os.path.join(SELF, "toggle-autoping.sh")
-_HOME = os.path.expanduser("~")
 # (r13 #11) resolve the bank dir with the SAME order as lib.sh (BANK_DIR -> ACCOUNT_BANK_DIR
 # -> ~/.claude/accounts). The old XDG default (~/.local/share/quotabar) read a DIFFERENT
 # .config.json than the scripts mutate, so the menu showed stale auto-ping/cooldown state
 # and offered actions inconsistent with what ping/swap actually operate on.
-BANK_DIR = (os.environ.get("BANK_DIR") or os.environ.get("ACCOUNT_BANK_DIR")
-            or os.path.join(_HOME, ".claude", "accounts"))
+# (r15 #4) now literally the shared implementation rather than a second copy of the order.
+sys.path.insert(0, SELF)
+import bank_common as _bc
+BANK_DIR = _bc.resolve_bank_dir()
 CONFIG_FILE = os.path.join(BANK_DIR, ".config.json")
 PING_COOLDOWN = 1800  # 30 min, must match ping-account.sh
 

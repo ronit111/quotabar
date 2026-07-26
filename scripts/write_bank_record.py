@@ -122,6 +122,13 @@ if meta_email != email:
 #   do not eliminate that window. A JWT-subject decode was considered and rejected
 #   as too fragile to make load-bearing without the ability to validate against a
 #   real token's claim structure.
+#   (v101-confirm) That residual is now handled by the CALLERS, since identity proof is only
+#   obtainable above this layer. Nothing invokes this writer on an unattributable credential
+#   any more: usage.py's poll heal requires a positive live G9 identity match first, and the
+#   SessionStart hook (bank_common.hook_rebank_refusal) re-banks only a credential whose
+#   accessToken is unchanged — an access token is issued to one account, so that is offline
+#   proof — and defers every other drift to the poll. This writer keeps its own gates
+#   unchanged: they are the last line, and a direct/manual caller still gets them.
 def _plan_tier(s):
     s = (s or "").lower()
     if "max" in s: return "max"

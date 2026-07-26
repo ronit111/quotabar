@@ -21,9 +21,17 @@ if _lock_stale_and_dead; then fail "fresh live lock wrongly judged stale/dead"; 
 # (a) OLD but LIVE lock (our pid, aged mtime) must NOT be reclaimed
 touch -t 200001010000 "$LOCK_DIR"
 if _lock_stale_and_dead; then fail "OLD LIVE lock wrongly reclaimable (r3 #1)"; else pass "OLD LIVE lock is NOT reclaimable (r3 #1)"; fi
-# (b) OLD live lock whose OWNER RECORD is unreadable/absent = UNKNOWN, NOT dead
-rm -f "$LOCK_DIR/owner"; touch -t 200001010000 "$LOCK_DIR"
-if _lock_stale_and_dead; then fail "old live lock w/ missing owner wrongly reclaimable (r3 #1)"; else pass "unreadable owner on an old lock is UNKNOWN, NOT reclaimable (r3 #1)"; fi
+# (b) OLD live lock whose OWNER RECORD is present but UNREADABLE = UNKNOWN, NOT dead
+printf 'garbage-not-a-pid\n' > "$LOCK_DIR/owner"; touch -t 200001010000 "$LOCK_DIR"
+if _lock_stale_and_dead; then fail "old live lock w/ unreadable owner wrongly reclaimable (r3 #1)"; else pass "unreadable owner on an old lock is UNKNOWN, NOT reclaimable (r3 #1)"; fi
+# (b2) (v101-confirm) an ABSENT owner record is a DIFFERENT state from an unreadable one: it
+# is an acquisition killed between its mkdir and its owner publication, and refusing it
+# forever wedged the lock permanently (no owner can ever be proven dead). Past the bounded
+# grace it IS reclaimable; inside the grace it is not, because it may still be in flight.
+rm -f "$LOCK_DIR/owner"; touch "$LOCK_DIR"
+if _lock_stale_and_dead; then fail "a FRESH ownerless lock must not be reclaimable (v101-confirm)"; else pass "a FRESH ownerless lock is NOT reclaimable — acquisition may be in flight (v101-confirm)"; fi
+touch -t 200001010000 "$LOCK_DIR"
+if _lock_stale_and_dead; then pass "an ownerless lock PAST the grace IS reclaimable (v101-confirm)"; else fail "ownerless lock past the grace still wedged (v101-confirm)"; fi
 rm -rf "$LOCK_DIR"
 # (c) a genuinely OLD + DEAD lock (dead pid, aged) IS reclaimable
 mkdir -p "$LOCK_DIR"

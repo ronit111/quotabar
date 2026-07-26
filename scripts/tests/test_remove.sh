@@ -55,4 +55,41 @@ assert_eq 78 "$rc" "(r12 #7) remove under EPOCH v2 is fenced rc 78, before any m
 assert_contains "ghost@x.com" "$(cat "$BANK_DIR/.config.json")" \
   "(r12 #7) .config.json auto_ping NOT scrubbed under v2 (no lie 'nothing to remove')"
 
+# ---- (r15 #3) removal FAILS CLOSED when the live identity cannot be established ----
+# The old gate aborted only on a positive fingerprint MATCH, so an unreadable or unstable
+# keychain — the exact symptom of the /login race the gate exists to catch — fell through
+# and deleted the record. Deletion now needs positive proof the target is not live.
+new_env rm_kc_unreadable >/dev/null
+set_active a@x.com A
+bank_record a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B "" "$FUT" max claude_max
+out="$(STUB_KC_MODE=readerror /bin/bash "$RM" b@x.com 2>&1)"; rc=$?
+assert_ne 0 "$rc" "(r15 #3) an UNREADABLE keychain refuses the removal"
+assert_file_present "$BANK_DIR/b@x.com.json" \
+  "(r15 #3) the bank record survives an unreadable keychain (fail closed, not open)"
+assert_contains "absence NOT" "$out" "(r15 #3) the refusal says absence was not confirmed"
+
+# A CONFIRMED-empty slot (security find -> rc 44) is different: nothing can be becoming
+# active, so removal must still work. Fail-closed must not mean fail-always.
+new_env rm_kc_absent >/dev/null
+set_active a@x.com A
+bank_record a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B "" "$FUT" max claude_max
+out="$(STUB_KC_MODE=readfail /bin/bash "$RM" b@x.com 2>&1)"; rc=$?
+assert_eq 0 "$rc" "(r15 #3) a CONFIRMED-empty keychain (rc 44) still allows removal"
+assert_file_absent "$BANK_DIR/b@x.com.json" "(r15 #3) the parked record is deleted as before"
+
+# The live keychain holding the TARGET's credential still aborts (the original guard).
+new_env rm_kc_is_target >/dev/null
+set_active a@x.com A
+bank_record a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B "" "$FUT" max claude_max
+# a /login already installed b's credential while ~/.claude.json still names a@x.com;
+# the blob must fingerprint-match b's bank record exactly (same fields bank_record wrote).
+printf '{"claudeAiOauth":{"accessToken":"B","refreshToken":"r-B","expiresAt":%s,"subscriptionType":"max"}}' \
+  "$FUT" > "$STUB_KC_FILE"
+out="$(/bin/bash "$RM" b@x.com 2>&1)"; rc=$?
+assert_ne 0 "$rc" "(r15 #3) the live keychain holding the target's creds still aborts"
+assert_file_present "$BANK_DIR/b@x.com.json" "(r15 #3) target record preserved during the /login race"
+
 finish "remove"

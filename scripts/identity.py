@@ -57,10 +57,20 @@ def _is_auth_signature(body):
         "authentication_error", "permission_error")
 
 
-def resolve(access_token):
-    """One G9 call. Never raises; every failure mode maps into the verdict."""
+def resolve(access_token, timeout=None):
+    """One G9 call. Never raises; every failure mode maps into the verdict.
+
+    (r15 #1) `timeout` lets a caller bound the call by ITS own budget instead of the 15s
+    default — usage.py's poll gate resolves identity inside a deadline-fenced run and must
+    not be able to outlive it. A shorter budget only ever produces INDETERMINATE (never a
+    verdict), so bounding it can never turn into a wrong identity answer."""
     if not isinstance(access_token, str) or not access_token.strip():
         return IdentityResult("INDETERMINATE", "", "", "", "no access token supplied")
+    try:
+        timeout = float(timeout) if timeout is not None else TIMEOUT_S
+    except (TypeError, ValueError):
+        timeout = TIMEOUT_S
+    timeout = max(0.5, min(TIMEOUT_S, timeout))
     req = urllib.request.Request(
         PROFILE_URL,
         headers={
@@ -71,7 +81,7 @@ def resolve(access_token):
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S,
+        with urllib.request.urlopen(req, timeout=timeout,
                                     context=ssl.create_default_context()) as resp:
             body = resp.read(1 << 20)
     except urllib.error.HTTPError as e:
@@ -104,10 +114,10 @@ def resolve(access_token):
     return IdentityResult("RESOLVED", uuid, email, _plan_of(acct), "ok")
 
 
-def verify_owner(access_token, expected_email):
+def verify_owner(access_token, expected_email, timeout=None):
     """Convenience: (bool_or_None, result). True/False ONLY on RESOLVED; None on
     anything else (callers MUST treat None as do-not-mutate)."""
-    r = resolve(access_token)
+    r = resolve(access_token, timeout=timeout)
     if r.verdict != "RESOLVED":
         return None, r
     return r.email == expected_email, r

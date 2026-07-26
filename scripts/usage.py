@@ -41,6 +41,10 @@ try:
     import reconcile as _reconcile
 except Exception:
     _reconcile = None
+try:
+    import identity as _identity   # (r15 #1) the G9 live-identity oracle the heal gate requires
+except Exception:
+    _identity = None
 
 LOCKED = False          # True only while we may MUTATE (hold lock AND no unresolved torn swap)
 HOLD_LOCK = False       # True while we physically hold the lock (gates release)
@@ -67,7 +71,7 @@ DEADLINE = float("inf")   # wall-clock run deadline; set in main(), read by proc
 LOCK_STALE_SECS = 300
 
 HOME = os.path.expanduser("~")
-BANK_DIR = os.environ.get("BANK_DIR", os.path.join(HOME, ".claude", "accounts"))
+BANK_DIR = bank_common.resolve_bank_dir()   # (r15 #4) the ONE rule: BANK_DIR -> ACCOUNT_BANK_DIR -> default
 CLAUDE_JSON = os.environ.get("CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
 CACHE_FILE = os.path.join(BANK_DIR, ".usage-cache.json")
 # (r8 #3 / r13 #12) the v2 control-plane skip set now lives in bank_common (shared with
@@ -91,6 +95,12 @@ AUTOPING_COOLDOWN = float(os.environ.get("ACCOUNT_BANK_AUTOPING_COOLDOWN", "1800
 # can't be re-fired every poll cycle.
 AUTOPING_FAIL_COOLDOWN = float(os.environ.get("ACCOUNT_BANK_AUTOPING_FAIL_COOLDOWN", "300"))
 AUTOPING_DRYRUN = os.environ.get("ACCOUNT_BANK_AUTOPING_DRYRUN", "0") == "1"
+# (v101) benign UNLINKED auto-heal. Off switch + the post-failure backoff window; the
+# marker is a DOTfile so the bank-record `*.json` glob never sees it as an account.
+HEAL_UNLINKED = os.environ.get("ACCOUNT_BANK_HEAL_UNLINKED", "1") == "1"
+HEAL_BACKOFF = float(os.environ.get("ACCOUNT_BANK_HEAL_BACKOFF", "600"))
+HEAL_MARKER = os.path.join(BANK_DIR, ".unlinked-heal.json")
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 # force-fresh: bypass parked-cache AND burst-guard for this email (post-switch trust)
 _ff = os.environ.get("ACCOUNT_BANK_FORCE_FRESH", "")
 FORCE_FRESH_ALL = _ff.strip() == "*"
@@ -317,23 +327,10 @@ def set_bank_status(bank_path, status):
 
 # ---------- per-account: CLAUDE ----------
 def _norm_plan(raw):
-    """Normalize a plan string from EITHER oauthAccount.organizationType
-    ("claude_max", "claude_max_20x") OR claudeAiOauth.subscriptionType ("max") to
-    the max|pro|free tier strings autopick matches EXACTLY. Prefix-based so tier
-    variants ($100 Max 5x / $200 Max 20x) both collapse to "max" — a naive
-    "claude_"-strip would yield "max_20x" and break is_max()'s `== "max"`."""
-    if not isinstance(raw, str) or not raw:
-        return None
-    r = raw.lower()
-    if r.startswith("claude_"):
-        r = r[len("claude_"):]
-    if r.startswith("max"):
-        return "max"
-    if r.startswith("pro"):
-        return "pro"
-    if r.startswith("free"):
-        return "free"
-    return None
+    """Normalize organizationType/subscriptionType to the max|pro|free tier strings autopick
+    matches EXACTLY, else None. (v101-confirm) The rule itself now lives in bank_common so the
+    hook's re-bank gate reads tiers identically; this stays as the name the poll already uses."""
+    return bank_common.plan_tier(raw)
 
 
 def process_claude(email, oauth, is_active, bank_path, status, oauth_account=None):
@@ -920,6 +917,171 @@ def maybe_autoping(results, bank_paths):
     return ["spawn-failed:" + email]   # (#34) never report a fired ping that didn't start
 
 
+# ---------- (v101) benign UNLINKED auto-heal ----------
+# resolve_identity is fail-closed by design: the ACTIVE account's own token rotating ahead
+# of its bank record is offline-indistinguishable from a keychain-first /login, so both read
+# as UNRESOLVED. The SessionStart hook (account-warn.sh login-sync) already resolves the
+# rotation case by re-banking the active account through bank-account.sh. These helpers give
+# the POLL path a STRICTLY STRONGER rule: the hook re-banks on any drift the offline checks
+# do not contradict, while the poll re-banks only on POSITIVE proof of identity from the live
+# G9 oracle (r15 #1).
+# Authority check: the "Link account" button the UNLINKED chip offered runs bank-account.sh
+# with no arguments — i.e. this exact re-bank. The heal automates the mutation the chip was
+# already asking for, under strictly tighter preconditions than either the button or the hook.
+def _identity_oracle(token):
+    """(r15 #1) ONE live G9 profile lookup (identity.py). Returns an IdentityResult, or None
+    when the primitive is unavailable — callers treat None exactly like INDETERMINATE. Tests
+    replace this attribute; nothing else in the poll may substitute for it.
+
+    Bounded by HTTP_TIMEOUT (the same per-request budget every other network call in this
+    poll uses) and by the run's remaining deadline. This call happens while we HOLD THE BANK
+    LOCK, so a long one would stall a concurrent swap waiting on that lock; identity.py's own
+    15s default is far too generous for that position. A tight budget is safe precisely
+    because the gate is fail-closed: a timeout yields INDETERMINATE, which refuses the heal
+    and leaves the chip up for the next poll to retry — it can never yield a wrong identity."""
+    if _identity is None:
+        return None
+    return _identity.resolve(token, timeout=max(1.0, min(HTTP_TIMEOUT, DEADLINE - now())))
+
+
+def _benign_drift_refusal(act, kc):
+    """Why the current UNRESOLVED keychain must NOT be auto-re-banked, or "" when it IS the
+    benign case (the active account's credential rotated ahead of its own bank record).
+    Every check is phrased as a REFUSAL: an unknown, unreadable or ambiguous state returns a
+    reason, never "". Never raises.
+
+    (r15 #1) The offline checks below are all ABSENCE OF CONTRADICTION, and no amount of them
+    is identity proof: a keychain-first /login installing an UNBANKED, SAME-PLAN account while
+    ~/.claude.json still names `act` is byte-identical, offline, to `act`'s own token having
+    rotated. The heal therefore ends on POSITIVE identity confirmation from the live G9 oracle
+    and re-banks only when the resolved live email is exactly `act`. That closes the residual
+    this docstring used to carry, and closes it in the strong direction: an oracle that cannot
+    answer (offline, 429, 5xx, proxy 401) REFUSES, so an offline poll can never heal at all.
+    (v101-confirm) This is now the ONLY path that re-banks a changed access token: the
+    SessionStart hook re-banks only credentials it can attribute offline (an unchanged access
+    token whose refresh/expiry rotated) and defers the rest here, so no path re-banks an
+    ambiguous identity any more."""
+    if not HEAL_UNLINKED:
+        return "auto-heal disabled"
+    # v1-mutator-class write: v1|shadow only, and never during a SEEDING freeze. Under v2
+    # there is no bank-record rail to heal, so this must not fire at all. write_bank_record.py
+    # enforces the same gate plus a generation fence; checking here keeps us from spawning a
+    # writer we know will be fenced.
+    try:
+        import epoch as _ep
+        _ep.v1_gate(BANK_DIR)
+    except Exception as e:
+        return f"epoch gate refused ({type(e).__name__})"
+    # Lock ownership must be PROVABLE. Without our token the writer would try to acquire the
+    # non-reentrant lock we are already holding and simply time out.
+    if not _LOCK.token:
+        return "bank lock ownership not provable"
+    if not act:
+        return "no active identity metadata"
+    if not bank_common.valid_oauth(kc):
+        return "no complete live credential"
+    if bank_common.safe_email(act) is None:
+        return "unsafe active email"
+    path = os.path.join(BANK_DIR, f"{act}.json")
+    if not os.path.exists(path):
+        return "active identity is not banked"
+    br = bank_common.load_bank_record(path, expected_email=act)
+    if not br.ok:
+        return f"bank record invalid ({br.reason})"
+    if br.status == "needs-relogin":
+        return "record is needs-relogin"       # a real re-login is needed; show the chip
+    live_fp = bank_common.cred_fingerprint(kc)
+    if not live_fp:
+        return "live credential has no fingerprint"
+    if live_fp == bank_common.cred_fingerprint(br.oauth):
+        return "no drift to heal"              # UNRESOLVED for some other reason entirely
+    if bank_common.fp_owner(BANK_DIR, kc) is not None:
+        # The live credential is the CURRENT credential of a DIFFERENT banked account: a
+        # genuinely different account is in the slot, not a rotation. Never auto-link.
+        return "credential belongs to another banked account"
+    # A plan-tier change is a distinct event, and a tier disagreement is also the positive tell
+    # write_bank_record.py uses for crossed identities — so it is never healed silently. Only a
+    # KNOWN-vs-KNOWN disagreement refuses (mirroring that cross-check): an absent
+    # subscriptionType on either side is no evidence.
+    # (v101-confirm) The SessionStart hook used to be the one that re-banked this case; it now
+    # ANNOUNCES the tier change and defers, so a plan change is the one drift class neither
+    # path writes automatically. That is deliberate: it is rare, it is user-initiated, and the
+    # hook's message names the one-line fix (bank-account.sh). Do not relax this into an
+    # automatic write without a reason stronger than convenience.
+    _kt, _rt = (_norm_plan((kc or {}).get("subscriptionType")),
+                _norm_plan((br.oauth or {}).get("subscriptionType")))
+    if _kt and _rt and _kt != _rt:
+        return "plan tier changed"
+    # (r15 #1) POSITIVE IDENTITY CONFIRMATION — the decisive gate, deliberately last so the
+    # free offline refusals above short-circuit before we spend a network call. Ask the live
+    # credential itself who it belongs to (identity.py's G9 /api/oauth/profile: read-only,
+    # non-refreshing, no quota) and re-bank ONLY on RESOLVED-and-equal. INVALID (the server
+    # rejected the credential) and INDETERMINATE (offline, timeout, 429, 5xx, proxy/WAF 401)
+    # are both refusals: "cannot confirm" must never read as "confirmed", which is exactly
+    # the inversion that let a same-plan unbanked /login pass as benign rotation.
+    try:
+        r = _identity_oracle((kc or {}).get("accessToken", ""))
+    except Exception:
+        r = None                                   # a raising oracle confirms nothing
+    if r is None or getattr(r, "verdict", "") != "RESOLVED":
+        return "live identity unconfirmed"
+    if r.email != act:
+        return "live identity is a different account"
+    return ""
+
+
+def _heal_backoff_active():
+    try:
+        return float(json.load(open(HEAL_MARKER)).get("until", 0) or 0) > now()
+    except Exception:
+        return False
+
+
+def _heal_mark_failure():
+    """One backoff window per failed heal — no retry storm when a state is unhealable."""
+    try:
+        with open(HEAL_MARKER, "w") as f:
+            json.dump({"until": now() + HEAL_BACKOFF, "ts": int(now())}, f)
+        os.chmod(HEAL_MARKER, 0o600)
+    except Exception:
+        pass
+
+
+def _heal_clear_backoff():
+    try:
+        os.remove(HEAL_MARKER)
+    except OSError:
+        pass
+
+
+def _heal_unlinked(act, kc):
+    """Re-bank the active account through the ONE sanctioned writer, write_bank_record.py,
+    reusing the bank lock usage.py already holds (bank-account.sh is the shell caller that
+    ACQUIRES that lock, so calling it from here would only contend with ourselves). The
+    writer re-checks the metadata==email identity match, the plan cross-check, the epoch gate
+    and generation fence, and archives the predecessor credential before replacing it —
+    every gate a hook-driven re-bank passes. Returns True iff the record was rewritten."""
+    out = os.path.join(BANK_DIR, f"{act}.json")
+    env = dict(os.environ)
+    env["ACCOUNT_BANK_HOLDS_LOCK"] = "1"
+    env["ACCOUNT_BANK_LOCK_TOKEN"] = _LOCK.token
+    # The writer takes the FULL keychain blob on stdin and reads only claudeAiOauth from it;
+    # read_keychain_blob() already unwrapped that member, so re-wrapping is lossless. The
+    # fingerprint goes along as the expected-snapshot gate (re-review issue 11), exactly as
+    # bank-account.sh passes fp1 — a /login racing us then fails the write instead of
+    # misattributing a credential.
+    try:
+        p = subprocess.run([sys.executable, os.path.join(_SELF_DIR, "write_bank_record.py"),
+                            CLAUDE_JSON, act, out, iso(), str(int(now())),
+                            bank_common.cred_fingerprint(kc)],
+                           input=json.dumps({"claudeAiOauth": kc}),
+                           capture_output=True, text=True, env=env,
+                           timeout=max(1.0, min(10.0, DEADLINE - now())))
+    except Exception:
+        return False
+    return p.returncode == 0
+
+
 def _stable_identity(retries=3):
     """Repeatedly read the active identity + live keychain fingerprint and return
     (email, blob, stable) — stable is True only if two consecutive reads agree
@@ -1132,6 +1294,29 @@ def main():
         # oauth dict (or None); resolve against the SAME bank dir usage.py polls.
         identity_resolved = bool(act and kc
                                  and bank_common.resolve_identity(BANK_DIR, kc, act) == act)
+
+        # (v101) BENIGN UNLINKED AUTO-HEAL. The commonest UNRESOLVED state by far is the
+        # ACTIVE account's own token rotating ahead of its bank record — self-healing, but
+        # it painted an alarming "UNLINKED + Link account" chip until the next SessionStart
+        # hook re-banked it. The hook's login-sync already auto-re-banks exactly this; heal
+        # it here too so the state does not have to wait for a session. Attempted at most
+        # ONCE per poll, only while we may mutate (LOCKED implies both the physical lock and
+        # a STABLE two-read identity snapshot, the same gate bank-account.sh applies before
+        # capture), and only when _benign_drift_refusal() can prove the case is benign —
+        # which since r15 #1 requires the live G9 oracle to name `act` as the credential's
+        # owner, so an unconfirmable identity leaves the chip standing rather than healing.
+        # On success we re-run the resolver so THIS poll already emits a resolved, chip-free
+        # payload — no transient "healing" state ever reaches the app. On failure we stamp a
+        # backoff marker so an unhealable state cannot re-run the writer every cycle, and the
+        # chip stands (correctly: it now means something needs attention).
+        if (LOCKED and not identity_resolved and not _heal_backoff_active()
+                and not _benign_drift_refusal(act, kc)):
+            if _heal_unlinked(act, kc):
+                _heal_clear_backoff()
+                identity_resolved = bool(act and kc
+                                         and bank_common.resolve_identity(BANK_DIR, kc, act) == act)
+            else:
+                _heal_mark_failure()
 
         # assemble claude accounts via the VALIDATED loader (finding #35): a
         # malformed bank record becomes an explicit, visible error entry — never a

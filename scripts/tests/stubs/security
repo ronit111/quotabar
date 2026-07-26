@@ -14,6 +14,10 @@ cmd="$1"; shift
 case "$cmd" in
   find-generic-password)
     [ "$mode" = "readfail" ] && exit 44
+    # (r15 #3) a TRANSIENT read failure: the item's presence is UNKNOWN. Distinct from
+    # readfail's 44 (errSecItemNotFound = confirmed absent) precisely because callers that
+    # delete things must not treat "could not look" as "nothing is there".
+    [ "$mode" = "readerror" ] && exit 1
     if [ "$mode" = "empty_recheck" ]; then
       # (r5 #1) first read returns the store; the SECOND+ read returns EMPTY/absent,
       # simulating a keychain that becomes unreadable between kc_write's snapshot and

@@ -13,9 +13,10 @@ SDK := $(shell /usr/bin/xcrun --sdk macosx --show-sdk-path)
 TARGET := arm64-apple-macosx14.0
 SOURCES := App.swift Models.swift Services.swift Views.swift
 SCRIPTS_SRC := ../scripts
+SCRIPTS_MANIFEST := $(BUILD_DIR)/bundle-scripts.list
 SWIFT_FLAGS := -swift-version 6 -target $(TARGET) -sdk $(SDK) -framework SwiftUI -framework AppKit -framework ServiceManagement
 
-.PHONY: all typecheck test audit bundle verify install launch clean
+.PHONY: all typecheck test audit bundle bundle-scripts verify verify-bundle check-scripts-dir install launch clean
 
 all: bundle
 
@@ -59,22 +60,77 @@ audit:
 	@/usr/bin/grep -F 'last_ping' Services.swift >/dev/null
 	@/usr/bin/grep -F 'auto_ping' Services.swift >/dev/null
 
-bundle: typecheck
-	/bin/rm -rf "$(APP_BUNDLE)"
-	/bin/mkdir -p "$(CONTENTS)/MacOS" "$(CONTENTS)/Resources"
-	/bin/cp AppIcon.icns "$(CONTENTS)/Resources/AppIcon.icns"
-	@# Bundle the account-bank scripts so the app has a self-contained fallback when
-	@# nothing is installed at ~/.local/share/quotabar/account-bank (see Services.swift).
-	@if [ -d "$(SCRIPTS_SRC)" ]; then \
-	  /bin/rm -rf "$(CONTENTS)/Resources/account-bank"; \
-	  /usr/bin/ditto "$(SCRIPTS_SRC)" "$(CONTENTS)/Resources/account-bank"; \
-	  /bin/rm -rf "$(CONTENTS)/Resources/account-bank/__pycache__"; \
-	fi
+bundle: typecheck bundle-scripts
 	$(SWIFTC) -parse-as-library -O $(SWIFT_FLAGS) $(SOURCES) -o "$(EXECUTABLE)"
 	/bin/cp Info.plist "$(CONTENTS)/Info.plist"
 	/usr/bin/codesign --force --sign - --timestamp=none "$(APP_BUNDLE)"
 
-verify: bundle
+# (r15 #5) Bundle the account-bank scripts so the app has a self-contained fallback when
+# nothing is installed (see Services.swift) — but ship ONLY the runtime, from an EXPLICIT
+# file list. The old `ditto ../scripts` copied the live working tree wholesale: the shipped
+# v1.0.0 zip contained tests/__pycache__/test_g10.cpython-314.pyc, whose embedded absolute
+# source path leaked the maintainer's home directory to every user who downloaded it, and any
+# untracked scratch file, credential dump or editor backup under scripts/ would have shipped
+# the same way. The manifest is the repo's TRACKED files when we are in a git checkout (so
+# untracked files cannot ship by construction), with a find-based equivalent for builds from
+# an exported tarball. COPYFILE_DISABLE=1 keeps bsdtar from writing AppleDouble ._ sidecars,
+# so no resource forks or extended attributes ride along either.
+bundle-scripts:
+	/bin/rm -rf "$(APP_BUNDLE)"
+	/bin/mkdir -p "$(CONTENTS)/MacOS" "$(CONTENTS)/Resources"
+	/bin/cp AppIcon.icns "$(CONTENTS)/Resources/AppIcon.icns"
+	@set -eu; \
+	dest="$(CONTENTS)/Resources/account-bank"; \
+	/bin/rm -rf "$$dest"; \
+	if [ ! -d "$(SCRIPTS_SRC)" ]; then \
+	  echo "bundle: $(SCRIPTS_SRC) absent — no scripts bundled" >&2; exit 0; \
+	fi; \
+	/bin/mkdir -p "$(BUILD_DIR)" "$$dest"; \
+	if /usr/bin/git -C "$(SCRIPTS_SRC)" rev-parse --show-toplevel >/dev/null 2>&1; then \
+	  /usr/bin/git -C "$(SCRIPTS_SRC)" ls-files --cached -- .; \
+	else \
+	  ( cd "$(SCRIPTS_SRC)" && /usr/bin/find . -type d \( -name tests -o -name __pycache__ \) -prune \
+	      -o -type f -print | /usr/bin/sed 's|^\./||' ); \
+	fi \
+	  | /usr/bin/grep -vE '(^|/)(tests|__pycache__)/' \
+	  | /usr/bin/grep -vE '\.py[co]$$' \
+	  | /usr/bin/grep -vE '(^|/)\.' \
+	  > "$(SCRIPTS_MANIFEST)"; \
+	for required in usage.py lib.sh swap-account.sh bank_common.py; do \
+	  /usr/bin/grep -qxF "$$required" "$(SCRIPTS_MANIFEST)" || \
+	    { echo "bundle: manifest is missing $$required — the filter is wrong, refusing to ship" >&2; exit 1; }; \
+	done; \
+	COPYFILE_DISABLE=1 /usr/bin/tar -c -f - -C "$(SCRIPTS_SRC)" -T "$(SCRIPTS_MANIFEST)" \
+	  | ( cd "$$dest" && COPYFILE_DISABLE=1 /usr/bin/tar -x -f - ); \
+	echo "bundle: $$(/usr/bin/wc -l < "$(SCRIPTS_MANIFEST)" | /usr/bin/tr -d ' ') runtime script files bundled"
+
+# (r15 #5) Inspect the FINISHED artifact, not the recipe that built it — this is the gate
+# release.sh runs before packaging, and it is what would have caught the leaked absolute
+# path inside the shipped v1.0.0 zip. Checks what must not be there (test trees, bytecode,
+# AppleDouble sidecars, dotfiles) and what must not be IN it (absolute /Users paths, which
+# no tracked script contains: they only ever arrive via compiled or generated files).
+verify-bundle: bundle
+	@$(MAKE) --no-print-directory check-scripts-dir DIR="$(CONTENTS)/Resources/account-bank"
+
+# The check itself, over any directory, so the gate is testable against a planted fixture
+# instead of only ever seeing a bundle we just built (scripts/tests/test_r15.sh drives it).
+check-scripts-dir:
+	@set -eu; \
+	dest="$(DIR)"; \
+	[ -d "$$dest" ] || { echo "verify-bundle: $$dest missing" >&2; exit 1; }; \
+	found="$$(/usr/bin/find "$$dest" \( -name '__pycache__' -o -name 'tests' -o -name '*.pyc' \
+	   -o -name '*.pyo' -o -name '._*' -o -name '.*' \) -print)"; \
+	if [ -n "$$found" ]; then \
+	  echo "verify-bundle: excluded artifacts made it into the bundle:" >&2; \
+	  echo "$$found" >&2; exit 1; \
+	fi; \
+	if /usr/bin/grep -rlI '/Users/' "$$dest" >/dev/null 2>&1; then \
+	  echo "verify-bundle: an absolute /Users path is embedded in the bundled scripts:" >&2; \
+	  /usr/bin/grep -rlI '/Users/' "$$dest" >&2; exit 1; \
+	fi; \
+	echo "verify-bundle: no tests, bytecode, dotfiles, sidecars or absolute home paths"
+
+verify: bundle verify-bundle
 	/usr/bin/codesign --verify --deep --strict --verbose=2 "$(APP_BUNDLE)"
 	/usr/bin/plutil -lint "$(CONTENTS)/Info.plist"
 	@test "$$('/usr/libexec/PlistBuddy' -c 'Print :CFBundleIdentifier' "$(CONTENTS)/Info.plist")" = "$(BUNDLE_ID)"

@@ -35,7 +35,13 @@ except Exception:
     sys.exit(0)
 
 HOME = os.path.expanduser("~")
-BANK = os.environ.get("BANK_DIR", os.path.join(HOME, ".claude", "accounts"))
+# (v101-confirm) THE bank-directory rule, shared with lib.sh:22 and every other entry point:
+# BANK_DIR -> ACCOUNT_BANK_DIR -> default. This hook used to stop at BANK_DIR, so an
+# ACCOUNT_BANK_DIR-only setup had it READ the default bank's cache/config while the children it
+# spawns (bank-account.sh, usage.py, swap-account.sh) all resolved to the custom one — it could
+# decide an auto-swap from one bank and execute it against another. The resolved value is
+# exported to every child below so none of them can re-resolve differently.
+BANK = bank_common.resolve_bank_dir()
 CACHE = os.path.join(BANK, ".usage-cache.json")
 CONFIG = os.path.join(BANK, ".config.json")
 CLAUDE_JSON = os.environ.get("CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
@@ -81,6 +87,10 @@ def _security_bin():
 BASH = "/bin/bash" if os.path.exists("/bin/bash") else "bash"
 def _san_env(extra=None):
     env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV", "CDPATH")}
+    # (v101-confirm) pin BOTH rungs of the bank-directory rule to the value WE resolved, so a
+    # child can never resolve to a different bank than the one this hook read its decision from.
+    env["BANK_DIR"] = BANK
+    env["ACCOUNT_BANK_DIR"] = BANK
     if extra:
         env.update(extra)
     return env
@@ -160,6 +170,18 @@ if not os.path.exists(bank_file):
 # Compare the FULL canonical OAuth object (finding #45): a refresh-token/expiry
 # rotation with an unchanged accessToken is still drift. Require the re-bank child
 # to SUCCEED before announcing a re-sync (never announce on an ignored failure).
+#
+# (v101-confirm) This hook NO LONGER re-banks ambiguous drift. It re-banks only the one case
+# it can PROVE offline — the banked account's own access token, unchanged, with rotated
+# refresh/expiry fields — and DEFERS everything else to usage.py's oracle-gated poll heal,
+# which asks the live G9 identity endpoint who the credential belongs to before writing.
+# bank_common.hook_rebank_refusal is that rule and carries the reasoning.
+#
+# The gate is deliberately offline. This hook runs against a 5s cooperative deadline, and a
+# blocking identity lookup here is the historical hook-timeout/false-death hazard — so the
+# hook's job is to be RIGHT or SILENT, and the poll's job is to resolve what silence left
+# behind. A deferral is always announced: the user learns their credentials changed, that the
+# bank record is deliberately untouched, and that nothing is lost.
 else:
     try:
         raw = subprocess.run([_security_bin(), "find-generic-password", "-s", KEYCHAIN_SERVICE,
@@ -172,15 +194,30 @@ else:
         drift = bool(kc.get("accessToken")) and not bank_common.same_credentials(kc, rec)
         drift = drift or (kc.get("subscriptionType") != rec.get("subscriptionType") and bool(kc.get("accessToken")))
         if drift:
-            old_plan = rec.get("subscriptionType")
-            rc, out, err, st = run_child([BASH, os.path.join(self_dir, "bank-account.sh")],
-                                         {"ACCOUNT_BANK_LOCK_WAIT": "2"}, budget=min(remaining(), 4))
-            new_plan = kc.get("subscriptionType")
-            if rc == 0 and new_plan and old_plan and new_plan != old_plan:
-                note(f"{act}: plan change detected ({old_plan} -> {new_plan}) — bank re-synced.")
-            elif rc != 0 and st != "timeout-detached":
-                diag(f"login-sync re-bank did not succeed (status={st}, rc={rc})")
-            # token-only drift or detached: silent (routine rotation / will retry)
+            refusal = bank_common.hook_rebank_refusal(kc, rec)
+            if not refusal:
+                # PROVABLY this account's own credential: a rotation of the refresh token or
+                # expiry behind an unchanged access token. Re-bank silently, as before —
+                # routine rotation is not news.
+                rc, out, err, st = run_child([BASH, os.path.join(self_dir, "bank-account.sh")],
+                                             {"ACCOUNT_BANK_LOCK_WAIT": "2"},
+                                             budget=min(remaining(), 4))
+                if rc != 0 and st != "timeout-detached":
+                    diag(f"login-sync re-bank did not succeed (status={st}, rc={rc})")
+            else:
+                old_plan, new_plan = rec.get("subscriptionType"), kc.get("subscriptionType")
+                if old_plan and new_plan and old_plan != new_plan:
+                    note(f"{act}: plan change detected ({old_plan} -> {new_plan}). The bank "
+                         f"record is UNCHANGED for now — re-banking is deferred to the "
+                         f"identity-verified poll, which confirms the credential's owner "
+                         f"before writing. Run bank-account.sh to link it immediately.")
+                else:
+                    note(f"{act}: the active credential no longer matches its bank record "
+                         f"({refusal}). Not re-banked from this hook — deferred to the "
+                         f"identity-verified poll. The bank record is untouched; if the "
+                         f"account shows as unlinked, /swap still works and bank-account.sh "
+                         f"re-links it.")
+                diag(f"login-sync DEFERRED to the poll heal: {refusal}")
     except Exception as e:
         diag(f"login-sync error: {type(e).__name__}")
 
@@ -302,6 +339,14 @@ if action == "swap":
         # detached, spawn-failure, or a genuine failure — not a blanket "lock busy".
         if st == "timeout-detached":
             why = "swap still running (did not confirm within the hook budget)"
+        elif rc == 6:
+            # (v101-confirm) rc 6 is "commit landed, cleanup failed" — the switch DID happen
+            # and reporting it as a failed swap would be a lie in the other direction.
+            note(f"Auto-pick: swapped active account to {target} ({tpct}%) — but its recovery "
+                 f"journal could not be cleared. The switch is in effect; run reconcile.py "
+                 f"(or bank-account.sh) before the next swap.")
+            diag(f"auto-swap committed but journal clear failed err={(err or '')[:180]}")
+            done(0)
         elif rc == 3:
             why = "the active account changed under the lock (a newer switch won)"
         elif st in ("spawn-failed", "no-budget"):

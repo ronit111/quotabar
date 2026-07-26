@@ -108,6 +108,42 @@ atomic_write() {
   fi
 }
 
+# _fsync_dir <dir> — fsync a DIRECTORY so a rename/unlink that happened inside it is
+# durable (r15 #2). On macOS a file's own fsync does not make its DIRECTORY ENTRY
+# durable: after a power loss the rename or unlink can be lost while later steps of the
+# same transaction survive, which is exactly how a swap can end up with the target's
+# keychain credential paired with the outgoing account's metadata and no journal left to
+# recover from. Any multi-step transaction whose ORDER matters syncs the parent after each
+# step — the discipline repoint.py applies to the pointer transaction (its _fsync_dir) and
+# write_swap_journal already applies when creating the journal.
+# Best-effort by design: a directory we cannot even open is not grounds to fail a mutation
+# that already completed. Callers that need the ordering enforced check the step itself.
+_fsync_dir() {
+  python3 -c 'import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY)
+except OSError:
+    sys.exit(0)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)' "$1" 2>/dev/null || true
+}
+
+# _fsync_dir_checked <dir> — the same directory sync, but REPORTED (v101-confirm). Nonzero
+# when the directory could not be opened or the fsync failed. Use this wherever the sync is
+# part of the transaction's correctness (the swap journal's removal) rather than a best-effort
+# tightening; silently succeeding there is what let "the journal is durably gone" be claimed
+# on evidence nobody ever checked.
+_fsync_dir_checked() {
+  python3 -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)' "$1" 2>/dev/null
+}
+
 # run_with_timeout <secs> <cmd...> — portable timeout (macOS lacks `timeout`).
 #
 # PROCESS-GROUP kill (findings #2/#22): we enable monitor mode (`set -m`) just
@@ -210,18 +246,47 @@ _owner_provably_dead() {
   return 0                                       # ESRCH -> provably gone -> dead
 }
 
-# (r5 item 6) _reclaim_dir_if_dead <dir> <start_field> — reclaim a stale lock/mutex dir
-# SAFELY via RENAME-FIRST-VERIFY-INSIDE: rename it away atomically (exactly one contender
-# wins the mv), verify the owner is provably dead INSIDE the renamed copy no one else can
-# touch, then delete (dead) or restore (unexpectedly alive). Binds deletion to the exact
-# inspected instance — a successor created at the original path can never be destroyed.
-# Positive-death-only. Returns 0 iff the dir was removed.
+# (v101-confirm) _ownerless_past_grace <dir> — 0 iff <dir> exists, carries NO owner record at
+# all, and is older than OWNERLESS_GRACE_SECS. Acquisition is mkdir-then-publish-owner and the
+# gap between them is milliseconds, so an ownerless directory that survived a whole grace
+# window is an acquisition killed inside that gap — not one in progress. Without this a
+# SIGKILL/power loss there left a lock nobody could ever prove dead: every later acquirer
+# (including every launchd restart of the archiver) blocked forever on it. An owner record
+# that EXISTS but is unreadable or unparseable is NOT this state — that stays UNKNOWN and is
+# never reclaimed. Mirrors banklock.ownerless_past_grace exactly; the two implementations
+# contend for the same directories and must agree on what is reclaimable.
+OWNERLESS_GRACE_SECS=60
+_ownerless_past_grace() {
+  local d="$1" age
+  [ -d "$d" ] || return 1
+  [ -e "$d/owner" ] && return 1
+  age=$(( $(now_epoch) - $(_mtime "$d") ))
+  [ "$age" -gt "$OWNERLESS_GRACE_SECS" ]
+}
+
+# _reclaimable_dir <dir> <start_field> [allow_ownerless] — 0 iff <dir> may be reclaimed:
+# POSITIVE owner death, or (when allow_ownerless=1) ownerless past the bounded grace.
+_reclaimable_dir() {
+  local d="$1" sf="$2" ow="${3:-0}"
+  if _owner_provably_dead "$d/owner" "$sf"; then return 0; fi
+  if [ "$ow" = "1" ] && _ownerless_past_grace "$d"; then return 0; fi
+  return 1
+}
+
+# (r5 item 6) _reclaim_dir_if_dead <dir> <start_field> [allow_ownerless] — reclaim a stale
+# lock/mutex dir SAFELY via RENAME-FIRST-VERIFY-INSIDE: rename it away atomically (exactly one
+# contender wins the mv), verify INSIDE the renamed copy no one else can touch, then delete or
+# restore (unexpectedly alive). Binds deletion to the exact inspected instance — a successor
+# created at the original path can never be destroyed. The re-check on the frozen copy is what
+# makes the ownerless case safe too: an acquirer that published its owner between our
+# pre-check and the mv makes the frozen copy non-ownerless, and it is restored untouched.
+# Returns 0 iff the dir was removed.
 _reclaim_dir_if_dead() {
-  local d="$1" sf="$2" stolen
-  _owner_provably_dead "$d/owner" "$sf" || return 1        # pre-check at the original path
+  local d="$1" sf="$2" ow="${3:-0}" stolen
+  _reclaimable_dir "$d" "$sf" "$ow" || return 1            # pre-check at the original path
   stolen="$d.stealing.$$.$RANDOM$RANDOM"
   mv "$d" "$stolen" 2>/dev/null || return 1                # atomic; exactly one winner
-  if _owner_provably_dead "$stolen/owner" "$sf"; then
+  if _reclaimable_dir "$stolen" "$sf" "$ow"; then
     rm -rf "$stolen" 2>/dev/null
     return 0
   fi
@@ -249,13 +314,14 @@ _release_reclaim_mutex() {
 }
 
 # _lock_stale_and_dead — 0 iff LOCK_DIR is older than the 5-min stale window AND its
-# holder is PROVABLY dead. Main-lock owner is "pid token start" -> start at cut field 3.
+# holder is PROVABLY dead — or (v101-confirm) it is OWNERLESS past the bounded startup grace.
+# Main-lock owner is "pid token start" -> start at cut field 3.
 _lock_stale_and_dead() {
   [ -d "$LOCK_DIR" ] || return 1
   local age
   age=$(( $(now_epoch) - $(_mtime "$LOCK_DIR") ))
   [ "$age" -gt "$LOCK_STALE_SECS" ] || return 1
-  _owner_provably_dead "$LOCK_DIR/owner" 3
+  _reclaimable_dir "$LOCK_DIR" 3 1
 }
 
 acquire_lock() {
@@ -324,7 +390,18 @@ acquire_lock() {
         # and ownerless reclaim now (correctly) fails closed, wedging every future
         # reclaimer forever. We exclusively own it (just mkdir'd, no owner yet), so
         # remove OUR OWN dir rather than strand it; the outer wait loop retries.
-        if ! printf '%s %s %s\n' "$$" "$mtok" "$(_proc_starttime "$$")" | atomic_write "$RECLAIM_DIR/owner"; then
+        # (r15 #8) An EMPTY start-time is the same wedge by a different route: reclaim is
+        # positive-death-only, so an owner whose death can never be proven is permanent.
+        # Same retry-then-tear-down discipline the main lock applies above.
+        local _mstart="" _mi=0
+        while [ "$_mi" -lt 4 ]; do
+          _mstart="$(_proc_starttime "$$")"
+          [ -n "$_mstart" ] && break
+          _mi=$((_mi + 1)); sleep 0.05 2>/dev/null || sleep 1
+        done
+        if [ -z "$_mstart" ]; then
+          rm -rf "$RECLAIM_DIR" 2>/dev/null
+        elif ! printf '%s %s %s\n' "$$" "$mtok" "$_mstart" | atomic_write "$RECLAIM_DIR/owner"; then
           rm -rf "$RECLAIM_DIR" 2>/dev/null
         elif [ ! -d "$LOCK_DIR" ]; then
           _release_reclaim_mutex "$RECLAIM_DIR" "$mtok"
@@ -334,7 +411,7 @@ acquire_lock() {
             # FINAL own-token verification immediately before the main-lock rename.
             curtok="$(cut -d' ' -f2 "$RECLAIM_DIR/owner" 2>/dev/null)"
             if [ "$curtok" = "$mtok" ]; then
-              if _reclaim_dir_if_dead "$LOCK_DIR" 3; then
+              if _reclaim_dir_if_dead "$LOCK_DIR" 3 1; then
                 _release_reclaim_mutex "$RECLAIM_DIR" "$mtok"
                 continue                 # retry mkdir
               fi
@@ -343,9 +420,11 @@ acquire_lock() {
           _release_reclaim_mutex "$RECLAIM_DIR" "$mtok"
         fi
       else
-        # mutex contended: reclaim it ONLY if its holder is provably dead, via the safe
-        # rename-first primitive. An ownerless/unreadable/live mutex is left alone.
-        _reclaim_dir_if_dead "$RECLAIM_DIR" 3 || true
+        # mutex contended: reclaim it ONLY if its holder is provably dead — or (v101-confirm)
+        # it is ownerless past the bounded grace, the same interrupted-acquisition state the
+        # main lock can land in. Via the safe rename-first primitive; an unreadable-owner or
+        # live mutex is left alone.
+        _reclaim_dir_if_dead "$RECLAIM_DIR" 3 1 || true
       fi
     fi
     waited=$((waited + 1))
@@ -418,6 +497,26 @@ kc_read() {
 }
 # back-compat alias used by older call sites
 read_keychain_raw() { kc_read; }
+
+# kc_absent — return 0 ONLY when the credential slot is CONFIRMED EMPTY; nonzero for
+# "occupied" AND for "we could not look". (r15 #3) `security find-generic-password` answers
+# 44 (errSecItemNotFound) for a genuinely absent item and some other nonzero for a failure to
+# see (locked keychain, timeout, denied, missing binary). kc_read collapses both into empty
+# output, so a caller that must not confuse "nothing is there" with "we are blind" asks HERE
+# — the same rc-44 discipline add-account.sh uses before restoring an empty slot ("absence is
+# CONFIRMED via `security find` rc 44; a failed re-read is never 'empty'"). Two consecutive
+# 44s are required so a slot being written underneath us cannot read as stably empty.
+kc_absent() {
+  local sec i rc
+  sec="$(security_bin)" || return 1
+  for i in 1 2; do
+    run_with_timeout "$KC_TIMEOUT" \
+      "$sec" find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w </dev/null >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 44 ] || return 1
+  done
+  return 0
+}
 
 # snapshot_keychain -> atomically write the current keychain blob to
 # $SNAP_DIR/<epoch>-<pid>.json (0600). Prints the path. Fails if item absent.
@@ -655,7 +754,34 @@ finally: os.close(d)
 ' "$_LIB_HERE" "$SWAP_JOURNAL" "$1" "$2" "${3:-}"
 }
 
-clear_swap_journal() { rm -f "$SWAP_JOURNAL" 2>/dev/null; }
+# clear_swap_journal — the COMMIT POINT of the swap transaction: once the journal is
+# gone, nothing can reconstruct a torn keychain/metadata pairing. (r15 #2) The unlink is
+# therefore CHECKED (an unchecked `rm -f` reports success for a journal still on disk,
+# which would strand a real recovery record while the caller prints "swapped") and made
+# DURABLE by syncing the bank directory afterwards. Without that sync a power loss can
+# preserve the keychain write and this deletion while losing the metadata rename that
+# happened between them — the precise ordering inversion the journal exists to survive.
+# Returns nonzero if the journal is still present; callers run without errexit and treat
+# that as "keep the journal, let reconcile resolve it".
+# (v101-confirm) Two DISTINCT failures, neither of which may read as success:
+#   rc 1 — the journal is still on disk (the recovery record survives; reconcile will act).
+#   rc 2 — the unlink landed but its DIRECTORY ENTRY could not be synced, so a power loss can
+#          resurrect the journal on top of a committed swap. The old code ended on the
+#          best-effort _fsync_dir, whose `|| true` turned exactly that into rc 0.
+clear_swap_journal() {
+  [ -e "$SWAP_JOURNAL" ] || return 0
+  rm -f "$SWAP_JOURNAL" 2>/dev/null
+  if [ -e "$SWAP_JOURNAL" ]; then
+    err "account-bank: FAILED to clear the swap journal ($SWAP_JOURNAL); leaving it for reconcile."
+    return 1
+  fi
+  if ! _fsync_dir_checked "$(dirname "$SWAP_JOURNAL")"; then
+    err "account-bank: the swap journal was removed but $(dirname "$SWAP_JOURNAL") could not be"
+    err "synced; the removal is NOT proven durable. Treat the swap's cleanup as incomplete."
+    return 2
+  fi
+  return 0
+}
 
 # --- config (.config.json) ---------------------------------------------------
 # drop_from_autoping <email> — remove <email> from the auto_ping list in

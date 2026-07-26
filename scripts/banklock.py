@@ -32,6 +32,17 @@ LOCK_STALE_SECS = 300
 # instance older than this is definitively abandoned by a dead reclaimer. Kept far
 # above any legitimate hold, well below the main-lock stale window.
 RECLAIM_STALE_SECS = 30
+# (v101-confirm) Bounded grace for an OWNERLESS lock directory. Acquisition is mkdir-then-
+# publish-owner, and the gap between those two steps is milliseconds — but a SIGKILL, a
+# shutdown or a power loss inside it leaves a directory with no `owner` file, which
+# owner_provably_dead can never call dead (correctly: an unreadable owner is UNKNOWN). The
+# result was a permanently unreclaimable lock: every later acquirer, including every launchd
+# restart of the archiver daemon, exited as though a live holder existed, and only a manual
+# `rm -rf` fixed it. A directory that is BOTH ownerless AND older than this window cannot be
+# an acquisition in flight, so it is reclaimed — through the same rename-first-verify-inside
+# primitive, which re-checks ownerlessness on the frozen copy and restores it if an owner
+# appeared in between. Generous relative to the microseconds the real gap takes.
+OWNERLESS_GRACE_SECS = 60
 
 
 def _proc_starttime(pid):
@@ -141,26 +152,57 @@ def owner_provably_dead(owner_path, start_from):
     return live != ostart                  # start-time mismatch -> pid reused -> dead
 
 
-def reclaim_dir_if_dead(dirpath, start_from):
+def ownerless_past_grace(dirpath, owner_name="owner", grace=OWNERLESS_GRACE_SECS):
+    """(v101-confirm) True iff `dirpath` exists, carries NO owner record at all, and is older
+    than `grace` seconds. This is the ONE state where a lock with no provable owner may be
+    reclaimed: acquisition publishes the owner within milliseconds of the mkdir, so an
+    ownerless directory that has survived a full grace window is an interrupted acquisition,
+    never one in progress. An owner record that exists but is unreadable or unparseable is NOT
+    this state — that stays UNKNOWN and is never reclaimed. Never raises."""
+    if grace <= 0:
+        return False
+    try:
+        if os.path.exists(os.path.join(dirpath, owner_name)):
+            return False
+        age = time.time() - os.path.getmtime(dirpath)
+    except OSError:
+        return False
+    return age > grace
+
+
+def reclaim_dir_if_dead(dirpath, start_from, ownerless_grace=0):
     """(r5 items 1/6) Reclaim a stale lock/mutex directory SAFELY via
     RENAME-FIRST-VERIFY-INSIDE: rename the dir away atomically (exactly ONE contender
     wins the rename), then verify the owner is provably dead INSIDE the renamed copy that
     no other process can touch, then delete (dead) or restore (unexpectedly not dead).
     This binds the deletion to the exact inspected instance — a successor created at the
     original path between a separate inspection and a delete can never be destroyed.
-    POSITIVE-death-only: an ownerless/unreadable/live owner is never reclaimed. Returns
-    True iff the dir was removed (the caller may retry its mkdir)."""
+    POSITIVE-death-only: an unreadable or live owner is never reclaimed. Returns
+    True iff the dir was removed (the caller may retry its mkdir).
+
+    (v101-confirm) `ownerless_grace` > 0 adds the ONE additional reclaimable state: a directory
+    with NO owner record at all that is older than that many seconds (see
+    ownerless_past_grace). It runs through this same primitive, so the decisive check still
+    happens on the FROZEN renamed copy — if an acquirer published its owner between our
+    pre-check and the rename, the frozen copy is no longer ownerless, positive-death applies
+    to it instead, and the directory is restored untouched. Default 0 keeps every existing
+    caller byte-identical."""
     import shutil
+
+    def _reclaimable(path):
+        return (owner_provably_dead(os.path.join(path, "owner"), start_from)
+                or ownerless_past_grace(path, grace=ownerless_grace))
+
     # cheap pre-check at the original path so we never rename a live/unknown dir away.
-    if not owner_provably_dead(os.path.join(dirpath, "owner"), start_from):
+    if not _reclaimable(dirpath):
         return False
     stolen = f"{dirpath}.stealing.{os.getpid()}.{os.urandom(6).hex()}"
     try:
         os.rename(dirpath, stolen)
     except OSError:
         return False                       # lost the atomic race (gone/renamed) -> retry
-    # we now EXCLUSIVELY own `stolen`; re-verify death on the renamed copy before destroying.
-    if owner_provably_dead(os.path.join(stolen, "owner"), start_from):
+    # we now EXCLUSIVELY own `stolen`; re-verify on the renamed copy before destroying.
+    if _reclaimable(stolen):
         shutil.rmtree(stolen, ignore_errors=True)
         return True
     # (r6 b1) NOT provably dead on the frozen copy (a transient UNKNOWN probe, or — via a
@@ -181,17 +223,21 @@ def reclaim_dir_if_dead(dirpath, start_from):
 
 
 class BankLock(object):
-    __slots__ = ("bank_dir", "lock_dir", "owner", "reclaim_dir", "token")
+    __slots__ = ("bank_dir", "lock_dir", "owner", "reclaim_dir", "token", "stale_secs")
 
-    def __init__(self, bank_dir):
+    # (v101) `lock_name` / `stale_secs` are parameterized so DaemonLock below can reuse this
+    # protocol verbatim at a different path and with a different staleness rule. Defaults are
+    # the historical bank-lock values — every existing caller is byte-for-byte unchanged.
+    def __init__(self, bank_dir, lock_name=".lock", stale_secs=LOCK_STALE_SECS):
         self.bank_dir = bank_dir
-        self.lock_dir = os.path.join(bank_dir, ".lock")
+        self.lock_dir = os.path.join(bank_dir, lock_name)
         self.owner = os.path.join(self.lock_dir, "owner")
         # reclaim MUTEX (re-review issue 1): stale reclamation runs under this so
         # two contenders can never both rename the lock away — the ABA race where
         # one contender deletes a lock a second contender just freshly acquired.
-        self.reclaim_dir = os.path.join(bank_dir, ".lock.reclaim")
+        self.reclaim_dir = os.path.join(bank_dir, lock_name + ".reclaim")
         self.token = None
+        self.stale_secs = stale_secs
 
     def acquire(self, timeout=10):
         os.makedirs(self.bank_dir, exist_ok=True)
@@ -243,21 +289,33 @@ class BankLock(object):
     def _stale_and_dead(self):
         """The main lock is reclaimable only when it is older than the 5-min stale
         window AND its holder is PROVABLY dead (positive-death via owner_provably_dead;
-        the owner record is 'pid token start', so the start-time begins at field 2)."""
-        try:
-            age = time.time() - os.path.getmtime(self.lock_dir)
-        except OSError:
-            return False
-        if age <= LOCK_STALE_SECS:
-            return False
-        return owner_provably_dead(self.owner, start_from=2)
+        the owner record is 'pid token start', so the start-time begins at field 2).
+
+        (v101-confirm) ...or when it is OWNERLESS and past the bounded startup grace — an
+        acquisition that died between its mkdir and its owner publication. Without this the
+        directory has no owner to prove dead and wedges every future acquirer forever."""
+        if self.stale_secs > 0:
+            try:
+                age = time.time() - os.path.getmtime(self.lock_dir)
+            except OSError:
+                return False
+            if age <= self.stale_secs:
+                return False
+        if owner_provably_dead(self.owner, start_from=2):
+            return True
+        return ownerless_past_grace(self.lock_dir, grace=OWNERLESS_GRACE_SECS)
 
     def _reclaim_mutex(self):
         """(r5 item 6) Reclaim an ABANDONED reclaim mutex ONLY via the safe
         rename-first-verify-inside primitive with POSITIVE-death-only owner inspection —
-        NO age fallback, NO ownerless/unreadable reclaim. The mutex owner record is
-        'pid token start' (start at field 2), matching the main lock's format."""
-        return reclaim_dir_if_dead(self.reclaim_dir, start_from=2)
+        NO age fallback, NO unreadable-owner reclaim. The mutex owner record is
+        'pid token start' (start at field 2), matching the main lock's format.
+
+        (v101-confirm) The mutex is acquired by the identical mkdir-then-publish-owner
+        sequence, so it carries the identical ownerless-wedge hole — and wedging it wedges
+        every stale-lock reclaim behind it. Same bounded grace, same rename-first primitive."""
+        return reclaim_dir_if_dead(self.reclaim_dir, start_from=2,
+                                   ownerless_grace=OWNERLESS_GRACE_SECS)
 
     def _try_reclaim_stale(self):
         """Reclaim a stale main lock SAFELY. Serialized under a reclaim mutex whose own
@@ -277,10 +335,28 @@ class BankLock(object):
         except OSError:
             return False
         mutex_owner = os.path.join(self.reclaim_dir, "owner")
+        # (r15 #8) The MUTEX owner needs the same provable start-time as the main lock above.
+        # A transient `ps` failure here published "pid token " with an empty third field; if
+        # this process then died before the finally-block released the mutex, every later
+        # contender would read an owner it can never prove dead (_reclaim_mutex is
+        # positive-death-only, by design, with no age fallback) — so .lock.reclaim would be
+        # unreclaimable forever and every bank mutation would wedge behind it until someone
+        # deleted the directory by hand. Retry, and on failure tear down the directory we
+        # exclusively own rather than publish an owner nobody can ever disprove.
+        _pstart = ""
+        for _ in range(4):
+            _pstart = _proc_starttime(os.getpid())
+            if _pstart:
+                break
+            time.sleep(0.05)
+        if not _pstart:
+            import shutil
+            shutil.rmtree(self.reclaim_dir, ignore_errors=True)
+            return False
         try:
             fd, tmp = tempfile.mkstemp(dir=self.reclaim_dir, prefix=".own.")
             with os.fdopen(fd, "w") as f:
-                f.write(f"{os.getpid()} {mutex_tok} {_proc_starttime(os.getpid())}")
+                f.write(f"{os.getpid()} {mutex_tok} {_pstart}")
             os.replace(tmp, mutex_owner)
         except Exception:
             import shutil
@@ -299,7 +375,8 @@ class BankLock(object):
                 cur = []
             if len(cur) < 2 or cur[1] != mutex_tok:
                 return False
-            return reclaim_dir_if_dead(self.lock_dir, start_from=2)
+            return reclaim_dir_if_dead(self.lock_dir, start_from=2,
+                                       ownerless_grace=OWNERLESS_GRACE_SECS)
         finally:
             # tear down OUR mutex only (own-token bound), via the safe rename-away.
             try:
@@ -332,3 +409,42 @@ class BankLock(object):
             import shutil
             shutil.rmtree(self.lock_dir, ignore_errors=True)
             self.token = None
+
+
+class DaemonLock(BankLock):
+    """(v101) Single-instance lock for a LONG-LIVED daemon (archiverd), held for the whole
+    process lifetime instead of for a short critical section.
+
+    Same protocol as BankLock — mkdir acquisition, a 'pid token start' owner record, and the
+    rename-first-verify-inside positive-death reclaim. Two things differ, both forced by the
+    daemon's lifetime:
+
+      * NO AGE WINDOW (stale_secs=0). BankLock refuses to reclaim a lock younger than
+        LOCK_STALE_SECS because a fresh holder is the normal case there. A daemon's lock dir
+        is as old as the daemon, so that window would lock a launchd KeepAlive restart out
+        for five minutes after every crash. The owner record's pid + start-time IS the
+        liveness proof here, so positive death alone reclaims.
+      * NO WAIT LOOP. A second instance must EXIT, not queue behind the first — the whole
+        point is that only one daemon runs. acquire() makes a single attempt.
+
+    A daemon killed by a signal never releases; the next start finds a provably-dead owner
+    and reclaims it immediately, which is exactly what dropping the age window buys.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, dir_path, lock_name):
+        BankLock.__init__(self, dir_path, lock_name=lock_name, stale_secs=0)
+
+    def acquire(self, timeout=0):
+        """Default: a SINGLE attempt (one stale-reclaim pass, then give up) — the newcomer
+        stands down instead of queueing. True iff we now hold the lock."""
+        return BankLock.acquire(self, timeout=timeout)
+
+    def owner_pid(self):
+        """The pid recorded in the CURRENT owner record, or None — for the newcomer's one
+        log line naming who it is standing down for. Never raises."""
+        try:
+            return int(open(self.owner).read().split()[0])
+        except Exception:
+            return None

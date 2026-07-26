@@ -97,7 +97,35 @@ try:
 except Exception:
     o={}
 print(bank_common.cred_fingerprint(o))' "$HERE" "$tf" 2>/dev/null)"
-if [ -n "$live1" ] && [ "$live1" = "$live2" ] && [ -n "$target_cred_fp" ] && [ "$live1" = "$target_cred_fp" ]; then
+
+# (r15 #3) FAIL CLOSED on every identity observation we cannot trust. The old gate aborted
+# only on a positive fingerprint MATCH, so the states in which we CANNOT SEE — an empty read
+# from a transient Keychain failure, or two reads that disagree — sailed straight past it and
+# deleted the record. That is the worst possible direction: those are exactly the conditions
+# of the race this check exists to catch (a /login writes the Keychain BEFORE ~/.claude.json,
+# so during the window the metadata still names the old account while the target's credential
+# is already live), and the deleted record is the ONLY copy of that account's tokens.
+# Deletion now requires POSITIVE, STABLE proof that the live credential is not the target's.
+if [ "$live1" != "$live2" ]; then
+  err "Aborting removal: the live keychain fingerprint is UNSTABLE (two reads disagree) —"
+  err "something is writing it right now. Removal needs proof '$target' is not live. Retry."
+  exit 1
+fi
+if [ -z "$live1" ]; then
+  # An empty read is "occupied but unreadable" until `security find` says rc 44. Only a
+  # CONFIRMED-empty slot proves no account can be becoming active underneath us.
+  if kc_absent; then
+    :   # slot provably empty -> no live credential can be the target's
+  else
+    err "Aborting removal: could not READ the live keychain (empty result, absence NOT"
+    err "confirmed). A failed read is not proof that '$target' is parked. Retry in a moment."
+    exit 1
+  fi
+elif [ -z "$target_cred_fp" ]; then
+  err "Aborting removal: could not compute '$target's banked credential fingerprint, so the"
+  err "live keychain cannot be compared against it. Refusing to delete unverified."
+  exit 1
+elif [ "$live1" = "$target_cred_fp" ]; then
   err "Aborting removal: the live keychain now holds '$target's credentials (it is"
   err "becoming the active account via a /login). Swap away / let the login settle first."
   exit 1

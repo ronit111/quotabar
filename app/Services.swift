@@ -379,10 +379,12 @@ final class AppModel: ObservableObject {
         static let env = "/usr/bin/env"
 
         // (r10 #1) resolved at launch instead of a hard-coded dev path: $QUOTABAR_SCRIPTS_DIR
-        // -> the owner ~/.claude install -> the XDG data dir -> the copy bundled in Resources.
+        // -> the supported XDG install -> the copy bundled in Resources -> (r15 #7) the legacy
+        // ~/.claude path, last, so an upgrade cannot keep running pre-upgrade scripts.
         static let scripts: String = ScriptsLocation.resolve()
         // The accounts (bank) control-plane dir that claude-acct / sessions.py / restart.py act
-        // on: $BANK_DIR, else the owner install. Mirrors the scripts' own default.
+        // on. (r15 #4) Resolved by the ONE documented rule the scripts use:
+        // BANK_DIR -> ACCOUNT_BANK_DIR -> ~/.claude/accounts.
         static let accountsDir: String = ScriptsLocation.resolveAccountsDir()
 
         static let usage = "\(scripts)/usage.py"
@@ -402,8 +404,13 @@ final class AppModel: ObservableObject {
 
     /// Environment the app hands v2 scripts so claude-acct / sessions.py / restart.py resolve
     /// the SAME accounts + scripts dirs the app resolved (matters on a non-default XDG install).
+    /// (r15 #4) BANK_DIR carries the RESOLVED value, not just ACCOUNT_BANK_DIR: it is the
+    /// highest-precedence key in the shared rule, so pinning it makes every child agree with
+    /// the app by construction instead of re-resolving and possibly landing on another bank.
     private var scriptEnvironment: [String: String] {
-        ["ACCOUNT_BANK_DIR": Paths.accountsDir, "ACCOUNT_BANK_SCRIPTS_DIR": Paths.scripts]
+        ["BANK_DIR": Paths.accountsDir,
+         "ACCOUNT_BANK_DIR": Paths.accountsDir,
+         "ACCOUNT_BANK_SCRIPTS_DIR": Paths.scripts]
     }
 
     static let codexCardKey = "codex"
@@ -1437,27 +1444,61 @@ enum ScriptsLocation {
         return candidates.first(where: exists)
     }
 
+    /// (v101-confirm) Precedence: the explicit `QUOTABAR_SCRIPTS_DIR` override, then the copy
+    /// BUNDLED inside QuotaBar.app, then the XDG install (`$XDG_DATA_HOME/quotabar/account-bank`,
+    /// the only path install.sh writes), and the legacy `~/.claude/scripts/account-bank` LAST.
+    ///
+    /// The bundled copy moved AHEAD of the install because the app and its runtime ship as one
+    /// versioned artifact and nothing else reconciles them. r15 #7 had already demoted the
+    /// legacy path for exactly this reason, but left the XDG install first — so a user who ran
+    /// install.sh under v1.0.0 and then upgraded the Cask kept executing the v1.0.0
+    /// credential-mutating `usage.py`/`swap-account.sh`/`bank-account.sh` forever: the new app
+    /// binary shipped the fixes, resolved to the stale directory, and never ran them. There is
+    /// no version manifest to compare against, so "the runtime that shipped with this binary"
+    /// is the only defensible default. A deliberately-managed install stays reachable through
+    /// the env override, which is why the override still outranks everything.
+    /// The ordering is a pure function so the table is a contract test. `bundled` is nil when
+    /// the app has no bundled copy; the XDG install remains the fallback when nothing exists.
+    static func pickScriptsDir(env: String?, installed: String, bundled: String?,
+                               legacy: String, exists: (String) -> Bool) -> String {
+        if let env, !env.isEmpty, exists(env) { return env }
+        if let bundled, exists(bundled) { return bundled }
+        if exists(installed) { return installed }
+        if exists(legacy) { return legacy }   // last resort only
+        return installed
+    }
+
     static func resolve() -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let fm = FileManager.default
         let hasScripts: (String) -> Bool = { fm.fileExists(atPath: "\($0)/usage.py") }
-        let candidates = [
-            "\(home)/.claude/scripts/account-bank",
-            "\(home)/.local/share/quotabar/account-bank",
-        ]
-        if let chosen = choose(
+        let xdgBase = ProcessInfo.processInfo.environment["XDG_DATA_HOME"].flatMap {
+            $0.isEmpty ? nil : $0
+        } ?? "\(home)/.local/share"
+        return pickScriptsDir(
             env: ProcessInfo.processInfo.environment["QUOTABAR_SCRIPTS_DIR"],
-            candidates: candidates, exists: hasScripts
-        ) { return chosen }
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("account-bank").path,
-           hasScripts(bundled) { return bundled }
-        return candidates[0]   // last resort: the owner install path
+            installed: "\(xdgBase)/quotabar/account-bank",
+            bundled: Bundle.main.resourceURL?.appendingPathComponent("account-bank").path,
+            legacy: "\(home)/.claude/scripts/account-bank",
+            exists: hasScripts
+        )
+    }
+
+    /// (r15 #4) THE bank-directory rule, identical to lib.sh:22 and bank_common.resolve_bank_dir:
+    /// BANK_DIR -> ACCOUNT_BANK_DIR -> ~/.claude/accounts. The app previously stopped after
+    /// BANK_DIR, so a user who set only the DOCUMENTED `ACCOUNT_BANK_DIR` had the shell
+    /// mutators acting on their custom bank while the app, poller and reconciler read the
+    /// default one. `pick` is pure so the precedence is a contract test.
+    static func pickBankDir(bankDir: String?, accountBankDir: String?, home: String) -> String {
+        if let b = bankDir, !b.isEmpty { return b }
+        if let a = accountBankDir, !a.isEmpty { return a }
+        return "\(home)/.claude/accounts"
     }
 
     static func resolveAccountsDir() -> String {
-        if let e = ProcessInfo.processInfo.environment["BANK_DIR"], !e.isEmpty { return e }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return "\(home)/.claude/accounts"
+        let env = ProcessInfo.processInfo.environment
+        return pickBankDir(bankDir: env["BANK_DIR"], accountBankDir: env["ACCOUNT_BANK_DIR"],
+                           home: FileManager.default.homeDirectoryForCurrentUser.path)
     }
 }
 

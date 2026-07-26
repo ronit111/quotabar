@@ -364,6 +364,17 @@ with os.fdopen(fd, "w") as f:
     json.dump(d, f, indent=2)
     f.flush(); os.fsync(f.fileno())
 os.replace(tmp, claude_json)
+# (r15 #2) fsync the PARENT so the rename itself is durable, not just the file's bytes.
+# This rename is step 2 of a 3-step transaction (keychain write -> metadata rename ->
+# journal clear) and it is the only step that was not synced: a power loss could keep
+# steps 1 and 3 while losing this one, leaving the target's credential paired with the
+# outgoing account's metadata and NO journal to recover from. Same discipline as
+# repoint.py's pointer transaction and lib.sh write_swap_journal.
+dfd = os.open(dirn, os.O_RDONLY)
+try:
+    os.fsync(dfd)
+finally:
+    os.close(dfd)
 PY
   err "Metadata update FAILED. Considering keychain rollback to the pre-swap account…"
   if [ -n "$precompact" ]; then
@@ -406,7 +417,13 @@ if [ "$post_fp" != "$target_fp" ] || [ "$post_email" != "$target" ]; then
 fi
 
 # both stores verified at the target: the swap committed cleanly.
-clear_swap_journal
+# (v101-confirm) The journal clear is CHECKED here. Its failure is not a swap failure — the
+# credential commit already landed and is verified — but it is not success either: a
+# secret-bearing recovery journal is still on disk (or its removal is not durable), and the
+# next mutator will refuse to run until reconcile clears it. Report the swap, then exit 6 so
+# no caller can read a clean 0 for a state that still needs attention.
+_journal_clear_rc=0
+clear_swap_journal || _journal_clear_rc=$?
 _restore_trap
 # === END COMMIT SECTION =====================================================
 
@@ -427,4 +444,14 @@ if [ "${n:-0}" -gt 0 ]; then
   echo "NOTE: $n running Claude-related process(es) switch to $target on their next"
   echo "  request (turn-level pickup). No /login needed; UIs may still DISPLAY the old"
   echo "  account (cosmetic). PIDs: $(printf '%s ' $pids)"
+fi
+
+# (v101-confirm) COMMIT LANDED, CLEANUP FAILED — a distinct outcome, never a silent 0.
+if [ "$_journal_clear_rc" -ne 0 ]; then
+  err ""
+  err "WARNING: the swap to $target COMMITTED, but its recovery journal could not be cleared"
+  err "cleanly (clear_swap_journal rc $_journal_clear_rc). The journal is secret-bearing and, while it"
+  err "remains, the next locked operation reconciles (and may block) on it. Run reconcile.py,"
+  err "or inspect $SWAP_JOURNAL. The account switch itself is verified and in effect."
+  exit 6
 fi

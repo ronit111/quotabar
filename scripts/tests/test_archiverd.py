@@ -457,6 +457,54 @@ def main():
     aSeat.scan()
     ok("SEATCRED2" in archived_tags(homeSeat), "a slot rotation IS archived (seat)")
 
+    # (v101) SINGLE INSTANCE. A manually-bootstrapped daemon and the launchd one coexisted
+    # for two days, alternating status writes so the health surface flapped between two views
+    # and each doubled the other's archiving. The daemon loop now takes a pid-lock.
+    import banklock as _bl
+    accL = tempfile.mkdtemp(prefix="archd-lock-")
+    envL = dict(os.environ, ACCOUNT_BANK_DIR=accL, ACCOUNT_BANK_ARCHIVER_RECONCILE="0")
+    held = _bl.DaemonLock(accL, archiverd.DAEMON_LOCK_NAME)
+    ok(held.acquire() is True, "the first archiverd takes the single-instance lock (v101)")
+    try:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "archiverd.py")],
+                           env=envL, capture_output=True, text=True, timeout=30)
+        rc, errtext = r.returncode, r.stderr
+    except subprocess.TimeoutExpired:
+        rc, errtext = None, "(second instance never exited — it ran run_forever)"
+    ok(rc == 0 and "another instance is already running" in errtext,
+       "a SECOND archiverd exits cleanly with one line instead of becoming a second writer (v101)")
+    ok(f"pid {os.getpid()}" in errtext, "the stand-down line names the live holder (v101)")
+    ok(not os.path.exists(os.path.join(accL, archiverd.STATUS_NAME)),
+       "the stood-down instance wrote NO status — the alternating-writes damage is gone (v101)")
+    held.release()
+
+    # A holder killed by a signal never releases. Reclaim is on POSITIVE DEATH of the recorded
+    # owner, with no age window: BankLock's 5-min staleness rule would lock a launchd KeepAlive
+    # restart out for five minutes after every crash, since a daemon's lock dir is as old as
+    # the daemon. (The SIGKILL-then-restart sequence earlier in this file exercises the same
+    # path against the real daemon.)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"]); dead.wait()
+    lockdir = os.path.join(accL, archiverd.DAEMON_LOCK_NAME)
+    os.makedirs(lockdir)
+    with open(os.path.join(lockdir, "owner"), "w") as f:
+        f.write(f"{dead.pid} tok-of-a-dead-daemon Mon Jan  1 00:00:00 2020")
+    ok(_bl.BankLock(accL, archiverd.DAEMON_LOCK_NAME).acquire(timeout=0) is False,
+       "bank-lock age semantics would NOT reclaim a just-crashed daemon's lock (v101)")
+    fresh = _bl.DaemonLock(accL, archiverd.DAEMON_LOCK_NAME)
+    ok(fresh.acquire() is True,
+       "DaemonLock reclaims a provably-dead holder immediately — no age window (v101)")
+    ok(fresh.owner_pid() == os.getpid(), "the reclaimed lock records the new holder (v101)")
+    fresh.release()
+    ok(not os.path.isdir(lockdir), "release removes the daemon lock dir (v101)")
+
+    # a LIVE holder is never reclaimed, however old the lock is
+    live = _bl.DaemonLock(accL, archiverd.DAEMON_LOCK_NAME)
+    ok(live.acquire() is True, "re-acquire after release (v101)")
+    os.utime(lockdir, (1, 1))                 # ancient mtime, live owner
+    ok(_bl.DaemonLock(accL, archiverd.DAEMON_LOCK_NAME).acquire() is False,
+       "an ancient lock with a LIVE owner is never reclaimed (v101)")
+    live.release()
+
     print(f"-- archiverd: {COUNT[0] - len(FAILS)} passed, {len(FAILS)} failed")
     return 1 if FAILS else 0
 

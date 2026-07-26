@@ -31,10 +31,18 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bank_common
+import banklock
 import epoch
 import registry
 
 STATUS_NAME = "archiver.status.json"
+# (v101) single-instance lock for the daemon loop. Two archiverds coexisted for two days
+# (a manual bootstrap alongside the launchd job), alternating status writes so the health
+# surface flapped between two views of the world and each doubled the other's archiving.
+# A dotfile beside archiver.status.json — outside the `*.json` bank-record glob and outside
+# the per-home fork-drift watch.
+DAEMON_LOCK_NAME = ".archiverd.lock"
 POLL_FALLBACK_S = 1.0        # belt-and-suspenders rescan cadence (G7)
 HEARTBEAT_EVERY_S = 5.0
 # (r3 #30) the retained-archive cap is env-tunable so the G7_FULL acceptance run (×100
@@ -498,15 +506,95 @@ def _detached_reconcile(acc, email):
     try:
         subprocess.Popen(
             [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "homerec.py"), email],
-            env=dict(os.environ, ACCOUNT_BANK_DIR=acc),
+            # (v101-confirm) pin BOTH rungs to the value we resolved, so the child cannot
+            # re-resolve to a different bank than the daemon is watching.
+            env=dict(os.environ, ACCOUNT_BANK_DIR=acc, BANK_DIR=acc),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     except Exception:
         pass
     return "dispatched"
 
 
+def _env_bank_dir(tokens):
+    """The bank directory a process resolved to, read from the `KEY=VALUE` tokens `ps -E`
+    appends to its command line. Same precedence as everywhere else (BANK_DIR ->
+    ACCOUNT_BANK_DIR -> $HOME/.claude/accounts), or None when even that cannot be determined —
+    which callers must treat as UNKNOWN, never as "a different bank"."""
+    env = {}
+    for tok in tokens:
+        for key in ("BANK_DIR", "ACCOUNT_BANK_DIR", "HOME"):
+            if tok.startswith(key + "=") and key not in env:
+                env[key] = tok[len(key) + 1:]
+    if env.get("BANK_DIR"):
+        return env["BANK_DIR"]
+    if env.get("ACCOUNT_BANK_DIR"):
+        return env["ACCOUNT_BANK_DIR"]
+    if env.get("HOME"):
+        return os.path.join(env["HOME"], ".claude", "accounts")
+    return None
+
+
+def other_archiverd_pids(bank_dir, ps_bin="/bin/ps", script_name="archiverd.py"):
+    """(v101-confirm) PIDs of OTHER live archiverd.py daemons operating on THIS bank, from a
+    process-table scan. Sorted; empty when none, and empty when `ps` itself fails — a scan we
+    could not perform is not evidence of a duplicate, and the lock still guards new code.
+
+    The single-instance LOCK only coordinates processes running THIS code. During an upgrade
+    the dangerous instance is precisely the one that predates it: a pre-v1.0.1 daemon holds no
+    lock, so the new launchd job acquires cleanly and both then archive and alternate status
+    writes — the exact production failure the lock was added to cure. Nothing but the process
+    table can see that instance.
+
+    Four filters, because a false positive here is a daemon that refuses to run:
+      * OUR UID only. Another user's daemon cannot write a 0700 bank of ours.
+      * A PYTHON argv[0] with an argument whose BASENAME is exactly archiverd.py. A substring
+        test over the whole command line also matches `test_archiverd.py`, a `grep
+        archiverd.py`, and any shell whose arguments merely mention the name.
+      * NOT a bounded one-shot (`--once`, `--converge`). A running daemon is expected to
+        overlap those; they take no lock and standing down for one would make startup flaky.
+      * The SAME bank directory, read from the candidate's own environment (`ps -E`). A daemon
+        watching a different bank is not a coexisting writer — and without this, one developer
+        daemon on the default bank would block every sandboxed run on a temp bank.
+    A candidate whose bank cannot be determined at all counts as a rival: unknown identity on
+    the dangerous side of this question is exactly when to stand down."""
+    try:
+        out = subprocess.run([ps_bin, "-Eww", "-Axo", "uid=,pid=,command="],
+                             capture_output=True, text=True, timeout=10).stdout or ""
+    except Exception:
+        return []
+    mine, uid = {os.getpid(), os.getppid()}, os.getuid()
+    want = os.path.realpath(bank_dir)
+    pids = set()
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            puid, pid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pid in mine or puid != uid:
+            continue
+        tokens = parts[2].split()
+        if not tokens or "python" not in os.path.basename(tokens[0]).lower():
+            continue
+        if not any(os.path.basename(tok) == script_name for tok in tokens):
+            continue
+        if "--once" in tokens or "--converge" in tokens:
+            continue
+        theirs = _env_bank_dir(tokens)
+        if theirs is not None and os.path.realpath(theirs) != want:
+            continue
+        pids.add(pid)
+    return sorted(pids)
+
+
 def main():
-    acc = os.environ.get("ACCOUNT_BANK_DIR", os.path.expanduser("~/.claude/accounts"))
+    # (v101-confirm) THE bank-directory rule, shared with lib.sh:22 and every other entry
+    # point: BANK_DIR -> ACCOUNT_BANK_DIR -> default. The daemon used to skip the BANK_DIR
+    # rung, so a BANK_DIR-only setup ran the archiver (and its single-instance lock) against
+    # the DEFAULT bank while the swap/poll rails held their lock in the custom one.
+    acc = bank_common.resolve_bank_dir()
     a = Archiver(acc)
     if "--once" in sys.argv:
         # (r10 #12) route through the epoch-gated cycle — a direct scan() would archive
@@ -538,7 +626,36 @@ def main():
     # (default on) so the hermetic archiving-contract test can keep it off (no real network).
     if os.environ.get("ACCOUNT_BANK_ARCHIVER_RECONCILE", "1") != "0":
         a.reconciler = _detached_reconcile
-    a.run_forever()
+    # (v101) SINGLE INSTANCE. Only the daemon loop takes the lock — --once and --converge are
+    # bounded one-shot invocations that a running daemon is expected to overlap. A newcomer
+    # that loses stands down cleanly with one line rather than becoming a second writer;
+    # launchd's KeepAlive then keeps retrying it, which is the visible cure for whichever
+    # instance is squatting. The lock is released on clean exit; a signal-killed holder is
+    # reclaimed by the next start on positive death (DaemonLock drops the age window for it).
+    lock = banklock.DaemonLock(acc, DAEMON_LOCK_NAME)
+    if not lock.acquire():
+        sys.stderr.write(f"archiverd: another instance is already running "
+                         f"(pid {lock.owner_pid()}); exiting.\n")
+        return 0
+    try:
+        # (v101-confirm) UPGRADE PREFLIGHT, after the lock and before any writing. Holding the
+        # lock proves no NEW-code daemon is running; it proves nothing about an OLD one, which
+        # takes no lock at all. Scan the process table and stand down rather than become the
+        # second writer — a locked new daemon coexisting with an unlocked old one is precisely
+        # the state the lock was supposed to make impossible. launchd's KeepAlive retries, so
+        # the daemon starts by itself once the old process is gone.
+        others = other_archiverd_pids(acc)
+        if others:
+            sys.stderr.write(
+                "archiverd: REFUSING to start — another archiverd.py process is already live "
+                f"on this bank ({acc}) and does not hold the single-instance lock (pid(s): "
+                + ", ".join(str(p) for p in others) + "). This is almost certainly a "
+                "pre-upgrade daemon. Stop it (kill those pids, or `launchctl bootout` the old "
+                "job) and this daemon will start on the next KeepAlive attempt.\n")
+            return 0
+        a.run_forever()
+    finally:
+        lock.release()
     return 0
 
 

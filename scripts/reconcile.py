@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bank_common
 
 HOME = os.path.expanduser("~")
-BANK_DIR = os.environ.get("BANK_DIR", os.path.join(HOME, ".claude", "accounts"))
+BANK_DIR = bank_common.resolve_bank_dir()   # (r15 #4) the ONE rule: BANK_DIR -> ACCOUNT_BANK_DIR -> default
 CLAUDE_JSON = os.environ.get("CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
 SWAP_JOURNAL = os.path.join(BANK_DIR, ".swap-journal.json")
 # DURABLE unresolved-blocker (re-review issue 3): once a torn swap is detected and
@@ -73,6 +73,24 @@ def _atomic_write_json(path, obj):
         os.fsync(d)
     finally:
         os.close(d)
+
+
+def _fsync_dir(dirpath):
+    """(v101-confirm) Make a rename/unlink inside `dirpath` durable. Returns True only when
+    the directory was opened AND fsync'd — a failure here is REPORTED, never absorbed, because
+    the caller uses it to decide whether a journal removal actually happened on disk.
+    Tests substitute this attribute to simulate a directory that cannot be synced."""
+    try:
+        fd = os.open(dirpath, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def _quarantine(path, why):
@@ -305,8 +323,28 @@ def reconcile_swap_journal():
     live_fp = _live_fp()
 
     def resolved():
-        try: os.remove(SWAP_JOURNAL)
-        except OSError: pass
+        """(v101-confirm) "resolved" is a claim about DISK, so prove it on disk before making
+        it. The old body swallowed the unlink's OSError and never synced the directory, so a
+        read-only bank (or any errno at all) produced "resolved" with the secret-bearing
+        journal still sitting there — and the very next mutator would rediscover it as a torn
+        swap. Both a surviving journal and an unproven-durable removal now fall through to
+        unresolved(), which durably records WHY and keeps blocking."""
+        try:
+            os.remove(SWAP_JOURNAL)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            sys.stderr.write(f"reconcile: could not remove the resolved swap journal "
+                             f"({type(e).__name__}); keeping it as the blocker.\n")
+            return unresolved("journal removal failed")
+        if os.path.exists(SWAP_JOURNAL):
+            sys.stderr.write("reconcile: the swap journal is still present after removal; "
+                             "keeping it as the blocker.\n")
+            return unresolved("journal still present after removal")
+        if not _fsync_dir(os.path.dirname(SWAP_JOURNAL) or "."):
+            sys.stderr.write("reconcile: the journal was removed but its directory could not be "
+                             "synced; the removal is not proven durable.\n")
+            return unresolved("journal removal not durable")
         _clear_unresolved_marker()
         return ("resolved", target)
 
