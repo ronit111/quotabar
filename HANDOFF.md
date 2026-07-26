@@ -2,7 +2,21 @@
 
 Resume point. Read FULLY. Supersedes all prior handoffs.
 
-## RELEASED: v1.0.1 IS PUBLIC (2026-07-26 ~15:45 IST) — current
+## RELEASED: v1.0.2 IS PUBLIC (2026-07-26 ~17:50 IST) — current
+Full backlog shipped: update-available hint (daily anon GitHub check, README-
+disclosed, toggleable — the upgrade-discovery answer), un-seed flow (registry-
+cross-verified, launch-admission fence via new launchadmit.py + .admit.lock in
+the §8 lock order, archive-before-delete of BOTH seat forms), plan-tier auto-
+heal (owner-ratified; oracle-gated; rendered one-time notice, FIFO-acked),
+hook debounce (class+fingerprint keyed), all four visual items, pinned-launch
+affordance, v2 cosmetics. Review: one diff-scoped pass vs baseline 0b02fc9
+(REVISE 8) + one micro pass on the destructive surface (REVISE 4) — all fixed;
+final r3 fixes shipped same-vendor-verified (next Codex pass diffs vs main
+@ this release). Deployed live + released + cask sha-verified same day.
+NOT built: rail/pinned session labels (pipe carries no session data — needs
+plumbing, v1.0.3 candidate). Baseline for next review: main at v1.0.2.
+
+## RELEASED: v1.0.1 (2026-07-26 ~15:45 IST) — superseded
 Binding cross-vendor audit cycle complete: r15 full audit (10 findings) +
 diff-scoped confirmation review (7 findings, incl. 1 Critical in the hook
 re-bank path) — all 17 fixed-to-clean, suites green both trees (repo-root test
