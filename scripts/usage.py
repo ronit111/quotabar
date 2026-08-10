@@ -1103,6 +1103,48 @@ def _benign_drift_refusal(act, kc, note=None):
         return "live identity unconfirmed"
     if r.email != act:
         return "live identity is a different account"
+    # (v103) ORACLE-ATTESTED PLAN-STAMP CORRECTION — closes the upgrade deadlock. The
+    # keychain blob's subscriptionType is stamped only by a real /login; a plan change
+    # while banked leaves it stale indefinitely (token refreshes never rewrite it —
+    # verified live 2026-08-10, pro→max). write_bank_record's crossed-identity tell then
+    # compares that stale stamp against ~/.claude.json's fresh organizationType and
+    # refuses every heal, leaving an empty banked card plus an UNLINKED twin until a
+    # manual /login. Its "catches up next cycle" assumption only holds in the other
+    # direction (metadata lagging the credential). With the oracle having just POSITIVELY
+    # named `act` as this credential's owner AND reported its live plan, the stamp is
+    # provably stale — correct it in the blob we are about to bank (the stdin copy only;
+    # the keychain is untouched and re-stamps itself at the next real /login). The
+    # credential fingerprint excludes subscriptionType by design, so the writer's
+    # expected-snapshot gate still matches, and its live-vs-live tell now agrees instead
+    # of deadlocking. The correction fires ONLY when the oracle and the live metadata
+    # AGREE on a tier the stamp contradicts — two independent live sources naming the
+    # stamp as the odd one out. If the oracle and metadata disagree (one of them is
+    # itself stale or the account is mid-change), correcting would just move the
+    # writer's refusal around, so we leave everything alone: the heal fails closed,
+    # the chip stands, and the next poll retries once the metadata settles. A tier
+    # unknown on any side is no evidence — no correction. And a conflict where the
+    # STAMP sides with the metadata (oracle alone dissenting — e.g. an upgrade the
+    # session metadata has not yet refreshed into ~/.claude.json) deliberately still
+    # heals WITHOUT correction: identity, the load-bearing claim, is positively
+    # confirmed, and v102 chose linking a same-account rotation over leaving the
+    # UNLINKED chip up; the tier self-corrects on a later poll via _banked_plan_is_stale
+    # once the metadata moves. (Codex 2026-08-10 flagged this as fail-open; ruled
+    # benign-by-design — plan is advisory display/autopick data, not identity.) Two hard edges (Codex review
+    # 2026-08-10): only "max"/"pro" attest — identity._plan_of() reports "free" as the
+    # ABSENCE default when the profile carries neither plan flag, so at this layer a
+    # free verdict is indistinguishable from missing evidence and never corrects; and
+    # the caller's blob is never mutated — the correction lands on a COPY handed to the
+    # writer through `note`, so a writer refusal (fence, race, validation) leaves no
+    # phantom-corrected credential behind in caller state.
+    _oracle_tier = bank_common.plan_tier(getattr(r, "plan", None))
+    _meta_tier = bank_common.plan_tier(
+        (active_oauth_account() or {}).get("organizationType"))
+    _stamp_tier = bank_common.plan_tier(kc.get("subscriptionType"))
+    if (_oracle_tier in ("max", "pro") and _meta_tier and _stamp_tier
+            and _oracle_tier == _meta_tier != _stamp_tier and isinstance(note, dict)):
+        _corrected = dict(kc)
+        _corrected["subscriptionType"] = getattr(r, "plan", "")
+        note["stamp_corrected_blob"] = _corrected
     if _plan_change is not None and isinstance(note, dict):
         note["healed_plan_change"] = dict(_plan_change, email=act)
     return ""
@@ -1484,7 +1526,9 @@ def main():
         _heal_note = {}
         if (LOCKED and (not identity_resolved or _plan_stale) and not _heal_backoff_active()
                 and not _benign_drift_refusal(act, kc, _heal_note)):
-            if _heal_unlinked(act, kc):
+            # (v103) bank the stamp-corrected COPY when the gate produced one; `kc`
+            # itself is never mutated, so a refused write leaves no phantom correction.
+            if _heal_unlinked(act, _heal_note.get("stamp_corrected_blob") or kc):
                 _heal_clear_backoff()
                 if _heal_note.get("healed_plan_change"):
                     _heal_note_plan_change(_heal_note["healed_plan_change"])

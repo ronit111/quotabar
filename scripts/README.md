@@ -304,6 +304,21 @@ of one at the cost of the other. It clears via `usage.py --ack-heal-notice`, or 
 after `ACCOUNT_BANK_HEAL_NOTICE_TTL` (default 24h). The hook still announces the change when it
 sees it first; it just no longer has the last word.
 
+**The frozen stamp (v103).** The keychain blob's `subscriptionType` is stamped only by a real
+`/login` — token refreshes never rewrite it — so a plan change while banked leaves the stamp
+stale indefinitely, and the writer's crossed-identity tell (stamp vs `organizationType`) would
+refuse the v1.0.2 heal forever: empty banked card, UNLINKED twin, until a manual `/login`.
+Offline, that state is byte-identical to a downgrade whose metadata is still lagging; only the
+oracle's live plan tells them apart. So when the oracle positively resolves the credential to
+the active identity AND the oracle and live metadata agree on a tier the stamp contradicts,
+the heal banks a stamp-corrected **copy** of the blob (the keychain itself is untouched and
+re-stamps at the next natural login). Only explicit "max"/"pro" verdicts attest — "free" is
+the profile's absence default and never corrects — and the caller's blob is never mutated, so
+a refused write leaves no phantom correction behind.
+Swap/manual re-banks after a plan change stay frozen until the stamp itself is
+repaired: run `heal-plan-stamp.sh` (oracle-gated, full kc_write ceremony) — or the next
+real `/login`, which re-stamps naturally.
+
 **Announced once, not every session (v1.0.2).** A deferral is news the first time and noise
 after that — until something heals it, the same paragraph printed at every single SessionStart,
 which is worst on exactly the machines where QuotaBar is not running to do the healing. The

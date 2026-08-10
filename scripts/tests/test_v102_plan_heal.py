@@ -58,8 +58,10 @@ def write_json(path, obj):
 Res = namedtuple("Res", "verdict uuid email plan detail")
 
 
-def oracle_saying(email, verdict="RESOLVED"):
-    return lambda tok: Res(verdict, "uuid-" + str(email), email, "max", "stub")
+def oracle_saying(email, verdict="RESOLVED", plan="max"):
+    # (v103) `plan` must be SCENARIO-CONSISTENT now: the stamp correction reads it, so a
+    # stub reporting a plan the scenario contradicts is stating a different scenario.
+    return lambda tok: Res(verdict, "uuid-" + str(email), email, plan, "stub")
 
 
 def main():
@@ -248,6 +250,11 @@ def main():
     write_json(os.environ["CLAUDE_JSON"],
                {"oauthAccount": {"emailAddress": "a@x.com", "organizationType": "claude_max"}})
     lagged = cred("lag2", plan="pro")            # credential moved, metadata has not
+    # (v103) in THIS story the account really is moving to pro, so the live oracle says pro —
+    # it disagrees with the lagging metadata, which is exactly why no stamp correction fires
+    # and the writer's conservative refusal below still stands. (The same bytes with an oracle
+    # AGREEING with the metadata are the frozen-stamp upgrade — test_v103_stamp_heal.py.)
+    usage._identity_oracle = oracle_saying("a@x.com", plan="pro")
     n = {}
     ok(usage._benign_drift_refusal("a@x.com", lagged, n) == "" and n == {},
        "a metadata-lagged credential is a rotation, not an announced plan change (v102-r3)")
@@ -257,6 +264,7 @@ def main():
        "...while the writer REFUSES it anyway: organizationType disagrees with the credential")
     ok(json.load(open(a_path))["claudeAiOauth"]["accessToken"] == "at-lag1",
        "...leaving the bank record untouched (fail closed, retry next poll)")
+    usage._identity_oracle = oracle_saying("a@x.com")
     write_json(a_path, record("a@x.com", banked))
     write_json(os.environ["CLAUDE_JSON"],
                {"oauthAccount": {"emailAddress": "a@x.com", "organizationType": "claude_pro"}})

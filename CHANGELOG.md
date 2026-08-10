@@ -2,6 +2,19 @@
 
 All notable changes to QuotaBar. Full notes on each [GitHub release](https://github.com/ronit111/quotabar/releases).
 
+## Unreleased
+
+- **Frozen plan-stamp heal (v103)**: the keychain credential's plan stamp is
+  written only at login, so a plan change on the active account froze it and
+  the crossed-identity gate refused every re-bank (empty card + UNLINKED twin).
+  The poll heal now banks an oracle-attested corrected copy — displays,
+  linking, and auto-pick recover with no re-login. Two review rounds, fixed to
+  clean; one finding ruled benign-by-design in-code.
+- **`heal-plan-stamp.sh`**: standalone, oracle-gated repair of the keychain
+  stamp itself (full snapshot/archive/recheck write ceremony, post-write
+  verification), unfreezing swap and manual re-banks after a plan change
+  without a re-login.
+
 ## v1.0.2 — 2026-07-26
 
 - **Update hint**: QuotaBar checks GitHub releases once a day (anonymous,
