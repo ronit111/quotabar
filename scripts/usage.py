@@ -838,6 +838,28 @@ def _clear_stagger_hold(bp):
         pass
 
 
+def _home_seat_token_expired(home):
+    """(v104) True ONLY when the home's seat credential is present, well-formed, and
+    provably expired. Any unreadable/absent/indeterminate state is False — this feeds
+    an auto-ping TRIGGER, and a ping fired on a seat we cannot read would bill a turn
+    on evidence we do not have. Never raises."""
+    try:
+        import seedflow as _sf
+        _b, _r, _status, _kind = _sf.seat_read(home)
+        if _status != "present" or not isinstance(_b, dict):
+            return False
+        _o = _b.get("claudeAiOauth")
+        # (Codex P2) a malformed-but-parseable seat must not fire a billed ping:
+        # validate the WHOLE credential, and bool is an int in Python — exclude it.
+        if not isinstance(_o, dict) or not bank_common.valid_oauth(_o):
+            return False
+        _exp = _o.get("expiresAt")
+        return (isinstance(_exp, (int, float)) and not isinstance(_exp, bool)
+                and _exp > 0 and _exp <= now_ms())
+    except Exception:
+        return False
+
+
 def maybe_autoping(results, bank_paths):
     """Fire at most ONE detached ping per poll cycle (finding #10), for the
     MOST-lapsed opted-in account whose 5h window has lapsed and whose cooldowns
@@ -870,7 +892,16 @@ def maybe_autoping(results, bank_paths):
             _home = V2_HOME_PATHS.get(email)
             if not _home:
                 continue
-            if not five_hour_lapsed(r):
+            # (v104, Ronit-ratified 2026-08-11) an EXPIRED home seat token is a
+            # lapse-equivalent trigger. The lapse check below reads `r`, and once the
+            # token idle-expires the poll fail-softs to the CACHED row — whose
+            # resets_at is still plausibly in the future — so the one state the home
+            # ping exists to recover was the one state that never reached candidacy:
+            # the card sat on "cached Nm ago" for hours until the stale window
+            # happened to lapse. Check the seat LIVE, not the cached row; all the
+            # usual gates (30-min cooldown, one-per-cycle, most-lapsed ordering)
+            # still apply, so this adds at most a few turns/day on an idle home.
+            if not five_hour_lapsed(r) and not _home_seat_token_expired(_home):
                 continue
             try:
                 rec = json.load(open(os.path.join(_home, ".ping-marker.json")))

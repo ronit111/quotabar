@@ -4,6 +4,13 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **Idle-home staleness fix (v104)**: a monitored (parked) home's token
+  idle-expires ~8h after its last turn; polls then served the cached row for
+  hours ("cached Nm ago") because the auto-ping lapse check read that same
+  stale row. An expired home seat token is now a lapse-equivalent auto-ping
+  trigger, checked live and fail-closed (validated credential only), with the
+  existing cooldown and one-per-cycle gates unchanged.
+
 - **Frozen plan-stamp heal (v103)**: the keychain credential's plan stamp is
   written only at login, so a plan change on the active account froze it and
   the crossed-identity gate refused every re-bank (empty card + UNLINKED twin).
