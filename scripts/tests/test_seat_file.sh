@@ -64,6 +64,14 @@ eq "$CFG/.credentials.json" "$(_seat_file_path)" "the seat path follows CLAUDE_C
   if _seat_is_file; then echo FILE; else echo SLOT; fi ) > "$BASE/iso.txt"
 eq "SLOT" "$(cat "$BASE/iso.txt")" "a stubbed/redirected security bin forces the SLOT, never the file"
 
+# --- (v108.1) the seat read must not depend on ANY external binary.
+# QuotaBar runs as an LSUIElement with PATH=/usr/bin:/bin:/usr/sbin:/sbin — the same
+# minimal-PATH class of environment that once made bare `claude` fail rc 127 and killed
+# auto-ping. A credential read is not the place to need a subprocess, so the shape check
+# is pure bash (case + $(<file)) rather than a python3 parse.
+( PATH=/nonexistent; r="$(cred_read)"; [ ${#r} -gt 0 ] ) && rr=0 || rr=1
+eq "0" "$rr" "cred_read works with an EMPTY PATH (no python3, no cat)"
+
 # --- kc_write writes THE FILE, verifies against it, and leaves it 0600.
 # No `security` process is involved in this branch at all.
 NEW='{"claudeAiOauth":{"accessToken":"AT-NEW","refreshToken":"RT-NEW","expiresAt":99999999999999,"subscriptionType":"max"}}'

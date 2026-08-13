@@ -528,15 +528,19 @@ cred_read() {
   # in ITS config dir, and reading the default one would cross accounts.
   f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
   if [ -s "$f" ]; then
-    out="$(cat "$f" 2>/dev/null)"
-    # must parse and carry an oauth payload, else fall through to the slot
-    if printf '%s' "$out" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-sys.exit(0 if isinstance(d,dict) and (d.get('claudeAiOauth') or d.get('oauth')) else 1)
-" 2>/dev/null; then
-      printf '%s' "$out"; return 0
-    fi
+    out="$(<"$f")" 2>/dev/null   # bash redirection builtin: no `cat`, no PATH
+    # (v108.1) Shape check in PURE BASH — no python3, no external binary.
+    # QuotaBar is an LSUIElement app with a minimal PATH (the same trap that made bare
+    # `claude` fail rc 127 and silently killed auto-ping). A bare `python3` here returned
+    # non-zero in that context, cred_read fell through to a slot that no longer exists,
+    # and "Swap here" aborted with "could not capture a valid live credential" — i.e. the
+    # PATH dependency turned a working credential into a missing one. Real schema
+    # validation still happens downstream in validate_blob.py before any write; this only
+    # decides "is this file a credential at all".
+    case "$out" in
+      \{*\"claudeAiOauth\"*) printf '%s' "$out"; return 0 ;;
+      \{*\"oauth\"*)         printf '%s' "$out"; return 0 ;;
+    esac
   fi
   kc_read
 }
