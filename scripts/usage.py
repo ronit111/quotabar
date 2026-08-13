@@ -94,6 +94,31 @@ AUTOPING_COOLDOWN = float(os.environ.get("ACCOUNT_BANK_AUTOPING_COOLDOWN", "1800
 # last_ping_failed on failure, so a ping that never actually started the window
 # can't be re-fired every poll cycle.
 AUTOPING_FAIL_COOLDOWN = float(os.environ.get("ACCOUNT_BANK_AUTOPING_FAIL_COOLDOWN", "300"))
+# (v105) The 5-min debounce above is FLAT, so a permanently broken home was retried
+# every poll cycle forever — 60 consecutive failures across ~33h were observed 11-13 Aug
+# 2026 on both homes, and it would never have stopped on its own. Two brakes now:
+#   1. the failure cooldown doubles per consecutive failure (5m, 10m, 20m, ...) up to
+#      AUTOPING_FAIL_COOLDOWN_MAX, so a broken home costs ~4 futile turns/day, not ~144;
+#   2. a home whose ping reported "no credential at all" is skipped entirely until a
+#      /login makes a ping succeed (ping-account.sh clears needs_login_since on success).
+# Both read state ping-account.sh writes; neither can wedge a HEALTHY home, because any
+# success resets the streak and clears the flag.
+AUTOPING_FAIL_COOLDOWN_MAX = float(
+    os.environ.get("ACCOUNT_BANK_AUTOPING_FAIL_COOLDOWN_MAX", "21600"))  # 6h
+
+
+def _autoping_fail_cooldown(rec):
+    """Escalating backoff for consecutive ping failures. streak<=1 keeps the historical
+    5-min debounce, so nothing changes for the ordinary one-off failure."""
+    try:
+        streak = int(rec.get("ping_fail_streak", 0) or 0)
+    except Exception:
+        streak = 0
+    if streak <= 1:
+        return AUTOPING_FAIL_COOLDOWN
+    # cap the exponent before shifting so a corrupt/huge streak can't overflow
+    return min(AUTOPING_FAIL_COOLDOWN * (2 ** min(streak - 1, 12)),
+               AUTOPING_FAIL_COOLDOWN_MAX)
 AUTOPING_DRYRUN = os.environ.get("ACCOUNT_BANK_AUTOPING_DRYRUN", "0") == "1"
 # (v101) benign UNLINKED auto-heal. Off switch + the post-failure backoff window; the
 # marker is a DOTfile so the bank-record `*.json` glob never sees it as an account.
@@ -929,7 +954,12 @@ def maybe_autoping(results, bank_paths):
         if time.time() - last_ok < AUTOPING_COOLDOWN:
             continue
         last_fail = float(rec.get("last_ping_failed", 0) or 0)
-        if time.time() - last_fail < AUTOPING_FAIL_COOLDOWN:
+        if time.time() - last_fail < _autoping_fail_cooldown(rec):
+            continue
+        # (v105) No credential in that home at all — only an interactive /login fixes it,
+        # so auto-ping stands down rather than burning a turn every cycle. The manual Ping
+        # button still fires, which is how a successful /login clears this.
+        if rec.get("needs_login_since"):
             continue
         candidates.append((email, r))
     if not candidates:

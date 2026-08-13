@@ -4,6 +4,22 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **Auto-ping no longer hot-loops on a home it cannot fix (v105)**: the
+  post-failure debounce was flat at 5 minutes, so a home whose credential was
+  gone got re-pinged every poll cycle indefinitely — 60 consecutive failures
+  over ~33 hours were observed on both homes before anyone noticed, and nothing
+  upstream could have stopped it (v104's expired-seat-token trigger stays true
+  forever on such a home). The ping turn's output was also discarded, so "no
+  credential at all" was indistinguishable from a network blip. Now the turn's
+  output is captured, classified and deleted without ever being logged; a home
+  reporting no credential is skipped by auto-ping until a login makes a ping
+  succeed; and consecutive failures double the cooldown up to a 6-hour cap, so
+  a broken home costs a handful of turns per day instead of ~144. Any success
+  clears both brakes, and the manual Ping button is deliberately unchanged so a
+  fresh login can always be verified by hand. Transient responses (403, 429,
+  timeout, network) veto the no-credential verdict, matching the existing
+  fail-closed posture for parked-token death.
+
 - **Idle-home staleness fix (v104)**: a monitored (parked) home's token
   idle-expires ~8h after its last turn; polls then served the cached row for
   hours ("cached Nm ago") because the auto-ping lapse check read that same

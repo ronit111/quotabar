@@ -93,15 +93,33 @@ PY
   esac
 
   # marker writer (fsync'd, atomic) — success or failure timestamp
-  _v2_mark() {   # $1 = last_ping | last_ping_failed
-    python3 - "$V2_MARK" "$1" <<'PY'
+  # (v105) Also maintains the state auto-ping needs to STOP retrying a hopeless home:
+  #   ping_fail_streak   — consecutive failures; usage.py escalates its cooldown off this.
+  #   needs_login_since  — set when the turn said the home has no credential at all
+  #                        ("Not logged in / please run /login"). No amount of retrying
+  #                        fixes that; only an interactive /login does.
+  # A success clears both. Recording only — the manual Ping path is unchanged, so Ronit
+  # can always retry by hand (that is how he verifies a /login worked).
+  _v2_mark() {   # $1 = last_ping | last_ping_failed [$2 = needs_login]
+    python3 - "$V2_MARK" "$1" "${2:-}" <<'PY'
 import json, os, sys, time
 p, field = sys.argv[1], sys.argv[2]
+flag = sys.argv[3] if len(sys.argv) > 3 else ""
 try:
     d = json.load(open(p))
     if not isinstance(d, dict): d = {}
 except Exception:
     d = {}
+if field == "last_ping":
+    d["ping_fail_streak"] = 0
+    d.pop("needs_login_since", None)
+else:
+    try:
+        d["ping_fail_streak"] = int(d.get("ping_fail_streak", 0) or 0) + 1
+    except Exception:
+        d["ping_fail_streak"] = 1
+    if flag == "needs_login" and not d.get("needs_login_since"):
+        d["needs_login_since"] = int(time.time())
 d[field] = int(time.time())
 tmp = p + ".tmp.%d" % os.getpid()
 with open(tmp, "w") as f:
@@ -118,15 +136,39 @@ PY
   echo "Pinging v2 READY home for $v2_target (model $MODEL, 60s cap)…"
   # (r12 sweep-c) strip alt-auth env so the turn bills the HOME's OAuth, never an inherited
   # ANTHROPIC_API_KEY / Bedrock/Vertex identity. CLAUDE_CONFIG_DIR is kept (not in the list).
-  if CLAUDE_CONFIG_DIR="$HOME_PATH" run_with_timeout 60 /usr/bin/env $(_auth_env_u_args) "$CLAUDE" -p "reply with just: ok" --model "$MODEL" </dev/null >/dev/null 2>&1; then
+  # (v105) The turn's output was previously discarded (>/dev/null 2>&1), which meant a
+  # home with NO credential looked identical to a network blip — so auto-ping retried a
+  # hopeless home every ~10 min indefinitely (60 consecutive failures observed 11-13 Aug
+  # 2026, both homes, ~33h). Capture it 0600, classify, then discard. The raw text is
+  # NEVER logged or echoed; only the category escapes this block.
+  _out="$(mktemp "${TMPDIR:-/tmp}/.abping.XXXXXX")" || _out=""
+  [ -n "$_out" ] && chmod 600 "$_out" 2>/dev/null
+  if CLAUDE_CONFIG_DIR="$HOME_PATH" run_with_timeout 60 /usr/bin/env $(_auth_env_u_args) "$CLAUDE" -p "reply with just: ok" --model "$MODEL" </dev/null >"${_out:-/dev/null}" 2>&1; then
+    [ -n "$_out" ] && rm -f "$_out"
     if ! _v2_mark last_ping; then err "Ping ran but the cooldown marker write FAILED; treating as failed."; exit 1; fi
     echo "Ping OK — 5h window started for $v2_target (home $HOME_PATH)."
     release_lock; trap - EXIT INT TERM HUP PIPE
     exit 0
   else
     rc=$?
-    err "Ping failed (v2 home turn exited rc $rc; output redacted)."
-    _v2_mark last_ping_failed || true
+    # "Not logged in · Please run /login" = the config dir holds no credential at all.
+    # Unlike a server-side OAuth rejection this is not ambiguous and not transient, but
+    # an ambiguous response (403 / 429 / network / timeout) still vetoes the verdict —
+    # same fail-closed posture as isolated_refresh.AUTH_TRANSIENT_MARKERS.
+    _flag=""
+    if [ -n "$_out" ] && [ -s "$_out" ]; then
+      if grep -qiE 'not logged in|please run /login' "$_out" 2>/dev/null \
+         && ! grep -qiE '403|forbidden|not permitted|429|rate.?limit|overloaded|timeout|timed out|network|connection|temporarily' "$_out" 2>/dev/null; then
+        _flag="needs_login"
+      fi
+    fi
+    [ -n "$_out" ] && rm -f "$_out"
+    if [ "$_flag" = "needs_login" ]; then
+      err "Ping failed: $v2_target's home has NO credential — run /login for it (auto-ping will stand down until it succeeds)."
+    else
+      err "Ping failed (v2 home turn exited rc $rc; output redacted)."
+    fi
+    _v2_mark last_ping_failed "$_flag" || true
     exit 1
   fi
 fi
