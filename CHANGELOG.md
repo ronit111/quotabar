@@ -4,6 +4,15 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **Needs-login breaker requires a provably-absent seat (v105.1)**: the
+  v105 classifier trusted the ping turn's own message, but a caller that
+  cannot read the keychain (locked, denied, or headless) gets the identical
+  "not logged in" text for a perfectly healthy credential — so a diagnostic
+  run from the wrong context could stand auto-ping down on a working home.
+  The verdict is now corroborated against the seat itself and only a
+  provably-absent seat arms the breaker; an unreadable seat is treated as
+  unknown and falls back to ordinary backoff.
+
 - **Auto-ping no longer hot-loops on a home it cannot fix (v105)**: the
   post-failure debounce was flat at 5 minutes, so a home whose credential was
   gone got re-pinged every poll cycle indefinitely — 60 consecutive failures

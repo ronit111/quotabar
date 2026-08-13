@@ -159,7 +159,23 @@ PY
     if [ -n "$_out" ] && [ -s "$_out" ]; then
       if grep -qiE 'not logged in|please run /login' "$_out" 2>/dev/null \
          && ! grep -qiE '403|forbidden|not permitted|429|rate.?limit|overloaded|timeout|timed out|network|connection|temporarily' "$_out" 2>/dev/null; then
-        _flag="needs_login"
+        # (v105.1) The turn's message alone is NOT proof. A caller that cannot read the
+        # keychain (locked, denied, no GUI session — e.g. a headless shell) gets the very
+        # same "Not logged in" text for a perfectly good credential, and stamping the
+        # breaker on that is the false-death this system is hardened against (r8 #1:
+        # seat status "error" means UNKNOWN, never a negative verdict). Only a seat that
+        # is PROVABLY absent earns the breaker; error/present fall back to plain backoff.
+        _seat="$(python3 - "$HERE" "$HOME_PATH" <<'PY' 2>/dev/null
+import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    import seedflow
+    print(seedflow.seat_read(sys.argv[2])[2])
+except Exception:
+    print("error")   # unreadable == UNKNOWN, never a needs-login verdict
+PY
+)"
+        [ "$_seat" = "absent" ] && _flag="needs_login"
       fi
     fi
     [ -n "$_out" ] && rm -f "$_out"

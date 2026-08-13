@@ -79,6 +79,22 @@ def main():
        "the turn's output is captured for classification, not discarded")
     ok('rm -f "$_out"' in ping, "the captured output is deleted, never logged")
 
+    # --- v105.1: the turn's message alone must NOT arm the breaker.
+    # A caller that cannot read the keychain (locked/denied/headless) sees the exact same
+    # "Not logged in" text for a HEALTHY credential. r8 #1: seat status "error" is UNKNOWN
+    # and must never become a negative verdict. This regressed once, on live homes.
+    ok('seedflow' in ping and 'seat_read' in ping,
+       "the needs-login verdict is corroborated against the actual seat")
+    ok('[ "$_seat" = "absent" ] && _flag="needs_login"' in ping,
+       "ONLY a provably-absent seat arms the breaker (error/present must not)")
+    ok('print("error")' in ping,
+       "an unreadable seat degrades to error, i.e. no breaker — fail-open on the verdict")
+    ok('"$HERE"' in ping,
+       "the seat probe resolves seedflow via $HERE, so the OSS mirror works unchanged")
+    # the guard must sit INSIDE the text-match branch, so a normal failure still backs off
+    ok(ping.index('_seat=') > ping.index('not logged in|please run /login'),
+       "the seat check runs only after the text signature matches, not on every failure")
+
     print(f"-- autoping_backoff: {COUNT[0] - len(FAILS)} passed, {len(FAILS)} failed")
     return 1 if FAILS else 0
 
