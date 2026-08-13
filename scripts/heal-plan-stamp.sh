@@ -28,8 +28,8 @@ source "$HERE/lib.sh"
 acquire_lock 15 || { err "heal-plan-stamp: could not acquire the bank lock"; exit 1; }
 trap 'release_lock' EXIT
 
-blob="$(kc_read)"
-[ -n "$blob" ] || { err "heal-plan-stamp: no live keychain credential"; exit 1; }
+blob="$(cred_read)"
+[ -n "$blob" ] || { err "heal-plan-stamp: no live credential (checked the credentials file and the keychain slot)"; exit 1; }
 
 act="$(active_email)"
 [ -n "$act" ] || { err "heal-plan-stamp: no active identity in ~/.claude.json"; exit 1; }
@@ -125,7 +125,7 @@ fi
 # (Codex P1a) kc_write verifies by cred_fingerprint, which deliberately EXCLUDES
 # subscriptionType — the one field this repair changes. Its success therefore cannot
 # prove the stamp landed; re-read and check the stamp AND the untouched tokens.
-verify="$(kc_read | HEAL_WANT="$patched" python3 -c "
+verify="$(cred_read | HEAL_WANT="$patched" python3 -c "
 import json, os, sys
 after = json.load(sys.stdin)
 ao = after.get('claudeAiOauth', after)

@@ -111,7 +111,7 @@ fi
 
 # --- re-derive current active account + live credential under the lock ---
 current="$(active_email)"
-raw_current="$(kc_read)"   # live blob, for re-bank AND rollback
+raw_current="$(cred_read)"   # live blob (v108: the SEAT), for re-bank AND rollback
 target_fp="$(printf '%s' "$target_blob" | _cred_fp)"
 
 # --- (finding #11) expected-active guard: bail if the world moved under us ---
@@ -240,7 +240,7 @@ _restore_trap() { trap 'release_lock; exit 130' INT TERM HUP PIPE; }
 #     phase journal is retained until the post-write verify passes so reconcile can
 #     still resolve any torn keychain state. This window cannot be closed from shell.
 if [ -n "$current" ]; then
-  raw_now="$(kc_read)"
+  raw_now="$(cred_read)"
   now_fp="$(printf '%s' "$raw_now" | _cred_fp)"
   pre_fp="$(printf '%s' "$precompact" | _cred_fp)"
   if [ -z "$now_fp" ]; then

@@ -172,6 +172,72 @@ def _active_email():
         return ""
 
 
+# --- (v108) SEAT-AWARE credential access -------------------------------------
+# Current Claude Code keeps the active credential in $CLAUDE_CONFIG_DIR/.credentials.json
+# and no longer writes the bare keychain slot this tool was built against. Reconcile
+# restores the OUTGOING credential after a torn swap, so it must read and write the same
+# seat swap-account.sh does, or it "restores" into a place the CLI never reads.
+# Mirrors lib.sh cred_read/_seat_is_file exactly, including the isolation rule: when
+# credential reads are redirected (tests/stubs) the SLOT is always the seat, so a
+# hermetic run can never read or overwrite the owner's real credential file.
+def _seat_file_path():
+    return os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or
+                        os.path.join(os.path.expanduser("~"), ".claude"),
+                        ".credentials.json")
+
+
+def _seat_is_file():
+    if (os.environ.get("ACCOUNT_BANK_FAKE_KEYCHAIN") or os.environ.get("STUB_KC_FILE")
+            or os.environ.get("ACCOUNT_BANK_SECURITY_BIN")):
+        return False
+    try:
+        return os.path.getsize(_seat_file_path()) > 0
+    except OSError:
+        return False
+
+
+def _seat_read():
+    """The live credential: file seat when that is where the CLI keeps it, else slot."""
+    if _seat_is_file():
+        try:
+            raw = open(_seat_file_path()).read().strip()
+        except OSError:
+            return None
+        if raw:
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                return None
+            if isinstance(d, dict) and (d.get("claudeAiOauth") or d.get("oauth")):
+                return raw
+        return None
+    return _live_keychain_blob()
+
+
+def _seat_write(compact_blob):
+    """Write the live credential seat atomically (0600). True on a landed write."""
+    if not _seat_is_file():
+        sec = _security_bin()
+        if not sec:
+            return False
+        cmd = 'add-generic-password -U -s "%s" -a "%s" -w %s\n' % (
+            KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, compact_blob)
+        try:
+            subprocess.run([sec, "-i"], input=cmd, text=True, capture_output=True, timeout=8)
+        except Exception:
+            pass   # rc ignored — the caller VERIFIES instead of trusting it
+        return True
+    path = _seat_file_path()
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".cred.")
+        with os.fdopen(fd, "w") as f:
+            f.write(compact_blob); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600); os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
 def _live_keychain_blob():
     """Raw keychain blob (string) for the exact service+account, or None. Bounded;
     secret never logged."""
@@ -190,7 +256,9 @@ def _live_keychain_blob():
 
 
 def _live_fp():
-    return bank_common.cred_fingerprint(_live_keychain_blob() or "")
+    # (v108) the fingerprint of the live SEAT — the same thing _seat_write just wrote,
+    # so the post-write verify below actually proves the write landed where the CLI reads.
+    return bank_common.cred_fingerprint(_seat_read() or "")
 
 
 def _stable_live_fp(retries=3):
@@ -250,14 +318,14 @@ def _restore_keychain(compact_blob, expected_live_fp):
     if not sec:
         return False
     # fail-closed: refuse to CREATE — the item must already exist.
-    if _live_keychain_blob() is None:
-        sys.stderr.write("reconcile: no existing keychain item to restore into; refusing to create.\n")
+    if _seat_read() is None:
+        sys.stderr.write("reconcile: no existing credential seat to restore into; refusing to create.\n")
         return False
     # snapshot the current item before overwriting it
     snap_dir = os.path.join(BANK_DIR, ".keychain-snapshots")
     try:
         os.makedirs(snap_dir, exist_ok=True); os.chmod(snap_dir, 0o700)
-        cur = _live_keychain_blob()
+        cur = _seat_read()
         if cur:
             sp = os.path.join(snap_dir, f"{int(time.time())}-{os.getpid()}.json")
             fd, tmp = tempfile.mkstemp(dir=snap_dir, prefix=".snap.")
@@ -272,12 +340,8 @@ def _restore_keychain(compact_blob, expected_live_fp):
             bank_common.archive_blob(BANK_DIR, bank_common.fp_owner(BANK_DIR, cur), cur)
     except Exception:
         return False   # snapshot / archive failure -> fail closed
-    cmd = 'add-generic-password -U -s "%s" -a "%s" -w %s\n' % (
-        KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, compact_blob)
-    try:
-        subprocess.run([sec, "-i"], input=cmd, text=True, capture_output=True, timeout=8)
-    except Exception:
-        pass   # rc ignored — we VERIFY below instead of trusting it
+    if not _seat_write(compact_blob):
+        return False
     return _live_fp() == want_fp
 
 

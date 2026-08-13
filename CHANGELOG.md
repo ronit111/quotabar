@@ -4,6 +4,18 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **Writes follow the seat too (v108)**: v107 made reads file-aware, but
+  `kc_write` still wrote the keychain slot — so a swap wrote a place the CLI no
+  longer reads and switched nothing. Rather than duplicate `kc_write`'s ceremony
+  (epoch gate, schema validation, archive-before-destroy, snapshot, pre-write
+  recheck, post-write verify) for a second backend, the seat is now a detail of
+  that one ceremony: a file seat is written atomically at 0600 and verified by
+  re-reading the file. Swap, ping, plan-stamp repair and torn-swap reconciliation
+  all follow the same seat. Redirected credential reads always mean the slot, so
+  the hermetic suite can neither read nor overwrite a real credential file. The
+  seeding freeze/unfreeze paths deliberately still read the slot — they verify a
+  fingerprint they themselves journaled, and must keep checking what they froze.
+
 - **Reads the credential where Claude Code actually stores it (v107)**: current
   Claude Code keeps the active account's credential in
   `$CLAUDE_CONFIG_DIR/.credentials.json`, and no longer writes the bare keychain

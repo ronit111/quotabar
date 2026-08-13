@@ -541,6 +541,25 @@ sys.exit(0 if isinstance(d,dict) and (d.get('claudeAiOauth') or d.get('oauth')) 
   kc_read
 }
 
+# _seat_file_path / _seat_is_file — where the ACTIVE seat physically lives.
+#
+# (v108) Reads alone were not enough: kc_write still wrote the keychain slot, so a swap
+# wrote a place the CLI no longer reads and switched nothing. Rather than duplicate
+# kc_write's ceremony (epoch gate, schema validation, archive-before-destroy, snapshot,
+# pre-write recheck, post-write verify, rollback) for a second storage backend, the seat
+# is a DETAIL of that one ceremony — the same way seat_read() treats v2 homes.
+#
+# Redirected credential reads (tests/stubs) always mean the slot: the hermetic suite must
+# never see, still less overwrite, the owner's real credential file.
+_seat_file_path() { printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"; }
+_seat_is_file() {
+  if [ -n "${ACCOUNT_BANK_FAKE_KEYCHAIN:-}" ] || [ -n "${STUB_KC_FILE:-}" ] \
+     || [ -n "${ACCOUNT_BANK_SECURITY_BIN:-}" ]; then
+    return 1
+  fi
+  [ -s "$(_seat_file_path)" ]
+}
+
 # kc_absent — return 0 ONLY when the credential slot is CONFIRMED EMPTY; nonzero for
 # "occupied" AND for "we could not look". (r15 #3) `security find-generic-password` answers
 # 44 (errSecItemNotFound) for a genuinely absent item and some other nonzero for a failure to
@@ -634,8 +653,8 @@ kc_write() {
     err "kc_write: blob failed validation; NOT writing"; return 10
   fi
   local want_fp; want_fp="$(printf '%s' "$blob" | _cred_fp)"
-  # fail-closed: the exact item must already exist unless bootstrapping
-  local cur; cur="$(kc_read)"
+  # fail-closed: the seat must already exist unless bootstrapping (v108: seat, not slot)
+  local cur; cur="$(cred_read)"
   if [ -z "$cur" ]; then
     if [ "${ACCOUNT_BANK_BOOTSTRAP:-0}" != "1" ]; then
       err "kc_write: no existing keychain item for $KEYCHAIN_SERVICE/$KEYCHAIN_ACCOUNT."
@@ -677,7 +696,7 @@ kc_write() {
     # unreadable and the diverged case we refresh KC_LAST_SNAPSHOT to whatever bytes we
     # could read so the caller re-banks the true-latest outgoing credential and aborts.
     local recheck recheck_fp cur_fp
-    recheck="$(kc_read)"
+    recheck="$(cred_read)"
     recheck_fp="$(printf '%s' "$recheck" | _cred_fp)"
     cur_fp="$(printf '%s' "$cur" | _cred_fp)"
     if [ -z "$recheck_fp" ] || [ -z "$cur_fp" ] || [ "$recheck_fp" != "$cur_fp" ]; then
@@ -706,6 +725,14 @@ kc_write() {
   # splits its command line on whitespace and honors double-quotes). The blob is
   # left unquoted: it is compact (validated: no whitespace) and starts with '{',
   # so security -i takes the whole run as one literal token.
+  # (v108) FILE SEAT: the CLI keeps the active credential in .credentials.json, so the
+  # write goes there. atomic_write is mktemp(0600)+rename in the same dir, so a crash
+  # mid-write cannot leave a truncated credential. Everything protective above (archive,
+  # snapshot, pre-write recheck) has already run and applies identically.
+  local rc=0
+  if _seat_is_file; then
+    if printf '%s' "$blob" | atomic_write "$(_seat_file_path)"; then rc=0; else rc=1; fi
+  else
   local sec; sec="$(security_bin)" || { err "kc_write: could not resolve the 'security' binary"; return 10; }
   local had_m=0; case "$-" in *m*) had_m=1;; esac
   set -m
@@ -719,16 +746,16 @@ kc_write() {
     kill -KILL -"$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null
   ) >/dev/null 2>&1 &
   local w=$!
-  local rc=0
   wait "$p" 2>/dev/null; rc=$?
   kill -KILL "$w" 2>/dev/null; wait "$w" 2>/dev/null
   { [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; } && rc=124
+  fi
   # POST-WRITE VERIFY (findings #10/#12): never trust the security exit code as
   # proof. `security -i` can commit just before a timeout-kill (nonzero rc but the
   # write LANDED), or a concurrent /login can overwrite our blob a moment later.
   # Re-read the live item and compare the FULL-credential fingerprint. Only an
   # exact match is success; anything else is indeterminate (fail loud, rc 1).
-  local live_fp; live_fp="$(kc_read | _cred_fp)"
+  local live_fp; live_fp="$(cred_read | _cred_fp)"
   if [ -n "$want_fp" ] && [ "$live_fp" = "$want_fp" ]; then
     return 0
   fi
@@ -936,7 +963,7 @@ run_child_bash() {
 # when absent. Pair with active_email() to snapshot the active identity under the
 # lock immediately before any keychain write / attribution / deletion, and abort
 # if either changed (findings #12/#26/#27/#41/#51).
-active_cred_fp() { kc_read | _cred_fp; }
+active_cred_fp() { cred_read | _cred_fp; }
 
 # (r5) fp_owner_other_than was retired: the "is the live keychain a DIFFERENT
 # banked account?" question is now answered by the single fail-closed resolver
@@ -962,7 +989,7 @@ resolve_identity() {
 # resolve. Prints the owner email + rc 0 when RESOLVED, else nothing + rc 1.
 resolve_active_identity() {
   local blob meta
-  blob="$(kc_read)"
+  blob="$(cred_read)"
   meta="$(active_email)"
   printf '%s' "$blob" | resolve_identity "$meta"
 }

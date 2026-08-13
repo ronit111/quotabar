@@ -305,7 +305,7 @@ if [ "$target" = "$active" ]; then
   # bank record (benign drift is offline-indistinguishable from an intruding login,
   # so it too fails closed here; re-bank $target to re-sync). Capture the live blob
   # ONCE so the post-turn check re-verifies the SAME credential.
-  live_blob="$(kc_read)"
+  live_blob="$(cred_read)"
   if [ "$(printf '%s' "$live_blob" | resolve_identity "$(active_email)")" != "$target" ]; then
     err "Aborting ping: could not bind the live keychain to '$target' (identity UNRESOLVED —"
     err "another/unbanked account, ambiguous, or a token drifted from the bank record; a"
