@@ -4,6 +4,18 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **A stale card now says why it is stale (v106)**: when a live fetch failed
+  the poller served the last good reading with `error: None` and status "ok",
+  so a card could sit on a 20-hour-old figure looking healthy with no way to
+  tell a brief blip from a credential that expired yesterday. The failed
+  attempt's reason is now carried onto the served row (`stale_error`, plus
+  `stale_since`) without altering the cached figures. The case that exposed
+  this also had a misleading message: an expired token on an account that
+  classification called parked but the live re-derivation called active was
+  reported as a transient poll race ("became active during poll") and repeated
+  every cycle; it now reports the real, actionable state — an expired active
+  token that this poller never refreshes by design.
+
 - **Needs-login breaker requires a provably-absent seat (v105.1)**: the
   v105 classifier trusted the ping turn's own message, but a caller that
   cannot read the keychain (locked, denied, or headless) gets the identical

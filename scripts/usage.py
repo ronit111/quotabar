@@ -410,7 +410,17 @@ def process_claude(email, oauth, is_active, bank_path, status, oauth_account=Non
         # Rotating an account that is now active would spend the refresh token its
         # live session still holds. Skip (transient) if it just became active.
         if active_email() == email:
-            res["error"] = "became active during poll; parked refresh skipped"
+            # (v106) The live re-derivation just proved this account IS active, so the
+            # honest state is the is_active branch above: an expired ACTIVE token, which
+            # this poller never refreshes by design. Reporting it as a poll-race ("became
+            # active during poll") reads as transient and self-healing — it is not. When
+            # main()'s classification and active_email() disagree persistently, the old
+            # message repeated every cycle while the card silently served a cached figure
+            # (observed: 19.8h stale, status "ok", error None). Skipping the refresh is
+            # still correct — only the explanation was wrong, and the wrong explanation
+            # is what made this invisible.
+            res["error"] = ("active token expired (run /login or let a session refresh it; "
+                            "not refreshed by design) — classified parked, live-active")
             return res, True
         # (r2 new blocker) a parked-account refresh here LAUNCHES claude, rotates the
         # v1 refresh grant, and writes rotated bank credentials — a v1 mutation. Gate it
@@ -1746,6 +1756,16 @@ def main():
                 good = prev_good(prev.get("accounts", []), "claude", email)
                 if good:
                     good = dict(good); good["stale_entry"] = True
+                    # (v106) Carry WHY this run failed onto the served cached row. Without
+                    # it a card can sit stale for 20+ hours reporting status "ok" and
+                    # error None — the cached row's own (healthy) fields mask the live
+                    # failure, so there is no way to tell a 60-second blip from a
+                    # credential that died yesterday. Diagnostic only: the cached figures
+                    # are still served unchanged, and `error` stays as the cached row had
+                    # it so nothing downstream that branches on `error` changes behaviour.
+                    if r.get("error"):
+                        good["stale_error"] = r.get("error")
+                    good["stale_since"] = good.get("fetched_at")
                     # (r5 #3) a quarantine / recovery path discovered THIS run must
                     # SURVIVE into the served entry — never let a healthy cached figure
                     # silently mask a rotated token stranded in quarantine. Carry the
