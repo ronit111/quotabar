@@ -26,8 +26,8 @@ fi
 # between the two reads, the snapshot is torn — abort rather than bind one
 # account's tokens to another's identity. write_bank_record.py enforces the
 # metadata==email match as a second, independent gate.
-raw="$(kc_read)"
-[ -n "$raw" ] || { err "No Claude Code credentials found in keychain (exact match). Are you logged in?"; exit 1; }
+raw="$(cred_read)"
+[ -n "$raw" ] || { err "No Claude Code credentials found (checked ~/.claude/.credentials.json and the keychain slot). Are you logged in?"; exit 1; }
 email="$(active_email)"
 if [ -z "$email" ]; then
   err "Could not determine active account email from $CLAUDE_JSON (oauthAccount.emailAddress)."
@@ -35,7 +35,7 @@ if [ -z "$email" ]; then
   exit 1
 fi
 fp1="$(printf '%s' "$raw" | _cred_fp)"
-raw2="$(kc_read)"; email2="$(active_email)"
+raw2="$(cred_read)"; email2="$(active_email)"
 fp2="$(printf '%s' "$raw2" | _cred_fp)"
 if [ -z "$fp1" ] || [ "$fp1" != "$fp2" ] || [ "$email" != "$email2" ]; then
   err "bank-account: the active account changed while capturing it (a /login raced the"

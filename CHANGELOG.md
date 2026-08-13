@@ -4,6 +4,19 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **Reads the credential where Claude Code actually stores it (v107)**: current
+  Claude Code keeps the active account's credential in
+  `$CLAUDE_CONFIG_DIR/.credentials.json`, and no longer writes the bare keychain
+  slot this bank was built against. Banking therefore failed with "no credentials
+  found in keychain" while the user was perfectly logged in, so the bank record
+  froze and every card served a cached figure indefinitely. A new `cred_read`
+  applies the same precedence `seat_read` already uses for pinned homes — a
+  present, non-empty file wins, else the slot — so a file/slot migration is a seat
+  change rather than a lost credential. It is deliberately not folded into
+  `kc_read`, whose post-write verification must keep re-reading the slot it wrote,
+  and it defers to the slot whenever credential reads are redirected (stubbed or
+  faked), so a sandboxed caller can never be handed the real token.
+
 - **A stale card now says why it is stale (v106)**: when a live fetch failed
   the poller served the last good reading with `error: None` and status "ok",
   so a card could sit on a 20-hour-old figure looking healthy with no way to

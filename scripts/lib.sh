@@ -497,6 +497,49 @@ kc_read() {
 }
 # back-compat alias used by older call sites
 read_keychain_raw() { kc_read; }
+# cred_read -> the ACTIVE account's credential, file-first then keychain slot.
+#
+# (v107, 2026-08-13) Claude Code stores the default account's credential in
+# $CLAUDE_HOME/.credentials.json on current versions; the bare keychain slot this bank
+# was built against is simply not written any more. Observed live: .credentials.json
+# valid and freshly rotated, no bare slot at all, and the bank record consequently
+# frozen for ~20h while every /login "succeeded" — the bar read a place the CLI had
+# stopped using. seat_read() already encodes exactly this precedence for v2 HOMES
+# (present non-empty FILE wins, else the per-config-dir slot); this is the same rule
+# for the default seat, so a file->slot or slot->file migration is a seat CHANGE
+# rather than a lost credential.
+#
+# Deliberately NOT folded into kc_read(): kc_write()'s post-write verification
+# re-reads the slot and compares fingerprints, and a reader that could answer from a
+# file would let a write "verify" against something it never wrote. Read sites that
+# want the live credential call this; sites that mean the SLOT keep calling kc_read.
+cred_read() {
+  local f out
+  # Isolation first (r8 #1 discipline): when ANY credential-read indirection is active the
+  # caller has deliberately sandboxed this — tests, gates, seeded contexts — and the real
+  # ~/.claude/.credentials.json is not the seat they mean. Reading it would escape the
+  # sandbox and hand back the OWNER's live token. test_v101_confirm caught exactly that:
+  # the hook returned a real `sk-ant-ort01-…` where the fixture expected `RT-2`.
+  if [ -n "${ACCOUNT_BANK_FAKE_KEYCHAIN:-}" ] || [ -n "${STUB_KC_FILE:-}" ] \
+     || [ -n "${ACCOUNT_BANK_SECURITY_BIN:-}" ]; then
+    kc_read; return $?
+  fi
+  # Follow CLAUDE_CONFIG_DIR, not $HOME blindly: a pinned/home context's credential lives
+  # in ITS config dir, and reading the default one would cross accounts.
+  f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+  if [ -s "$f" ]; then
+    out="$(cat "$f" 2>/dev/null)"
+    # must parse and carry an oauth payload, else fall through to the slot
+    if printf '%s' "$out" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+sys.exit(0 if isinstance(d,dict) and (d.get('claudeAiOauth') or d.get('oauth')) else 1)
+" 2>/dev/null; then
+      printf '%s' "$out"; return 0
+    fi
+  fi
+  kc_read
+}
 
 # kc_absent — return 0 ONLY when the credential slot is CONFIRMED EMPTY; nonzero for
 # "occupied" AND for "we could not look". (r15 #3) `security find-generic-password` answers
