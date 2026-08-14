@@ -95,6 +95,20 @@ def main():
     ok(ping.index('_seat=') > ping.index('not logged in|please run /login'),
        "the seat check runs only after the text signature matches, not on every failure")
 
+    # --- v109: a BLANKED seat (readable blob, empty accessToken+refreshToken) arms the
+    # breaker like an absent one. Observed live 2026-08-14: ronitchidara111's home slot
+    # held a parseable blob with empty token strings, seat_read said "present", and the
+    # breaker never armed — futile pings continued under plain backoff indefinitely.
+    # This stays doctrine-safe (v105.1): an empty blob can only come from a REAL read;
+    # a locked/denied keychain is status "error" and still never arms the breaker.
+    ok('accessToken' in ping and 'refreshToken' in ping,
+       "the classifier inspects the blob's tokens, not just seat status")
+    ok('status = "absent"' in ping,
+       "an empty-token blob is downgraded to absent (arms the breaker)")
+    ok('status == "present" and isinstance(blob, dict)' in ping,
+       'the empty-token downgrade applies ONLY to a readable "present" seat — '
+       '"error" stays UNKNOWN and never arms the breaker')
+
     print(f"-- autoping_backoff: {COUNT[0] - len(FAILS)} passed, {len(FAILS)} failed")
     return 1 if FAILS else 0
 

@@ -170,7 +170,17 @@ import sys
 sys.path.insert(0, sys.argv[1])
 try:
     import seedflow
-    print(seedflow.seat_read(sys.argv[2])[2])
+    blob, _raw, status, _kind = seedflow.seat_read(sys.argv[2])
+    # (v109) A BLANKED seat — a readable blob whose accessToken AND refreshToken are
+    # empty — is as credential-less as a deleted one. This is still a corroborated
+    # verdict, not a text-only one: a locked/denied/headless keychain yields status
+    # "error" (UNKNOWN), never an empty blob, so only a real read can land here.
+    if status == "present" and isinstance(blob, dict):
+        _o = blob.get("claudeAiOauth") or {}
+        if not str(_o.get("accessToken") or "").strip() \
+           and not str(_o.get("refreshToken") or "").strip():
+            status = "absent"
+    print(status)
 except Exception:
     print("error")   # unreadable == UNKNOWN, never a needs-login verdict
 PY
