@@ -990,8 +990,9 @@ struct QuotaBarTests {
             "read-only poll must retain process-tree SIGKILL escalation"
         )
         try expect(
-            ScriptExecutionPolicy.mutatingAction.timeout == 90,
-            "mutating actions must receive a 90s timeout"
+            ScriptExecutionPolicy.mutatingAction.timeout == 240,
+            "mutating actions must receive a 240s timeout (v110: the swap pre-flight and a "
+            + "parked ping run isolated_refresh's two 60s-capped turn attempts plus overhead)"
         )
         try expect(
             ScriptExecutionPolicy.mutatingAction.terminationGrace == 10,
@@ -1340,6 +1341,27 @@ struct QuotaBarTests {
         try expect(HealthPresentation.isHealthy(healthy, epoch: .v2, seedAuditAckTs: 0), "healthy payload shows no chrome")
         // v1 hides all health even when the payload is anomalous.
         let blind = try health(from: #"{"archiver":{"heartbeat_age":5,"epoch_parked":false,"blind_homes":["/h/a"]}}"#)
+        // (v110) credential-substrate canary: decodes, renders under EVERY epoch, flips isHealthy.
+        let substrate = try health(from:
+            #"{"credential_substrate":{"active_email":"a@x.com","since":1,"detail":"d"}}"#)
+        try expect(HealthPresentation.credentialSubstrateLine(substrate) != nil,
+                   "substrate alert renders a line")
+        try expect(HealthPresentation.credentialSubstrateLine(substrate)!.contains("a"),
+                   "substrate line names the account")
+        try expect(!HealthPresentation.isHealthy(substrate, epoch: .v1, seedAuditAckTs: 0),
+                   "substrate alert is an anomaly under v1 (NOT epoch-gated)")
+        try expect(HealthPresentation.credentialSubstrateLine(healthy) == nil,
+                   "no substrate alert on a healthy payload")
+        // (v110) scripts-drift canary: same contract.
+        let drifted = try health(from:
+            #"{"scripts_drift":{"running":"/r","maintained":"/m","files":["usage.py","lib.sh"],"detail":"d"}}"#)
+        try expect(HealthPresentation.scriptsDriftLine(drifted) != nil, "scripts drift renders a line")
+        try expect(HealthPresentation.scriptsDriftLine(drifted)!.contains("2"),
+                   "scripts-drift line carries the file count")
+        try expect(!HealthPresentation.isHealthy(drifted, epoch: .v1, seedAuditAckTs: 0),
+                   "scripts drift is an anomaly under v1 (NOT epoch-gated)")
+        try expect(HealthPresentation.scriptsDriftLine(healthy) == nil,
+                   "no scripts-drift alert on a healthy payload")
         try expect(HealthPresentation.archiverWarning(blind, epoch: .v1) == nil, "v1 hides archiver health")
         try expect(HealthPresentation.archiverWarning(blind, epoch: .v2) != nil, "a blind home warns under v2")
         // stale heartbeat (>10m) warns; just under does not.

@@ -167,6 +167,18 @@ verify: bundle verify-bundle
 	@test "$$('/usr/libexec/PlistBuddy' -c 'Print :LSUIElement' "$(CONTENTS)/Info.plist")" = "true"
 	/usr/bin/file "$(EXECUTABLE)" | /usr/bin/grep -q 'arm64'
 
+# (v110) Local-dev install: the normal install, then the bundle's account-bank becomes a
+# SYMLINK to the maintained scripts dir, so the app can never execute stale bundled copies
+# (usage.py's scripts_drift health canary watches for an upgrade resetting this link).
+# Releases keep bundling real copies — this target is for a machine that maintains the
+# scripts in place. Override LIVE_SCRIPTS_DIR for a non-default location.
+LIVE_SCRIPTS_DIR ?= $(HOME)/.claude/scripts/account-bank
+install-linked: install
+	/bin/rm -rf "$(INSTALL_BUNDLE)/Contents/Resources/account-bank"
+	/bin/ln -s "$(LIVE_SCRIPTS_DIR)" "$(INSTALL_BUNDLE)/Contents/Resources/account-bank"
+	/usr/bin/codesign --force --sign - --timestamp=none "$(INSTALL_BUNDLE)"
+	@echo "install-linked: bundle account-bank -> $(LIVE_SCRIPTS_DIR)"
+
 install: verify
 	@set -eu; \
 	if [[ -d "$(INSTALL_BUNDLE)" ]]; then \

@@ -1251,12 +1251,15 @@ final class AppModel: ObservableObject {
 
     var archiverWarning: String? { HealthPresentation.archiverWarning(health, epoch: currentEpoch) }
     var forkDriftLine: String? { HealthPresentation.forkDriftLine(health, epoch: currentEpoch) }
+    var credentialSubstrateLine: String? { HealthPresentation.credentialSubstrateLine(health) }
+    var scriptsDriftLine: String? { HealthPresentation.scriptsDriftLine(health) }
 
     /// True when ANY health anomaly is worth showing — otherwise the popover renders no health
     /// chrome at all (zero noise in the healthy state).
     var hasHealthAnomaly: Bool {
         archiverWarning != nil || forkDriftLine != nil || seedAuditReview != nil
-            || healedPlanChange != nil
+            || healedPlanChange != nil || credentialSubstrateLine != nil
+            || scriptsDriftLine != nil
     }
 
     /// True while a restart offer is pending or per-session restart outcomes are still showing.

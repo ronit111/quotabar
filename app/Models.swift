@@ -909,8 +909,13 @@ struct ScriptExecutionPolicy: Equatable, Sendable {
         terminationGrace: 0.25,
         sendsTreeSIGKILL: true
     )
+    // (v110) 240s, was 90: the swap's target-liveness pre-flight and a parked ping both run
+    // isolated_refresh, whose turn tries the requested model then falls back to the default —
+    // two 60s-capped attempts plus lock/reconcile overhead legitimately exceeds 90s. A SIGTERM
+    // mid-pre-flight is harmless (no mutation has happened) but reports failure for a swap that
+    // would have succeeded, so the budget covers the honest worst case instead.
     static let mutatingAction = ScriptExecutionPolicy(
-        timeout: 90,
+        timeout: 240,
         terminationGrace: 10,
         sendsTreeSIGKILL: false
     )
@@ -1255,15 +1260,39 @@ struct Health: Decodable, Sendable {
             case email, ts
         }
     }
+    /// (v110) The credential-substrate canary: an active identity with NO credential readable
+    /// through any known seat form — the signature of Claude Code moving credential storage
+    /// again (the 12-14 Aug 2026 outage class). /login does not fix it; the bank's reads do.
+    struct CredentialSubstrate: Decodable, Sendable {
+        let activeEmail: String?
+        let since: Int?
+        let detail: String?
+        enum CodingKeys: String, CodingKey {
+            case activeEmail = "active_email"
+            case since, detail
+        }
+    }
+    /// (v110) The scripts-drift canary: the poll is executing release-frozen bundle scripts
+    /// that differ from the maintained copy (an app upgrade reset the bundle symlink).
+    struct ScriptsDrift: Decodable, Sendable {
+        let running: String?
+        let maintained: String?
+        let files: [String]?
+        let detail: String?
+    }
     let archiver: Archiver?
     let forkDrift: [String: [String]]?
     let seedAudit: SeedAudit?
     let healedPlanChange: HealedPlanChange?
+    let credentialSubstrate: CredentialSubstrate?
+    let scriptsDrift: ScriptsDrift?
     enum CodingKeys: String, CodingKey {
         case archiver
         case forkDrift = "fork_drift"
         case seedAudit = "seed_audit"
         case healedPlanChange = "healed_plan_change"
+        case credentialSubstrate = "credential_substrate"
+        case scriptsDrift = "scripts_drift"
     }
 }
 
@@ -1336,6 +1365,22 @@ enum HealthPresentation {
         return (ts, "\(who) is now \(to) · re-banked")
     }
 
+    /// (v110) Credential-substrate alert. Deliberately NOT epoch-gated: it describes the v1
+    /// keychain/file world the daily rail runs on. One compact line; the poll's stderr carries
+    /// the full diagnosis.
+    static func credentialSubstrateLine(_ health: Health?) -> String? {
+        guard let cs = health?.credentialSubstrate else { return nil }
+        let who = cs.activeEmail.map(RemoveAccountPolicy.shortEmail) ?? "active account"
+        return "No readable credential for \(who) — CLI storage may have moved (not a /login fix)"
+    }
+
+    /// (v110) Scripts-drift alert. Not epoch-gated either: stale bundle scripts break every
+    /// epoch equally. Names the count, not the paths — the popover is 320pt wide.
+    static func scriptsDriftLine(_ health: Health?) -> String? {
+        guard let sd = health?.scriptsDrift, let files = sd.files, !files.isEmpty else { return nil }
+        return "App is running \(files.count) stale bundled script\(plural(files.count)) — re-link the bundle"
+    }
+
     /// True when NOTHING on this pipe has anything to show — the popover renders no health
     /// chrome at all. (v102-r2) The plan-change notice counts. It is not an anomaly, but it IS a
     /// row, and a "healthy" verdict that ignored it would be a second opinion disagreeing with
@@ -1348,6 +1393,8 @@ enum HealthPresentation {
             && forkDriftLine(health, epoch: epoch) == nil
             && seedAuditReview(health, epoch: epoch, ackedTs: seedAuditAckTs) == nil
             && healedPlanChange(health, ackedTs: healNoticeAckTs) == nil
+            && credentialSubstrateLine(health) == nil
+            && scriptsDriftLine(health) == nil
     }
 
     private static func plural(_ n: Int) -> String { n == 1 ? "" : "s" }

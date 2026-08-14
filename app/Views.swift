@@ -1112,6 +1112,18 @@ private struct HealthSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // (v110) The two canaries outrank everything below: each names a state where the
+            // numbers on the cards can no longer be trusted (unreadable substrate / stale code).
+            if let substrate = model.credentialSubstrateLine {
+                HealthRow(symbol: "key.slash.fill", tint: .red,
+                          text: substrate, emphasized: true,
+                          identifier: "quotabar.health.credentialSubstrate")
+            }
+            if let drift = model.scriptsDriftLine {
+                HealthRow(symbol: "doc.badge.gearshape.fill", tint: .orange,
+                          text: drift, emphasized: true,
+                          identifier: "quotabar.health.scriptsDrift")
+            }
             if let warning = model.archiverWarning {
                 HealthRow(symbol: "exclamationmark.triangle.fill", tint: .orange,
                           text: warning, emphasized: true, identifier: "quotabar.health.archiver")
