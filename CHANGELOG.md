@@ -4,6 +4,48 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **Swap verifies the target credential live before committing (v110)**: a
+  schema-valid bank record is not a live credential — on a shared account a
+  co-user's `/login` revokes the banked grant server-side while every offline
+  field still reads fresh. The swap now proves the target with one real turn in
+  an isolated config dir (the same ceremony parked pings use) before any
+  keychain mutation: a confirmed-dead target marks needs-relogin and aborts with
+  the recovery path, a transient failure aborts retriable, and the active
+  account is never touched. `ACCOUNT_BANK_SKIP_TARGET_VERIFY=1` bypasses for
+  offline/emergency swaps. The app's mutating-action budget rises 90s -> 240s to
+  cover the pre-flight's two 60s-capped turn attempts.
+
+- **The refresh readback follows the seat (v110)**: recent Claude Code migrates
+  ANY config dir's file credential into its per-config-dir keychain slot and
+  deletes the file, and records a cleared login by blanking the blob — so the
+  file-only readback quarantined every refresh and orphan slots accumulated one
+  per turn. The readback now reads file-then-slot, classifies a blanked slot as
+  the CLI's cleared-login stamp (dead only with a confirmed auth signature),
+  deletes the harvested orphan slot, and records candidate slot service names
+  beside anything quarantined. An offline `refreshTokenExpiresAt` lapse is no
+  longer death evidence — records freeze during outages, so only a confirmed
+  rejection may mark needs-relogin.
+
+- **Two loud health canaries (v110)**: `credential_substrate` (active identity
+  present but no credential readable through any known seat form — the
+  storage-moved-again signature; explicitly not a `/login` fix; armed only on a
+  confirmed double absence) and `scripts_drift` (the app executing
+  release-frozen bundled scripts that differ from the maintained copy). Both
+  render as health rows in the popover. `make install-linked` points a local
+  install's bundled scripts at the maintained dir so drift is structurally
+  impossible between releases.
+
+- **The poller reads the active credential where the CLI stores it (v110)**: the
+  usage poll was still slot-only after v107, so identity never bound and the
+  active card rendered only through its bank record (including a duplicate row).
+  Tri-state read, file first — and a present-but-unreadable/blanked file never
+  falls back to the stale pre-migration slot.
+
+- **A blanked home seat arms the auto-ping breaker (v109)**: a readable blob
+  with empty tokens is as credential-less as a deleted one, and only a real read
+  can observe it — a locked keychain still reads as UNKNOWN and never arms.
+
+
 - **Writes follow the seat too (v108)**: v107 made reads file-aware, but
   `kc_write` still wrote the keychain slot — so a swap wrote a place the CLI no
   longer reads and switched nothing. Rather than duplicate `kc_write`'s ceremony
