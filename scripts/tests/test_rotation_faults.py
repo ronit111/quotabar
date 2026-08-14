@@ -220,13 +220,20 @@ BLANK = {"accessToken": "", "refreshToken": "", "expiresAt": 0, "subscriptionTyp
 
 class _FakeSeedflow:
     """(v110) stands in for seedflow's slot primitives: refresh_via_config_dir imports
-    seedflow lazily, so an object in sys.modules['seedflow'] is what it gets."""
+    seedflow lazily, so an object in sys.modules['seedflow'] is what it gets.
+    (v110-r2, review finding 9) services are DISTINCT per path and reads are recorded,
+    so a wrong-path hash or a deletion of the wrong service fails the assertions."""
     def __init__(self, oauth, status="present"):
         self._oauth, self._status = oauth, status
         self.deleted = []
+        self.reads = []
+        self.services = {}
     def config_slot_service(self, p):
-        return "Claude Code-credentials-fake"
+        svc = "Claude Code-credentials-fake-%08x" % (abs(hash(str(p))) % (16**8))
+        self.services[svc] = str(p)
+        return svc
     def _sh_keychain_read(self, service=None):
+        self.reads.append(service)
         if self._status != "present":
             return None, None, self._status
         blob = {"claudeAiOauth": self._oauth}
@@ -262,6 +269,8 @@ def case_v110_migrated_rotation_via_slot():
         eq("ok", rr.reason, "migrated readback commits normally, no quarantine (v110)")
         eq("ROT2", rr.creds.get("accessToken"), "migrated readback returns the SLOT's creds (v110)")
         eq(1, len(fake.deleted), "the orphan per-dir slot is deleted after harvest (v110)")
+        eq(fake.reads[0], fake.deleted[0],
+           "the DELETED service is exactly the one the harvest READ (v110-r2 finding 9)")
     finally:
         sys.modules.pop("seedflow", None)
         shutil.rmtree(base, ignore_errors=True)
@@ -342,6 +351,40 @@ def case_v110_slot_absent_still_torn():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def case_v110r2_offline_expiry_is_not_death():
+    # (v110-r2, review finding 2) a LAPSED offline refreshTokenExpiresAt stamp plus a
+    # TRANSIENT turn failure must exit 6 (retriable), never 3 (needs-relogin): the stamp
+    # freezes when records go stale (the 12-14 Aug outage held records for two days), so
+    # it is not proof of death. A CONFIRMED auth signature still exits 3.
+    import subprocess
+    base = tempfile.mkdtemp(prefix="rotflt110e-")
+    try:
+        _env(base)
+        json.dump({"oauthAccount": {"emailAddress": "other@x.com"}}, open(os.environ["CLAUDE_JSON"], "w"))
+        bank = os.environ["BANK_DIR"]
+        rec = {"email": "p@x.com", "status": "ok", "banked_at": "2026-07-19T00:00:00Z",
+               "banked_at_epoch": 1,
+               "claudeAiOauth": {"accessToken": "OLD", "refreshToken": "rOLD",
+                                  "expiresAt": 1, "refreshTokenExpiresAt": 2,
+                                  "subscriptionType": "max"},
+               "oauthAccount": {"emailAddress": "p@x.com", "organizationType": "claude_max"}}
+        tf = os.path.join(bank, "p@x.com.json")
+        json.dump(rec, open(tf, "w"))
+        env = dict(os.environ)
+        env["ACCOUNT_BANK_HOLDS_LOCK"] = "1"
+        env["BANK_DIR"] = bank
+        def run_cli(mode):
+            env["STUB_CLAUDE_MODE"] = mode
+            return subprocess.run([sys.executable, os.path.join(AB, "isolated_refresh.py"), tf],
+                                  env=env, capture_output=True, text=True, timeout=60).returncode
+        eq(6, run_cli("forbidden"),
+           "lapsed offline expiry + ambiguous 403 -> exit 6 retriable, NOT death (v110-r2)")
+        eq(3, run_cli("authfail"),
+           "lapsed offline expiry + CONFIRMED auth signature -> exit 3 dead (v110-r2)")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 if __name__ == "__main__":
     case_15_metaonly()
     case_6_readback_torn()
@@ -354,5 +397,6 @@ if __name__ == "__main__":
     case_v110_blanked_slot_auth_death()
     case_v110_blanked_slot_no_auth_text()
     case_v110_slot_absent_still_torn()
+    case_v110r2_offline_expiry_is_not_death()
     print(f"  -- rotation_faults: {_pass} passed, {_fail} failed")
     sys.exit(1 if _fail else 0)

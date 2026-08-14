@@ -69,6 +69,7 @@ def resolve_codex_bin():
 TOTAL_DEADLINE = float(os.environ.get("ACCOUNT_BANK_TOTAL_DEADLINE", "45"))
 DEADLINE = float("inf")   # wall-clock run deadline; set in main(), read by process_claude (#28)
 _SUBSTRATE_ALERT = None   # (v110) set by main() when the active credential is unreadable via every known seat form
+_ACTIVE_SEAT_STATUS = "error"   # (v110-r2) tri-state from the last read_keychain_blob(): present|absent|cleared|error
 LOCK_STALE_SECS = 300
 
 HOME = os.path.expanduser("~")
@@ -233,18 +234,34 @@ def read_keychain_blob():
     reads are REDIRECTED for tests (fake keychain / stub kc file / security-bin override),
     the real file must be ignored, or the suite escapes its sandbox and reads the owner's
     live token. Under redirection only the (stubbed) slot path runs."""
+    global _ACTIVE_SEAT_STATUS
+    _ACTIVE_SEAT_STATUS = "error"   # pessimistic until a read proves otherwise
     redirected = any(os.environ.get(v) for v in
                      ("ACCOUNT_BANK_FAKE_KEYCHAIN", "STUB_KC_FILE", "ACCOUNT_BANK_SECURITY_BIN"))
+    file_absent = True
     if not redirected:
-        try:
-            with open(_active_cred_file()) as f:
-                raw = f.read()
-            if raw.strip():
-                o = json.loads(raw).get("claudeAiOauth", {})
-                if isinstance(o, dict) and o:
+        cred = _active_cred_file()
+        if os.path.exists(cred):
+            file_absent = False
+            # (v110-r2, review finding 3) tri-state, and NO slot fallback for a file that
+            # EXISTS but is unreadable/torn/blanked: the bare slot is the pre-migration
+            # PREDECESSOR, and serving it as "the live credential" can feed the v101
+            # auto-heal a stale token to re-bank over a fresh record. A present-but-bad
+            # file is status ERROR (UNKNOWN) — kc None, canary NOT armed, no attribution.
+            try:
+                with open(cred) as f:
+                    raw = f.read()
+                o = json.loads(raw).get("claudeAiOauth", {}) if raw.strip() else None
+                if (isinstance(o, dict) and str(o.get("accessToken") or "").strip()
+                        and str(o.get("refreshToken") or "").strip()):
+                    _ACTIVE_SEAT_STATUS = "present"
                     return o
-        except Exception:
-            pass
+                # empty file, missing/blanked oauth: the CLI's cleared-login shape.
+                # /login DOES fix that, so it must never arm the substrate canary.
+                _ACTIVE_SEAT_STATUS = "cleared"
+            except Exception:
+                _ACTIVE_SEAT_STATUS = "error"
+            return None
     sec = resolve_security_bin()
     if not sec:
         return None
@@ -253,7 +270,14 @@ def read_keychain_blob():
                               "-a", KEYCHAIN_ACCOUNT, "-w"],
                              capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
         if out.returncode == 0 and out.stdout.strip():
-            return json.loads(out.stdout).get("claudeAiOauth", {})
+            o = json.loads(out.stdout).get("claudeAiOauth", {})
+            _ACTIVE_SEAT_STATUS = "present"
+            return o
+        # (v110-r2, review finding 4) `security` exits 44 (errSecItemNotFound) for a
+        # confirmed-absent item; anything else — locked keychain, denied ACL, timeout —
+        # is ERROR, i.e. UNKNOWN, and must never arm the canary (r8 #1).
+        if out.returncode == 44 and file_absent:
+            _ACTIVE_SEAT_STATUS = "absent"
     except Exception:
         pass
     return None
@@ -1623,8 +1647,15 @@ def main():
         # act-without-kc shapes) and not when there is no active identity at all.
         global _SUBSTRATE_ALERT
         _SUBSTRATE_ALERT = None
-        if act and kc is None and not any(os.environ.get(v) for v in (
-                "ACCOUNT_BANK_FAKE_KEYCHAIN", "STUB_KC_FILE", "ACCOUNT_BANK_SECURITY_BIN")):
+        # (v110-r2, review findings 4+5) arm ONLY on a CONFIRMED double absence — file
+        # absent AND slot returned errSecItemNotFound. "cleared" (a blanked/empty file:
+        # the CLI's logged-out shape, which /login DOES fix) and "error" (locked/denied/
+        # torn: UNKNOWN, r8 #1) never arm. Epoch-gated to v1/shadow: under v2 the live
+        # credential lives in the pointer home's per-dir slot, not these legacy seats.
+        if (act and kc is None and _ACTIVE_SEAT_STATUS == "absent"
+                and epoch_state() in ("v1", "shadow")
+                and not any(os.environ.get(v) for v in (
+                "ACCOUNT_BANK_FAKE_KEYCHAIN", "STUB_KC_FILE", "ACCOUNT_BANK_SECURITY_BIN"))):
             _SUBSTRATE_ALERT = {
                 "active_email": act,
                 "since": int(now()),

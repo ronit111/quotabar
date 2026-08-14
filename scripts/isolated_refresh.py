@@ -438,19 +438,23 @@ def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60, claude_
             raw_new = None
             try:
                 import seedflow as _sf
-                for _p in dict.fromkeys((os.path.abspath(d), os.path.realpath(d))):
-                    _svc = _sf.config_slot_service(_p)
+                _cands = list(dict.fromkeys(
+                    _sf.config_slot_service(_p)
+                    for _p in (os.path.abspath(d), os.path.realpath(d))))
+                # (v110-r2, review finding 6) record EVERY candidate service name BEFORE
+                # reading: if the slot turns out present-but-malformed (or the read errors)
+                # this run quarantines, and the renamed dir would otherwise lose the only
+                # pointer to where a rotated credential may live. Service names, no secrets.
+                try:
+                    with open(os.path.join(d, ".seat-slot-service"), "w") as _mf:
+                        _mf.write("\n".join(_cands) + "\n")
+                except Exception:
+                    pass
+                for _svc in _cands:
                     _blob, _sraw, _st = _sf._sh_keychain_read(service=_svc)
                     if _st == "present" and isinstance(_blob, dict):
                         raw_new = _blob
                         seat_slot_service = _svc
-                        # travels with the dir if quarantined — names where the only
-                        # copy of a rotated credential may live (service name, no secret)
-                        try:
-                            with open(os.path.join(d, ".seat-slot-service"), "w") as _mf:
-                                _mf.write(_svc + "\n")
-                        except Exception:
-                            pass
                         break
             except Exception:
                 raw_new = None
@@ -748,12 +752,21 @@ def _cli_locked(bankfile, bank_dir=None):
         sys.exit(0)
 
     # No valid rotation past this point.
+    # (v110-r2, review finding 2) exit 3 is reserved for a CONFIRMED auth rejection.
+    # The offline refreshTokenExpiresAt stamp is NOT proof of death: bank records froze
+    # for two days in the 12-14 Aug outage, so a lapsed stamp routinely describes a
+    # token that is fine — and a genuinely dead refresh token earns the auth signature
+    # the moment a turn tries it, so the offline branch only ever ADDED false deaths.
+    if rr.auth_failed:
+        print("refresh FAILED (confirmed dead token: auth rejected by server)", file=sys.stderr)
+        sys.exit(3)
     rexp = creds.get("refreshTokenExpiresAt")
     refresh_tok_expired = isinstance(rexp, (int, float)) and not isinstance(rexp, bool) and rexp <= now_ms
-    if rr.auth_failed or refresh_tok_expired:
-        why = "auth rejected by server" if rr.auth_failed else "refresh token expired"
-        print(f"refresh FAILED (confirmed dead token: {why})", file=sys.stderr)
-        sys.exit(3)
+    if refresh_tok_expired:
+        print(f"refresh deferred (refresh-token expiry stamp lapsed OFFLINE — unverifiable "
+              f"without a confirmed rejection; transient: {rr.reason}); token unchanged",
+              file=sys.stderr)
+        sys.exit(6)
     still_expired = (new.get("expiresAt") or 0) <= now_ms
     if still_expired:
         # token unchanged & still expired, not auth-dead -> transient, retriable.

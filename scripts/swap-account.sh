@@ -174,23 +174,32 @@ fi
 # (knowingly accepts the revoked-mid-turn failure mode).
 if [ "${ACCOUNT_BANK_SKIP_TARGET_VERIFY:-0}" != "1" ]; then
   echo "Verifying $target's banked credential live before swapping…"
-  if ACCOUNT_BANK_HOLDS_LOCK=1 python3 "$HERE/isolated_refresh.py" "$tf" >/dev/null 2>&1; then
+  # (v110-r2, review finding 7) keep the verifier's stderr — those are isolated_refresh's
+  # OWN redacted status lines (never raw claude output), and on the odd exit codes they
+  # carry the recovery pointer (quarantine name, became-active warning) that a bare rc hides.
+  _pf_log="$(ACCOUNT_BANK_HOLDS_LOCK=1 python3 "$HERE/isolated_refresh.py" "$tf" 2>&1 >/dev/null)"
+  prc=$?
+  if [ $prc -eq 0 ]; then
     : # proved live end-to-end; any rotation is already committed to the bank record
   else
-    prc=$?
-    if [ $prc -eq 3 ]; then
-      ACCOUNT_BANK_EPOCH_SNAP="$EPOCH_SNAP" python3 "$HERE/_ping_marker.py" "$tf" "$(now_epoch)" needs-relogin || true
-      err "Aborting swap: $target's banked credential is DEAD (confirmed auth rejection)."
-      err "On a shared account this usually means someone else re-logged in and revoked"
-      err "the banked grant. Marked needs-relogin; the active account is untouched."
-      err "Revive: /login in Claude Code as $target, then: bash $HERE/bank-account.sh"
-    elif [ $prc -eq 6 ]; then
-      err "Aborting swap: could not verify $target's credential (transient failure —"
-      err "resolver/launch/timeout/network). Nothing changed; re-run the swap."
-    else
-      err "Aborting swap: $target's credential verification did not confirm a live token"
-      err "(isolated_refresh rc $prc). Nothing changed; the active account is untouched."
-    fi
+    case $prc in
+      3)
+        ACCOUNT_BANK_EPOCH_SNAP="$EPOCH_SNAP" python3 "$HERE/_ping_marker.py" "$tf" "$(now_epoch)" needs-relogin || true
+        err "Aborting swap: $target's banked credential is DEAD (confirmed auth rejection)."
+        err "On a shared account this usually means someone else re-logged in and revoked"
+        err "the banked grant. Marked needs-relogin; the active account is untouched."
+        err "Revive: /login in Claude Code as $target, then: bash $HERE/bank-account.sh" ;;
+      6)
+        err "Aborting swap: could not verify $target's credential (transient failure —"
+        err "resolver/launch/timeout/network). Nothing changed; re-run the swap." ;;
+      7|8)
+        err "Aborting swap: the verifier could not settle $target's credential state and"
+        err "PRESERVED recovery material (rc $prc). Its report follows; resolve before re-running:" ;;
+      *)
+        err "Aborting swap: $target's credential verification did not confirm a live token"
+        err "(isolated_refresh rc $prc). Nothing changed; the active account is untouched." ;;
+    esac
+    [ -n "$_pf_log" ] && printf '%s\n' "$_pf_log" | tail -3 | sed 's/^/  verifier: /' >&2
     exit 1
   fi
   # the verify may have ROTATED the banked creds; reload the blob we will commit
@@ -199,6 +208,19 @@ if [ "${ACCOUNT_BANK_SKIP_TARGET_VERIFY:-0}" != "1" ]; then
     exit 1
   }
   target_fp="$(printf '%s' "$target_blob" | _cred_fp)"
+  # (v110-r2, review finding 1) the pre-flight held this process for up to two 60s turn
+  # attempts — an eternity next to the commit guards' assumptions. Re-derive the active
+  # identity and re-capture the live credential so everything downstream (orphan guard,
+  # preimage, rotation guard, re-bank) works from a post-verification snapshot, and abort
+  # if the world moved: a /login mid-verification must never leave stale A-vars feeding
+  # the commit while the live seat now belongs to someone else.
+  _current_after="$(active_email)"
+  if [ "$_current_after" != "$current" ]; then
+    err "Aborting swap: the active account changed ('${current:-none}' -> '${_current_after:-none}')"
+    err "while the target was being verified. No change made; re-run the swap."
+    exit 3
+  fi
+  raw_current="$(cred_read)"
 fi
 
 # --- (r3 #3) a live keychain credential with NO identifiable active email is a

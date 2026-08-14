@@ -174,6 +174,10 @@ verify: bundle verify-bundle
 # scripts in place. Override LIVE_SCRIPTS_DIR for a non-default location.
 LIVE_SCRIPTS_DIR ?= $(HOME)/.claude/scripts/account-bank
 install-linked: install
+	@set -eu; \
+	for f in usage.py lib.sh bank_common.py swap-account.sh ping-account.sh isolated_refresh.py; do \
+	  test -f "$(LIVE_SCRIPTS_DIR)/$$f" || { echo "install-linked: $(LIVE_SCRIPTS_DIR) lacks $$f — refusing to replace the verified bundled runtime" >&2; exit 1; }; \
+	done
 	/bin/rm -rf "$(INSTALL_BUNDLE)/Contents/Resources/account-bank"
 	/bin/ln -s "$(LIVE_SCRIPTS_DIR)" "$(INSTALL_BUNDLE)/Contents/Resources/account-bank"
 	/usr/bin/codesign --force --sign - --timestamp=none "$(INSTALL_BUNDLE)"
