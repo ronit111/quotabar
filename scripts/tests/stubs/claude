@@ -43,6 +43,8 @@ PY
 
 case "$mode" in
   ok)          _rotate; echo "ok"; exit 0 ;;
+  migrate)     _rotate; rm -f "$cred"; echo "ok"; exit 0 ;;  # (v110) CLI migrated file->slot, deleted the file
+  migrate_authfail)  rm -f "$cred"; echo "Failed to authenticate: OAuth session expired and could not be refreshed"; exit 1 ;;  # (v110) auth death + file gone
   rotate_fail) _rotate; echo "rotated but the turn then failed"; exit 1 ;;  # rotation + nonzero
   metaonly)    _metaonly; echo "ok"; exit 0 ;;   # (r3 #15) plan-only change, NOT a rotation
   torn)        _rotate; printf 'not json at all {' > "$cred"; echo "ok"; exit 0 ;;  # (r3 #6) torn readback

@@ -213,6 +213,135 @@ def case_r4_5_journal_unavailable():
         shutil.rmtree(base, ignore_errors=True)
 
 
+ROT2 = {"accessToken": "ROT2", "refreshToken": "rROT2",
+        "expiresAt": 10_000_000_000_001, "subscriptionType": "max"}
+BLANK = {"accessToken": "", "refreshToken": "", "expiresAt": 0, "subscriptionType": "max"}
+
+
+class _FakeSeedflow:
+    """(v110) stands in for seedflow's slot primitives: refresh_via_config_dir imports
+    seedflow lazily, so an object in sys.modules['seedflow'] is what it gets."""
+    def __init__(self, oauth, status="present"):
+        self._oauth, self._status = oauth, status
+        self.deleted = []
+    def config_slot_service(self, p):
+        return "Claude Code-credentials-fake"
+    def _sh_keychain_read(self, service=None):
+        if self._status != "present":
+            return None, None, self._status
+        blob = {"claudeAiOauth": self._oauth}
+        return blob, json.dumps(blob), "present"
+    def _sh_keychain_delete(self, service):
+        self.deleted.append(service)
+        return True
+
+
+def _with_fake_seedflow(fake):
+    sys.modules["seedflow"] = fake
+
+
+def case_v110_migrated_rotation_via_slot():
+    # (v110) CLI >= 2.1.228: file credential migrated to the per-dir SLOT, file deleted.
+    # Pre-fix: readback_torn quarantine on EVERY healthy refresh. Post-fix: the rotation
+    # is harvested from the slot, committed normally, and the orphan slot is deleted.
+    base = tempfile.mkdtemp(prefix="rotflt110a-")
+    try:
+        _env(base)
+        json.dump({"oauthAccount": {"emailAddress": "other@x.com"}}, open(os.environ["CLAUDE_JSON"], "w"))
+        ir = _fresh_import()
+        fake = _FakeSeedflow(dict(ROT2))
+        _with_fake_seedflow(fake)
+        os.environ["STUB_CLAUDE_MODE"] = "migrate"
+        try:
+            rr = ir.refresh_via_config_dir(dict(OLD), email="p@x.com",
+                                           claude_json=os.environ["CLAUDE_JSON"],
+                                           bank_dir=os.environ["BANK_DIR"])
+        finally:
+            os.environ.pop("STUB_CLAUDE_MODE", None)
+        eq(True, rr.rotated, "migrated readback: rotation harvested from the slot (v110)")
+        eq("ok", rr.reason, "migrated readback commits normally, no quarantine (v110)")
+        eq("ROT2", rr.creds.get("accessToken"), "migrated readback returns the SLOT's creds (v110)")
+        eq(1, len(fake.deleted), "the orphan per-dir slot is deleted after harvest (v110)")
+    finally:
+        sys.modules.pop("seedflow", None)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def case_v110_blanked_slot_auth_death():
+    # (v110) blanked slot (the CLI's cleared-login stamp) + confirmed auth signature
+    # in the turn output -> DEAD (auth_rejected), bank creds unchanged.
+    base = tempfile.mkdtemp(prefix="rotflt110b-")
+    try:
+        _env(base)
+        json.dump({"oauthAccount": {"emailAddress": "other@x.com"}}, open(os.environ["CLAUDE_JSON"], "w"))
+        ir = _fresh_import()
+        fake = _FakeSeedflow(dict(BLANK))
+        _with_fake_seedflow(fake)
+        os.environ["STUB_CLAUDE_MODE"] = "migrate_authfail"
+        try:
+            rr = ir.refresh_via_config_dir(dict(OLD), email="p@x.com",
+                                           claude_json=os.environ["CLAUDE_JSON"],
+                                           bank_dir=os.environ["BANK_DIR"])
+        finally:
+            os.environ.pop("STUB_CLAUDE_MODE", None)
+        eq(True, rr.auth_failed, "blanked slot + auth signature -> confirmed death (v110)")
+        eq("auth_rejected", rr.reason, "reason auth_rejected (v110)")
+        eq("OLD", rr.creds.get("accessToken"), "bank creds unchanged on death (v110)")
+    finally:
+        sys.modules.pop("seedflow", None)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def case_v110_blanked_slot_no_auth_text():
+    # (v110) blanked slot WITHOUT a confirmed auth signature stays a distinct
+    # TRANSIENT (v105.1: the verdict is fail-closed) — bank untouched, retriable,
+    # and no quarantine (empty tokens are provably nothing to preserve).
+    base = tempfile.mkdtemp(prefix="rotflt110c-")
+    try:
+        _env(base)
+        json.dump({"oauthAccount": {"emailAddress": "other@x.com"}}, open(os.environ["CLAUDE_JSON"], "w"))
+        ir = _fresh_import()
+        fake = _FakeSeedflow(dict(BLANK))
+        _with_fake_seedflow(fake)
+        os.environ["STUB_CLAUDE_MODE"] = "migrate"
+        try:
+            rr = ir.refresh_via_config_dir(dict(OLD), email="p@x.com",
+                                           claude_json=os.environ["CLAUDE_JSON"],
+                                           bank_dir=os.environ["BANK_DIR"])
+        finally:
+            os.environ.pop("STUB_CLAUDE_MODE", None)
+        eq(False, rr.auth_failed, "blanked slot without auth text is NOT death (v110)")
+        eq("seat_blanked", rr.reason, "distinct seat_blanked reason (v110)")
+        eq(None, rr.quarantine, "nothing to preserve -> no quarantine (v110)")
+    finally:
+        sys.modules.pop("seedflow", None)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def case_v110_slot_absent_still_torn():
+    # (v110) file gone AND slot absent/unreadable: genuinely torn — the quarantine
+    # path is unchanged, and the (absent) slot is NOT deleted.
+    base = tempfile.mkdtemp(prefix="rotflt110d-")
+    try:
+        _env(base)
+        json.dump({"oauthAccount": {"emailAddress": "other@x.com"}}, open(os.environ["CLAUDE_JSON"], "w"))
+        ir = _fresh_import()
+        fake = _FakeSeedflow(None, status="absent")
+        _with_fake_seedflow(fake)
+        os.environ["STUB_CLAUDE_MODE"] = "migrate"
+        try:
+            rr = ir.refresh_via_config_dir(dict(OLD), email="p@x.com",
+                                           claude_json=os.environ["CLAUDE_JSON"],
+                                           bank_dir=os.environ["BANK_DIR"])
+        finally:
+            os.environ.pop("STUB_CLAUDE_MODE", None)
+        eq("readback_torn", rr.reason, "file gone + slot absent -> still torn (v110)")
+        eq(0, len(fake.deleted), "no slot delete when nothing was harvested (v110)")
+    finally:
+        sys.modules.pop("seedflow", None)
+        shutil.rmtree(base, ignore_errors=True)
+
+
 if __name__ == "__main__":
     case_15_metaonly()
     case_6_readback_torn()
@@ -221,5 +350,9 @@ if __name__ == "__main__":
     case_r4_3_parseable_torn()
     case_r4_4_quarantine_rename_fail_preserves()
     case_r4_5_journal_unavailable()
+    case_v110_migrated_rotation_via_slot()
+    case_v110_blanked_slot_auth_death()
+    case_v110_blanked_slot_no_auth_text()
+    case_v110_slot_absent_still_torn()
     print(f"  -- rotation_faults: {_pass} passed, {_fail} failed")
     sys.exit(1 if _fail else 0)

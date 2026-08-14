@@ -68,6 +68,7 @@ def resolve_codex_bin():
     return None
 TOTAL_DEADLINE = float(os.environ.get("ACCOUNT_BANK_TOTAL_DEADLINE", "45"))
 DEADLINE = float("inf")   # wall-clock run deadline; set in main(), read by process_claude (#28)
+_SUBSTRATE_ALERT = None   # (v110) set by main() when the active credential is unreadable via every known seat form
 LOCK_STALE_SECS = 300
 
 HOME = os.path.expanduser("~")
@@ -215,7 +216,35 @@ def resolve_security_bin():
     return None
 
 
+def _active_cred_file():
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(cfg, ".credentials.json")
+
+
 def read_keychain_blob():
+    """(v110) The ACTIVE credential, by the SAME seat precedence lib.sh's cred_read applies:
+    a present, non-empty $CLAUDE_CONFIG_DIR/.credentials.json wins (Claude Code >= 2.1.228
+    stores the active credential in the FILE and abandons the bare keychain slot — the
+    12-14 Aug 2026 outage), else the bare slot. Without the file read this poller ran every
+    cycle with kc=None: identity never bound, the G9-verified attribution never engaged, and
+    the active account rendered only through its bank record.
+
+    Hermetic guard (the v107 lesson, caught live by test_v101_confirm): when credential
+    reads are REDIRECTED for tests (fake keychain / stub kc file / security-bin override),
+    the real file must be ignored, or the suite escapes its sandbox and reads the owner's
+    live token. Under redirection only the (stubbed) slot path runs."""
+    redirected = any(os.environ.get(v) for v in
+                     ("ACCOUNT_BANK_FAKE_KEYCHAIN", "STUB_KC_FILE", "ACCOUNT_BANK_SECURITY_BIN"))
+    if not redirected:
+        try:
+            with open(_active_cred_file()) as f:
+                raw = f.read()
+            if raw.strip():
+                o = json.loads(raw).get("claudeAiOauth", {})
+                if isinstance(o, dict) and o:
+                    return o
+        except Exception:
+            pass
     sec = resolve_security_bin()
     if not sec:
         return None
@@ -1496,6 +1525,40 @@ def _health_surface():
             health["healed_plan_change"] = n
     except Exception:
         pass
+    # (v110) the credential-substrate canary: loud, named, and impossible to mistake
+    # for ordinary staleness. See main() where it is armed.
+    if _SUBSTRATE_ALERT:
+        health["credential_substrate"] = _SUBSTRATE_ALERT
+    # (v110) SCRIPTS-DRIFT canary. The app executes the copy inside its bundle
+    # (pickScriptsDir: bundle outranks everything but the env var), which is kept a
+    # SYMLINK to the maintained scripts so divergence is structurally impossible —
+    # but an app reinstall/upgrade resets the bundle to a real dir of release-frozen
+    # copies (this silently ran 12 files behind for a full day, 2026-08-14). When
+    # THIS process is executing from a real (non-symlinked) bundle dir that differs
+    # from the maintained copy, say so on the health pipe instead of letting fixes
+    # silently not apply.
+    try:
+        selfdir = os.path.dirname(os.path.abspath(__file__))
+        legacy = os.path.join(os.path.expanduser("~"), ".claude", "scripts", "account-bank")
+        if (".app/Contents/Resources" in selfdir
+                and os.path.realpath(selfdir) == selfdir
+                and os.path.isdir(legacy)
+                and os.path.realpath(legacy) != selfdir):
+            import filecmp
+            drift = [fn for fn in ("usage.py", "lib.sh", "swap-account.sh",
+                                   "ping-account.sh", "isolated_refresh.py")
+                     if os.path.isfile(os.path.join(legacy, fn))
+                     and not filecmp.cmp(os.path.join(selfdir, fn),
+                                         os.path.join(legacy, fn), shallow=False)]
+            if drift:
+                health["scripts_drift"] = {
+                    "running": selfdir, "maintained": legacy, "files": drift,
+                    "detail": ("the app bundle is executing release-frozen scripts that "
+                               "differ from the maintained copy (app upgrade reset the "
+                               "bundle symlink?) — re-link or re-sync the bundle"),
+                }
+    except Exception:
+        pass
     return health
 
 
@@ -1550,6 +1613,28 @@ def main():
         act, kc, identity_stable = _stable_identity()
         if not identity_stable:
             LOCKED = False   # do not attribute a moving keychain; read-only this run
+        # (v110) CREDENTIAL-SUBSTRATE CANARY. `act` present with NO readable credential
+        # through ANY known seat form (file + bare slot) is the signature of Claude Code
+        # moving credential storage again — exactly what happened 12-14 Aug 2026 (keychain
+        # slot -> $CLAUDE_CONFIG_DIR/.credentials.json, CLI 2.1.228-232), when the bank
+        # served stale-but-green cards for ~20h because nothing named the real cause.
+        # This must fail LOUD with the diagnosis, never blend into ordinary staleness.
+        # Deliberately NOT armed under test redirection (the stubs legitimately produce
+        # act-without-kc shapes) and not when there is no active identity at all.
+        global _SUBSTRATE_ALERT
+        _SUBSTRATE_ALERT = None
+        if act and kc is None and not any(os.environ.get(v) for v in (
+                "ACCOUNT_BANK_FAKE_KEYCHAIN", "STUB_KC_FILE", "ACCOUNT_BANK_SECURITY_BIN")):
+            _SUBSTRATE_ALERT = {
+                "active_email": act,
+                "since": int(now()),
+                "detail": ("active identity present but no credential readable via "
+                           "%s or the bare keychain slot — Claude Code may have moved "
+                           "credential storage again (a CLI update?); the bank's reads "
+                           "need updating, /login will NOT fix this" % _active_cred_file()),
+            }
+            sys.stderr.write("usage.py: CREDENTIAL SUBSTRATE ALERT: %s\n"
+                             % _SUBSTRATE_ALERT["detail"])
         # (r8 #8) the DISPLAY-active account. Under EPOCH v2 it is the pointer target, not
         # the keychain identity (`act`). `act` is still used below for KEYCHAIN QUOTA
         # ATTRIBUTION (whose live credential is in the slot) — that is a separate question

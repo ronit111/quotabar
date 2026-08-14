@@ -184,7 +184,10 @@ assert_contains "Active account is now: b@x.com" "$out" \
   "(#7) the committed switch is still reported — it really did happen"
 assert_contains "COMMITTED, but its recovery journal could not be cleared" "$out" \
   "(#7) ...and the cleanup failure is stated plainly"
-assert_contains '"accessToken":"B"' "$(kc_now)" "(#7) the keychain really holds the target"
+# (v110) the pre-flight rotates the target's banked token before the commit, so the
+# keychain must match the POST-ROTATION bank record, not the literal pre-swap token.
+b_at="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$BANK_DIR/b@x.com.json")"
+assert_contains "\"accessToken\":\"$b_at\"" "$(kc_now)" "(#7) the keychain really holds the target (bank-consistent)"
 assert_eq "b@x.com" "$(claude_json_email)" "(#7) the metadata really names the target"
 rm -rf "$(dirname "$COPY")"
 

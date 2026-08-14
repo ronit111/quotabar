@@ -11,7 +11,12 @@ set_active a@x.com A "" "$FUT" max claude_max
 bank_record b@x.com B "" "$FUT" pro claude_pro
 /bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
 assert_eq 0 "$rc" "happy swap exits 0"
-assert_contains '"accessToken":"B"' "$(kc_now)" "keychain now holds B"
+# (v110) the liveness pre-flight ROTATES the parked target's token and commits it to
+# the bank before the keychain write; the keychain must hold that POST-ROTATION
+# credential, byte-consistent with the bank record. Asserting the literal pre-swap
+# token "B" would assert that a SPENT token was committed.
+b_at="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$BANK_DIR/b@x.com.json")"
+assert_contains "\"accessToken\":\"$b_at\"" "$(kc_now)" "keychain holds b's post-verify credential (bank-consistent)"
 assert_eq "b@x.com" "$(claude_json_email)" "claude.json now names b@x.com"
 assert_file_present "$BANK_DIR/a@x.com.json" "outgoing a@x.com re-banked"
 assert_file_absent "$BANK_DIR/.swap-journal.json" "journal cleared on clean commit"
@@ -71,5 +76,40 @@ chmod 700 "$rod"
 assert_ne 0 "$rc" "metadata-write failure -> swap nonzero"
 assert_contains '"accessToken":"A"' "$(kc_now)" "keychain ROLLED BACK to A after metadata failure"
 assert_file_absent "$BANK_DIR/.swap-journal.json" "journal cleared after successful rollback"
+
+# ---- (v110) pre-flight: target confirmed DEAD -> abort, active untouched ----
+# The zzazipyro class: a shared account's banked grant revoked by a co-user's
+# /login while every offline field still reads fresh. The swap must discover this
+# BEFORE the keychain write, mark needs-relogin, and leave the active login alone.
+new_env swap_preflight_dead >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B "" "$FUT" pro claude_pro
+before="$(kc_now)"
+STUB_CLAUDE_MODE=authfail /bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_ne 0 "$rc" "swap aborts when the target credential is confirmed dead (v110)"
+assert_eq "$before" "$(kc_now)" "keychain untouched after dead-target abort"
+assert_eq "a@x.com" "$(claude_json_email)" "active identity unchanged after dead-target abort"
+assert_contains 'needs-relogin' "$(cat "$BANK_DIR/b@x.com.json")" "dead target marked needs-relogin"
+
+# ---- (v110) pre-flight: TRANSIENT failure -> abort retriable, nothing marked dead ----
+new_env swap_preflight_transient >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B "" "$FUT" pro claude_pro
+before="$(kc_now)"
+STUB_CLAUDE_MODE=forbidden /bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_ne 0 "$rc" "swap aborts on transient verification failure (403 stays ambiguous)"
+assert_eq "$before" "$(kc_now)" "keychain untouched after transient abort"
+case "$(cat "$BANK_DIR/b@x.com.json")" in
+  *needs-relogin*) fail "transient failure must NOT mark the target needs-relogin" ;;
+  *) pass "transient failure leaves the target retriable (not marked dead)" ;;
+esac
+
+# ---- (v110) escape hatch: SKIP_TARGET_VERIFY commits the banked blob directly ----
+new_env swap_preflight_skip >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+bank_record b@x.com B "" "$FUT" pro claude_pro
+ACCOUNT_BANK_SKIP_TARGET_VERIFY=1 STUB_CLAUDE_MODE=authfail /bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_eq 0 "$rc" "skip-verify swap proceeds without the pre-flight"
+assert_contains '"accessToken":"B"' "$(kc_now)" "skip-verify commits the banked blob verbatim"
 
 finish "swap"

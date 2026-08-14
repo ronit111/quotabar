@@ -368,6 +368,7 @@ def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60, claude_
     d = tempfile.mkdtemp(prefix="acctbank-cfg-")
     os.chmod(d, 0o700)
     preserved = False   # (r3 #6/#7) set when we quarantine d instead of deleting it
+    seat_slot_service = None   # (v110) set when the readback came from the per-dir SLOT
     try:
         credpath = os.path.join(d, ".credentials.json")
         fd = os.open(credpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -427,6 +428,34 @@ def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60, claude_
         readback_failed = False
         try:
             raw_new = json.load(open(credpath))
+        except FileNotFoundError:
+            # (v110, live 2026-08-14 on CLI 2.1.232) Claude Code >= 2.1.228 treats a config
+            # dir's FILE credential as a migration source: it moves it into the per-config-dir
+            # keychain slot and deletes the file (the G5c behavior, previously seen only on
+            # pinned homes). A missing file after the turn is therefore the seat MOVING, not
+            # a torn write — read the slot before declaring the readback torn. The service
+            # name hashes the literal path string, so try both spellings of the temp dir.
+            raw_new = None
+            try:
+                import seedflow as _sf
+                for _p in dict.fromkeys((os.path.abspath(d), os.path.realpath(d))):
+                    _svc = _sf.config_slot_service(_p)
+                    _blob, _sraw, _st = _sf._sh_keychain_read(service=_svc)
+                    if _st == "present" and isinstance(_blob, dict):
+                        raw_new = _blob
+                        seat_slot_service = _svc
+                        # travels with the dir if quarantined — names where the only
+                        # copy of a rotated credential may live (service name, no secret)
+                        try:
+                            with open(os.path.join(d, ".seat-slot-service"), "w") as _mf:
+                                _mf.write(_svc + "\n")
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                raw_new = None
+            if raw_new is None:
+                readback_failed = True
         except Exception:
             readback_failed = True
             raw_new = None
@@ -438,6 +467,22 @@ def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60, claude_
                                  False, "readback_torn", q)
 
         new = raw_new.get("claudeAiOauth") if isinstance(raw_new, dict) else None
+        # (v110) a BLANKED slot — parseable blob, empty accessToken AND refreshToken — is the
+        # new CLI's cleared-login stamp (observed live 2026-08-14: three blanked orphan slots
+        # from one poll's refresh turns, byte-shape identical to a dead pinned home's seat).
+        # There is provably NO credential here to preserve (the tokens are empty strings and
+        # the predecessor is still in the bank), so quarantining would only accumulate noise.
+        # With a confirmed auth signature in the turn's output this is a DEAD token; without
+        # one it stays a distinct transient (bank untouched, retriable) — fail-closed on the
+        # verdict, exactly the v105.1 doctrine.
+        if (seat_slot_service and isinstance(new, dict)
+                and not str(new.get("accessToken") or "").strip()
+                and not str(new.get("refreshToken") or "").strip()):
+            if _is_auth_death(stderr_accum):
+                return RefreshResult(creds, False, cli_ok, None, True, "auth_rejected")
+            return RefreshResult(creds, False, cli_ok,
+                                 "seat blanked by the CLI without a confirmed auth rejection",
+                                 False, "seat_blanked", None)
         if not isinstance(new, dict) or not _valid_blob(new):
             # Torn/empty/missing/malformed readback. We wrote {"claudeAiOauth": creds}
             # and did NOT read back a schema-valid oauth object — a rotation may or
@@ -530,6 +575,18 @@ def refresh_via_config_dir(creds, email=None, model="haiku", timeout=60, claude_
         # (r3 #6/#7) never delete a config dir we deliberately quarantined.
         if not preserved:
             shutil.rmtree(d, ignore_errors=True)
+            # (v110) the CLI minted a per-dir keychain slot for this now-deleted temp dir;
+            # once the readback is harvested (banked/journaled by the caller's path) the
+            # slot is garbage that would otherwise accumulate one orphan per refresh turn
+            # (184 observed 2026-08-14). Best-effort; a survivor is only an orphan.
+            # Quarantined dirs KEEP their slot — it may hold the only rotated credential —
+            # and carry its service name in .seat-slot-service.
+            if seat_slot_service:
+                try:
+                    import seedflow as _sf
+                    _sf._sh_keychain_delete(seat_slot_service)
+                except Exception:
+                    pass
 
 
 def _cli():

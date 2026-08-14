@@ -75,7 +75,12 @@ tf="$(bank_file_for "$target")" || { err "swap: refusing unsafe target email '$t
 # exactly the same schema as every other reader — no weaker inline checks that
 # accept an unknown status or a top-level email mismatch. Emits the compact
 # keychain blob on stdout if valid; non-zero + reason otherwise.
-target_blob="$(python3 - "$HERE" "$tf" "$target" <<'PY'
+# (v110) A function because it runs twice: once here (fail fast on a record that
+# is invalid/needs-relogin BEFORE burning a verification turn), and once after the
+# liveness pre-flight (whose refresh may have ROTATED the banked creds — the blob
+# we commit must be the post-rotation one, or we would write a spent token).
+_load_valid_target_blob() {
+python3 - "$HERE" "$tf" "$target" <<'PY'
 import sys, json
 sys.path.insert(0, sys.argv[1])
 import bank_common
@@ -95,7 +100,8 @@ if not bank_common.valid_oauth(br.oauth):
     sys.stderr.write("bank creds incomplete (need access+refresh token + numeric expiresAt)\n"); sys.exit(1)
 sys.stdout.write(json.dumps({"claudeAiOauth": br.oauth}, separators=(",", ":")))
 PY
-)"
+}
+target_blob="$(_load_valid_target_blob)"
 vrc=$?
 if [ $vrc -ne 0 ]; then
   case $vrc in
@@ -148,6 +154,51 @@ if [ -n "$current" ] && [ "$current" = "$target" ]; then
   err "swap: $target is already active, but the live keychain was unreadable; could"
   err "NOT refresh its bank copy. Keychain untouched; re-run once the login settles."
   exit 1
+fi
+
+# --- (v110) TARGET LIVENESS PRE-FLIGHT: schema-valid is not alive -------------
+# On a SHARED account a co-user's /login revokes the banked grant server-side
+# while every offline field (STATUS, refreshTokenExpiresAt) still reads fresh —
+# nothing local can distinguish revoked from refreshable (zzazipyro 2026-08-14:
+# the swap committed cleanly, then the first live request died on "401 · OAuth
+# token has been revoked" and killed the owner's running turn). So prove the
+# target BEFORE any mutation, with the SAME ceremony parked pings use:
+# isolated_refresh.py runs one real turn in a throwaway config dir on the banked
+# creds (end-to-end proof, not an offline read), commits any rotation to the bank
+# record itself, and classifies failure on the hardened exit-code contract —
+# 3 = CONFIRMED dead (mark needs-relogin, exactly as ping does), 6 = transient
+# (token untouched, retriable). Every failure aborts BEFORE the keychain is
+# touched, so the currently-active account keeps working. The turn this costs
+# also starts the target's 5h window — which a swap wants anyway.
+# Escape hatch for offline/emergency swaps: ACCOUNT_BANK_SKIP_TARGET_VERIFY=1
+# (knowingly accepts the revoked-mid-turn failure mode).
+if [ "${ACCOUNT_BANK_SKIP_TARGET_VERIFY:-0}" != "1" ]; then
+  echo "Verifying $target's banked credential live before swapping…"
+  if ACCOUNT_BANK_HOLDS_LOCK=1 python3 "$HERE/isolated_refresh.py" "$tf" >/dev/null 2>&1; then
+    : # proved live end-to-end; any rotation is already committed to the bank record
+  else
+    prc=$?
+    if [ $prc -eq 3 ]; then
+      ACCOUNT_BANK_EPOCH_SNAP="$EPOCH_SNAP" python3 "$HERE/_ping_marker.py" "$tf" "$(now_epoch)" needs-relogin || true
+      err "Aborting swap: $target's banked credential is DEAD (confirmed auth rejection)."
+      err "On a shared account this usually means someone else re-logged in and revoked"
+      err "the banked grant. Marked needs-relogin; the active account is untouched."
+      err "Revive: /login in Claude Code as $target, then: bash $HERE/bank-account.sh"
+    elif [ $prc -eq 6 ]; then
+      err "Aborting swap: could not verify $target's credential (transient failure —"
+      err "resolver/launch/timeout/network). Nothing changed; re-run the swap."
+    else
+      err "Aborting swap: $target's credential verification did not confirm a live token"
+      err "(isolated_refresh rc $prc). Nothing changed; the active account is untouched."
+    fi
+    exit 1
+  fi
+  # the verify may have ROTATED the banked creds; reload the blob we will commit
+  target_blob="$(_load_valid_target_blob)" || {
+    err "Aborting swap: $target's record failed re-validation after the liveness check."
+    exit 1
+  }
+  target_fp="$(printf '%s' "$target_blob" | _cred_fp)"
 fi
 
 # --- (r3 #3) a live keychain credential with NO identifiable active email is a
