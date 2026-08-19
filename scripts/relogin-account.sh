@@ -26,6 +26,18 @@
 # The bank lock is deliberately NEVER held here — step 2 waits on a human for minutes,
 # and `bank-account.sh` takes the lock itself for the seconds it actually needs it.
 #
+# (r2) Two things the first cut got wrong, both about what happens when this does NOT go
+# to plan. A pending-relogin JOURNAL entry is written before the Terminal opens and
+# cleared only after cleanup, because a login completed after we gave up would otherwise
+# strand a live credential in a keychain slot whose config dir no longer exists — nothing
+# could ever recompute that service name. Every abandoning path now TERMINATES the login
+# (the launcher records its own pid) before deleting anything, every entry runs a sweep of
+# stale journal entries first, and a second Re-bank while one is pending is refused
+# instead of opening a second window. And the banked record is ASSERTED to hold the
+# credential this login captured — `bank-account.sh` re-reads the credential itself
+# through cred_read, whose shape gate can silently fall back to the active account's
+# default slot (see relogin_capture.py). A mismatch restores the pre-bank record.
+#
 # Invocation: with no tty (QuotaBar's Re-bank routes here) it DETACHES — the Terminal
 # window is the owner's interface from that point and the app's action queue must not
 # sit blocked behind a human. The detached run reports through a macOS notification and
@@ -61,12 +73,38 @@ case "$mode" in
   *) err "relogin-account.sh: unknown option '$mode'"; exit 2 ;;
 esac
 
+# Reap anything a previous run left behind (killed, rebooted, timed out mid-login) BEFORE
+# deciding whether one is pending — otherwise a dead entry would refuse every future
+# attempt. MAX_AGE bounds the pid-liveness test so a recycled pid cannot pin an entry.
+RELOGIN_MAX_AGE=$(( RELOGIN_TIMEOUT + 600 ))
+# Not in the detached child: its parent's claim may still carry the PARENT's pid, and the
+# parent has by then exited — the child would reap the very entry it is about to fill in.
+if [ -z "${ACCOUNT_BANK_RELOGIN_CLAIMED:-}" ]; then
+  python3 "$HERE/relogin_capture.py" journal-sweep "$BANK_DIR" "$RELOGIN_MAX_AGE" >/dev/null 2>&1 || true
+fi
+
+# One re-login per account at a time. QuotaBar cannot enforce this — its per-card busy
+# guard clears the moment the flow detaches — so the claim lives here, and it is taken in
+# whichever process runs FIRST (the detaching parent, or a --sync run started by hand),
+# never in the detached child, where two rapid clicks could both get past it.
+if [ -z "${ACCOUNT_BANK_RELOGIN_CLAIMED:-}" ]; then
+  claim_out="$(python3 "$HERE/relogin_capture.py" journal-claim "$BANK_DIR" "$email" "$$" "$RELOGIN_MAX_AGE")"
+  if [ $? -ne 0 ]; then
+    err "Re-login refused: $claim_out"
+    err "Finish (or close) the login window already open for $email, then try again."
+    exit 9
+  fi
+fi
+
 if [ "$detach" = "1" ]; then
   LOG="$BANK_DIR/.relogin.log"
   ( umask 077; : >>"$LOG" ) || true
   chmod 600 "$LOG" 2>/dev/null || true
   # nohup so the app's process-group teardown cannot take the login window with it.
-  nohup /bin/bash "$HERE/relogin-account.sh" "$email" --sync >>"$LOG" 2>&1 &
+  ACCOUNT_BANK_RELOGIN_CLAIMED=1 nohup /bin/bash "$HERE/relogin-account.sh" "$email" --sync >>"$LOG" 2>&1 &
+  # hand ownership of the claim to the child, so the guard tracks the process that is
+  # actually running the login rather than this one, which is about to exit
+  python3 "$HERE/relogin_capture.py" journal-update "$BANK_DIR" "$email" owner_pid "$!" >/dev/null 2>&1 || true
   # The ONE machine-readable line in this flow: QuotaBar reads it to caption the card
   # "Login window opened" instead of claiming the account was re-banked (RebankSummary).
   echo "QUOTABAR_STATUS: relogin-started"
@@ -74,6 +112,11 @@ if [ "$detach" = "1" ]; then
   echo "Banking finishes automatically; you'll get a notification. Log: $LOG"
   exit 0
 fi
+
+# From here this process owns the claim: stamp our pid so a concurrent sweep sees a live
+# entry, and make sure an early exit releases it rather than blocking the next attempt.
+python3 "$HERE/relogin_capture.py" journal-update "$BANK_DIR" "$email" owner_pid "$$" >/dev/null 2>&1 || true
+trap 'python3 "$HERE/relogin_capture.py" journal-release "$BANK_DIR" "$email" >/dev/null 2>&1 || true' EXIT
 
 echo "[$(now_iso)] relogin-account.sh $email — starting."
 
@@ -89,13 +132,21 @@ fi
 CFG="$(umask 077; mktemp -d "$BANK_DIR/.relogin.XXXXXXXX")" || {
   err "Re-login aborted: could not create a throwaway config dir under $BANK_DIR."; exit 6; }
 chmod 700 "$CFG"
+# The journal must know the dir BEFORE the login can write anything into it. From here on,
+# however this process dies, the slot spellings stay recomputable.
+python3 "$HERE/relogin_capture.py" journal-update "$BANK_DIR" "$email" config_dir "$CFG" >/dev/null 2>&1 || true
 
-_cleanup() {
-  # deletes the dir AND every per-config-dir keychain slot its path spellings produced
+# Order matters: kill the login FIRST, then delete. Deleting the config dir while the
+# login is still in flight is precisely how a credential gets stranded in an
+# unrecomputable slot — the OAuth completes afterwards and the CLI writes to a service
+# name derived from a path that no longer exists.
+_finish() {
+  python3 "$HERE/relogin_capture.py" journal-kill "$BANK_DIR" "$email" >/dev/null 2>&1 || true
   python3 "$HERE/relogin_capture.py" cleanup "$CFG" >/dev/null 2>&1 || true
+  python3 "$HERE/relogin_capture.py" journal-release "$BANK_DIR" "$email" >/dev/null 2>&1 || true
 }
-trap '_cleanup' EXIT
-trap '_cleanup; exit 130' INT TERM HUP PIPE
+trap '_finish' EXIT
+trap '_finish; exit 130' INT TERM HUP PIPE
 
 # --- the login window --------------------------------------------------------
 LOGIN_SH="$CFG/login-here.sh"
@@ -113,6 +164,10 @@ UARGS="$(_auth_env_u_args)"     # strip inherited alt-auth/proxy vars from the C
   printf 'echo "  3. That is all — banking finishes on its own. You can close"\n'
   printf 'echo "     this window once the login says it succeeded."\n'
   printf 'echo ""\n'
+  # $$ before the exec IS the claude process's pid (exec replaces this shell in place),
+  # and it lives in the config dir so it survives any crash between here and a journal
+  # write — the journal only has to point at the directory.
+  printf 'echo $$ > %q\n' "$CFG/login.pid"
   printf 'CLAUDE_CONFIG_DIR=%q exec /usr/bin/env%s %q\n' "$CFG" "$UARGS" "$CLAUDE"
 } >"$LOGIN_SH"
 chmod 700 "$LOGIN_SH"
@@ -124,18 +179,24 @@ if [ -n "${ACCOUNT_BANK_RELOGIN_TERMINAL_CMD:-}" ]; then
   # shell silently dropping them: launcher path, config dir, target email.)
   /bin/bash -c "$ACCOUNT_BANK_RELOGIN_TERMINAL_CMD \"\$@\"" _relogin "$LOGIN_SH" "$CFG" "$email" &
 else
-  /usr/bin/osascript - "$LOGIN_SH" >/dev/null 2>&1 <<'OSA'
+  # The window id comes back so an abandoned flow can close the window it opened rather
+  # than leaving a dead shell on screen.
+  _osa="${ACCOUNT_BANK_OSASCRIPT_BIN:-/usr/bin/osascript}"
+  _win="$("$_osa" - "$LOGIN_SH" 2>/dev/null <<'OSA'
 on run argv
   tell application "Terminal"
     activate
     do script ("/bin/bash " & quoted form of (item 1 of argv))
+    return id of front window
   end tell
 end run
 OSA
+)"
   if [ $? -ne 0 ]; then
     err "Re-login aborted: could not open a Terminal window for the login."
     exit 6
   fi
+  python3 "$HERE/relogin_capture.py" journal-update "$BANK_DIR" "$email" term_window "$_win" >/dev/null 2>&1 || true
 fi
 if [ "$RELOGIN_TIMEOUT" -ge 60 ]; then _budget="$((RELOGIN_TIMEOUT / 60))m"; else _budget="${RELOGIN_TIMEOUT}s"; fi
 echo "Waiting up to $_budget for the login to complete (pick $email)…"
@@ -158,12 +219,36 @@ case "$wrc" in
 esac
 
 # --- the real banking ceremony, pinned to the captured profile ---------------
+# Snapshot the record first: if the assertion below finds the wrong credential got
+# banked, this is what goes back. (No snapshot file == there was no record, and the
+# correct restoration is to remove the one this run created.)
+_rec="$(bank_file_for "$email")"
+_snap=""
+if [ -f "$_rec" ]; then
+  _snap="$CFG/pre-bank.json"
+  ( umask 077; cp "$_rec" "$_snap" ) || _snap=""
+fi
+
 if ! BANK_DIR="$BANK_DIR" CLAUDE_CONFIG_DIR="$CFG" CLAUDE_JSON="$CFG/.claude.json" \
      /bin/bash "$HERE/bank-account.sh"; then
   err "Re-login captured a verified credential for $email but bank-account.sh refused it."
   err "The credential is NOT lost by that: re-run this once whatever it reported is resolved."
   python3 "$HERE/notify.py" say "QuotaBar — banking refused" "$email logged in but the bank ceremony refused; see the log." >/dev/null 2>&1 || true
   exit 1
+fi
+
+# --- assert we banked what we captured ---------------------------------------
+# bank-account.sh re-reads "the live credential" itself; it does not take ours. cred_read
+# accepts a config dir's file only when the raw text carries "claudeAiOauth"/"oauth", so a
+# flat blob falls through to the BARE default slot — the ACTIVE account — and every
+# downstream identity check still agrees, because the email comes from the target's own
+# metadata. This is the one check that would notice, and it is shape-agnostic on purpose.
+_verify="$(python3 "$HERE/relogin_capture.py" verify-banked "$CFG" "$_rec" "$_snap")"
+if [ $? -ne 0 ]; then
+  err "Re-login FAILED the banked-credential check for $email: $_verify"
+  err "Nothing healthy was left behind — the record is back to its pre-login state."
+  python3 "$HERE/notify.py" say "QuotaBar — $email NOT re-banked" "The banked credential did not match the login; the record was restored." >/dev/null 2>&1 || true
+  exit 8
 fi
 
 # --- heal the card -----------------------------------------------------------

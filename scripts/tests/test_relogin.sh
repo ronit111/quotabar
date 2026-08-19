@@ -12,6 +12,8 @@
 #   ACCOUNT_BANK_FAKE_KEYCHAIN         per-service slot files (seedflow-native), so slot
 #                                      creation/deletion is observable on disk.
 #   ACCOUNT_BANK_NOTIFY_BIN            a recording stub instead of osascript.
+#   ACCOUNT_BANK_OSASCRIPT_BIN         /usr/bin/true, so no window-close can ever reach
+#                                      the real Terminal.
 source "$(dirname "${BASH_SOURCE[0]}")/testlib.sh"
 
 RELOGIN="$AB_DIR/relogin-account.sh"
@@ -23,16 +25,36 @@ OTHER="active@example.com"
 
 # A fake "login completed" terminal: $1 launcher, $2 config dir, $3 email. Writes the
 # credential into the config dir's FILE seat and the metadata the CLI would write.
-_make_terminal_stub() {  # <path> <email-to-write> [delay]
-  local out="$1" em="$2" delay="${3:-0}"
+_make_terminal_stub() {  # <path> <email-to-write> [token] [delay]
+  local out="$1" em="$2" tok="${3:-fresh-at}" delay="${4:-0}"
   cat > "$out" <<STUB
 #!/bin/bash
+# witness what the journal held at the moment the "Terminal" was opened — the whole
+# point of the journal is that it is already on disk by now
+cp "$BANK_DIR/.relogin-journal.json" "$BANK_DIR/../journal-at-open.json" 2>/dev/null
 sleep ${delay}
 cfg="\$2"
-printf '{"claudeAiOauth":{"accessToken":"fresh-at","refreshToken":"fresh-rt","expiresAt":$FUT,"subscriptionType":"max"}}' > "\$cfg/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"$tok","refreshToken":"r-$tok","expiresAt":$FUT,"subscriptionType":"max"}}' > "\$cfg/.credentials.json"
 printf '{"oauthAccount":{"emailAddress":"%s","organizationType":"claude_max"}}' "$em" > "\$cfg/.claude.json"
 STUB
   chmod +x "$out"
+}
+
+# A "login" that opens and then just sits there, the way a real one does while the human
+# is in the browser. Records its pid exactly as the generated launcher does.
+_make_hanging_terminal_stub() {  # <path>
+  cat > "$1" <<'STUB'
+#!/bin/bash
+cfg="$2"
+# Drop the inherited stdout FIRST. A real Terminal-open returns immediately; this stub
+# lingers, and if it kept the caller's capture pipe open the test would measure pipe
+# closure instead of what it is actually about — whether the login process gets killed.
+exec >/dev/null 2>&1
+sleep 600 &
+echo $! > "$cfg/login.pid"
+wait
+STUB
+  chmod +x "$1"
 }
 
 _notify_stub() {  # <path> <record-file>
@@ -56,6 +78,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 set_active "$OTHER" "at-other"
 bank_record "$OTHER" "at-other"
 bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
@@ -84,6 +107,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 set_active "$OTHER" "at-other"
 bank_record "$OTHER" "stale-at"
 bank_record "$TARGET" "target-at"
@@ -116,6 +140,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 set_active "$OTHER" "at-other"
 bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
 _make_terminal_stub "$base/term.sh" "somebody-else@example.com"
@@ -142,6 +167,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 set_active "$OTHER" "at-other"
 bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
 _make_terminal_stub "$base/term.sh" "$TARGET"
@@ -160,6 +186,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 set_active "$OTHER" "at-other"
 bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
 _make_terminal_stub "$base/term.sh" "$TARGET"
@@ -181,6 +208,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 set_active "$OTHER" "at-other"
 bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
 out="$(ACCOUNT_BANK_RELOGIN_DETACH=0 ACCOUNT_BANK_RELOGIN_TIMEOUT=4 \
@@ -194,6 +222,12 @@ assert_eq "0" "$leftover" "the throwaway config dir is cleaned up after a timeou
 
 # ---------------------------------------------------------------------------
 # 5. SUCCESS — capture, verify, bank, clear the breaker
+#
+# Both sides hold the SAME token here, deliberately: in the sandbox `cred_read` is
+# force-redirected to the stub keychain (the hermetic guard), so bank-account.sh can
+# never actually read the config dir's file and no test can prove WHICH source was
+# banked by watching this path. That attribution is what test 5c covers, by making the
+# two differ and requiring the flow to notice. This test covers everything else.
 # ---------------------------------------------------------------------------
 new_env relogin-success >/dev/null
 base="$(dirname "$BANK_DIR")"
@@ -203,7 +237,11 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
-set_active "$TARGET" "fresh-at" "fresh-rt" "$FUT" "max"    # the login landed on the seat
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+# The stub keychain must carry the SAME credential the "login" writes into the config
+# dir (refresh token included — the fingerprint covers accessToken+refreshToken+
+# expiresAt), because the sandbox's redirected cred_read is what bank-account.sh reads.
+set_active "$TARGET" "fresh-at" "r-fresh-at" "$FUT" "max"
 bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
 python3 - "$BANK_DIR/$TARGET.json" <<'PY'
 import json, sys
@@ -233,6 +271,154 @@ leftover="$(find "$BANK_DIR" -maxdepth 1 -name '.relogin.*' -type d 2>/dev/null 
 assert_eq "0" "$leftover" "the throwaway config dir is deleted after a successful bank"
 
 # ---------------------------------------------------------------------------
+# 5c. THE BANKED-CREDENTIAL ASSERTION (r2 finding 1)
+#
+# The bug: bank-account.sh re-reads the credential itself, and cred_read accepts a config
+# dir's file only when the raw text carries "claudeAiOauth"/"oauth" — a FLAT blob falls
+# through to the BARE default slot, i.e. the ACTIVE account, and every downstream check
+# still agrees because the email comes from the target's own metadata. Here the captured
+# credential and the default slot simply differ, which is that bug's exact signature: the
+# flow must NOT report success, and must not leave another account's tokens banked under
+# this email.
+# ---------------------------------------------------------------------------
+new_env relogin-fpmismatch >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
+export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
+export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+set_active "$TARGET" "DEFAULT-SLOT-TOKEN"          # what cred_read will actually return
+bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
+_make_terminal_stub "$base/term.sh" "$TARGET" "CAPTURED-FROM-LOGIN"
+NOTELOG="$base/notify.log"; _notify_stub "$base/notify-stub" "$NOTELOG"
+
+out="$(ACCOUNT_BANK_RELOGIN_DETACH=0 ACCOUNT_BANK_RELOGIN_TIMEOUT=20 \
+       ACCOUNT_BANK_RELOGIN_TERMINAL_CMD="/bin/bash $base/term.sh" \
+       ACCOUNT_BANK_FAKE_PROFILE="RESOLVED $TARGET" \
+       ACCOUNT_BANK_NOTIFY_BIN="$base/notify-stub" \
+       /bin/bash "$RELOGIN" "$TARGET" --sync 2>&1)"; rc=$?
+assert_eq "8" "$rc" "banking a credential other than the captured one is a HARD failure"
+assert_contains "MISMATCH" "$out" "the failure names the mismatch"
+assert_ne "Re-login complete" "$out" "a mismatch never reports completion"
+assert_eq "old-at" "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['claudeAiOauth']['accessToken'])" "$BANK_DIR/$TARGET.json")" \
+  "the pre-login record is restored — the wrong credential is NOT left banked"
+assert_eq "needs-relogin" "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['status'])" "$BANK_DIR/$TARGET.json")" \
+  "the restored record does not read as healthy"
+leftover="$(find "$BANK_DIR" -maxdepth 1 -name '.relogin.*' -type d 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "0" "$leftover" "the throwaway config dir is cleaned up after a mismatch"
+
+# and with no prior record at all, the correct restoration is to remove what we wrote
+new_env relogin-fpmismatch-norec >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
+export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
+export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+set_active "$TARGET" "DEFAULT-SLOT-TOKEN"
+_make_terminal_stub "$base/term.sh" "$TARGET" "CAPTURED-FROM-LOGIN"
+out="$(ACCOUNT_BANK_RELOGIN_DETACH=0 ACCOUNT_BANK_RELOGIN_TIMEOUT=20 \
+       ACCOUNT_BANK_RELOGIN_TERMINAL_CMD="/bin/bash $base/term.sh" \
+       ACCOUNT_BANK_FAKE_PROFILE="RESOLVED $TARGET" \
+       /bin/bash "$RELOGIN" "$TARGET" --sync 2>&1)"; rc=$?
+assert_eq "8" "$rc" "the assertion fires with no prior record too"
+assert_file_absent "$BANK_DIR/$TARGET.json" "a mismatched first-ever bank leaves no record behind"
+
+# ---------------------------------------------------------------------------
+# 5d. THE PENDING JOURNAL (r2 finding 2)
+# ---------------------------------------------------------------------------
+new_env relogin-journal >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
+export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
+export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+set_active "$OTHER" "at-other"
+bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
+_make_terminal_stub "$base/term.sh" "$TARGET"
+rm -f "$base/journal-at-open.json"
+
+out="$(ACCOUNT_BANK_RELOGIN_DETACH=0 ACCOUNT_BANK_RELOGIN_TIMEOUT=20 \
+       ACCOUNT_BANK_RELOGIN_TERMINAL_CMD="/bin/bash $base/term.sh" \
+       ACCOUNT_BANK_FAKE_PROFILE="RESOLVED $TARGET" \
+       /bin/bash "$RELOGIN" "$TARGET" --sync 2>&1)"
+
+# the journal existed, and already pointed at the config dir, BEFORE the login could run
+assert_file_present "$base/journal-at-open.json" "the journal is on disk before the Terminal opens"
+assert_contains "$TARGET" "$(cat "$base/journal-at-open.json" 2>/dev/null)" \
+  "the journal names the account before the login can write anything"
+assert_contains ".relogin." "$(cat "$base/journal-at-open.json" 2>/dev/null)" \
+  "the journal records the config dir, so every slot spelling stays recomputable"
+assert_eq "{}" "$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))" "$BANK_DIR/.relogin-journal.json" 2>/dev/null || echo '{}')" \
+  "a completed flow leaves no pending entry"
+
+# a stale entry (dead owner, no live login) is reaped: process, slot, dir, entry
+new_env relogin-sweep >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+stale="$BANK_DIR/.relogin.STALE1234"; mkdir -p "$stale"
+svc="$(python3 -c "import sys;sys.path.insert(0,'$AB_DIR');import seedflow;print(seedflow.config_slot_service(sys.argv[1]))" "$stale")"
+printf '{"claudeAiOauth":{"accessToken":"stranded"}}' > "$base/fakekc.svc-${svc##*-}"
+dead=99999   # a pid nothing can be running under in this sandbox
+python3 - "$BANK_DIR/.relogin-journal.json" "$TARGET" "$stale" "$dead" <<'JRNL'
+import json, sys, time
+p, email, cfg, pid = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+json.dump({email: {"config_dir": cfg, "started_at": int(time.time()),
+                   "owner_pid": pid, "term_window": ""}}, open(p, "w"))
+JRNL
+assert_file_present "$base/fakekc.svc-${svc##*-}" "the stranded slot exists before the sweep"
+python3 "$CAPTURE" journal-sweep "$BANK_DIR" 900 >/dev/null 2>&1
+assert_file_absent "$stale" "the sweep deletes the abandoned config dir"
+assert_file_absent "$base/fakekc.svc-${svc##*-}" "the sweep deletes the slot that would otherwise be unrecomputable"
+assert_eq "{}" "$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))" "$BANK_DIR/.relogin-journal.json")" \
+  "the sweep drops the reaped entry"
+
+# a LIVE entry is left alone by the sweep and REFUSES a second invocation
+new_env relogin-double >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+set_active "$OTHER" "at-other"
+bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
+sleep 30 & live_pid=$!
+python3 - "$BANK_DIR/.relogin-journal.json" "$TARGET" "$BANK_DIR/.relogin.LIVE" "$live_pid" <<'JRNL'
+import json, sys, time
+p, email, cfg, pid = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+json.dump({email: {"config_dir": cfg, "started_at": int(time.time()),
+                   "owner_pid": pid, "term_window": ""}}, open(p, "w"))
+JRNL
+out="$(ACCOUNT_BANK_RELOGIN_DETACH=0 ACCOUNT_BANK_RELOGIN_TIMEOUT=20 \
+       ACCOUNT_BANK_RELOGIN_TERMINAL_CMD='true' \
+       /bin/bash "$RELOGIN" "$TARGET" --sync 2>&1)"; rc=$?
+assert_eq "9" "$rc" "a second re-login is refused while one is pending"
+assert_contains "already running" "$out" "the refusal says a login is already open"
+assert_ne "" "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('$TARGET',''))" "$BANK_DIR/.relogin-journal.json")" \
+  "the refusal leaves the live entry intact"
+kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null
+
+# an abandoned flow TERMINATES its login instead of deleting the dir out from under it
+new_env relogin-terminate >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+set_active "$OTHER" "at-other"
+bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
+_make_hanging_terminal_stub "$base/hang.sh"
+out="$(ACCOUNT_BANK_RELOGIN_DETACH=0 ACCOUNT_BANK_RELOGIN_TIMEOUT=4 \
+       ACCOUNT_BANK_RELOGIN_TERMINAL_CMD="/bin/bash $base/hang.sh" \
+       ACCOUNT_BANK_FAKE_PROFILE="RESOLVED $TARGET" \
+       /bin/bash "$RELOGIN" "$TARGET" --sync 2>&1)"; rc=$?
+assert_eq "4" "$rc" "the hanging login times out"
+sleep 1
+survivors="$(pgrep -f 'sleep 600' | wc -l | tr -d ' ')"
+assert_eq "0" "$survivors" "the abandoned login process is killed, not left to strand a credential"
+assert_eq "{}" "$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))" "$BANK_DIR/.relogin-journal.json")" \
+  "an abandoned flow releases its journal entry"
+
+# ---------------------------------------------------------------------------
 # 5b. MATERIALIZATION — a SLOT-only seat becomes the dir's .credentials.json
 #     (fact 2: cred_read follows CLAUDE_CONFIG_DIR for the FILE form only, so a
 #     login that landed in the per-config-dir keychain slot must be written out as
@@ -247,6 +433,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 cfg="$base/slotseat"; mkdir -p "$cfg"
 svc="$(python3 -c "import sys;sys.path.insert(0,'$AB_DIR');import seedflow;print(seedflow.config_slot_service(sys.argv[1]))" "$cfg")"
 printf '{"claudeAiOauth":{"accessToken":"slot-at","refreshToken":"slot-rt","expiresAt":%s}}' "$FUT" \
@@ -270,6 +457,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 cfg="$base/cfgdir"; mkdir -p "$cfg"
 for spelling in "$cfg" "$cfg/"; do
   svc="$(python3 -c "import sys;sys.path.insert(0,'$AB_DIR');import seedflow;print(seedflow.config_slot_service(sys.argv[1]))" "$spelling")"
@@ -302,6 +490,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 NOTELOG="$base/notify.log"; _notify_stub "$base/notify-stub" "$NOTELOG"
 export ACCOUNT_BANK_NOTIFY_BIN="$base/notify-stub"
 
@@ -329,6 +518,7 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 NOTELOG="$base/notify.log"; _notify_stub "$base/notify-stub" "$NOTELOG"
 export ACCOUNT_BANK_NOTIFY_BIN="$base/notify-stub"
 bank_record "$TARGET" "old-at"

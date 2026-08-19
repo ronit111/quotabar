@@ -4,6 +4,26 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **v111-r2 — two failure-path holes in the re-login flow.** (1) The banked
+  credential is now ASSERTED to be the one the login captured.
+  `bank-account.sh` re-reads the credential itself through `cred_read`, whose
+  shape gate accepts a config dir's file only when the raw text carries
+  `claudeAiOauth`/`oauth` — a flat blob fell through to the bare default slot,
+  i.e. the ACTIVE account, and every downstream identity check still agreed
+  because the email came from the target's own metadata, so the flow could report
+  success with another account's tokens banked under the target's name. The
+  fingerprints must now match; a mismatch is a hard failure and the pre-bank
+  record is restored. `cred_read` is deliberately unchanged. (2) A pending-relogin
+  journal makes an abandoned login recoverable: the config dir is recorded before
+  the Terminal opens, so the per-config-dir keychain slot stays recomputable even
+  if the flow is killed or the machine reboots mid-login; every abandoning path
+  now terminates the login process and closes its window BEFORE deleting the dir
+  (previously a login completed after a timeout wrote a live credential into a
+  slot nothing could ever find again); and every entry sweeps stale entries. The
+  journal doubles as the double-invocation guard — a second Re-bank while one is
+  pending is refused rather than opening a second window, which the app cannot
+  enforce because its busy guard clears as soon as the flow detaches.
+
 - **One-click recovery for a revoked account (v111)**: a `needs-relogin` card
   used to need a manual ceremony — an isolated `/login`, a hand-materialized
   credential, then `bank-account.sh` pinned to that dir. Re-bank now does all of

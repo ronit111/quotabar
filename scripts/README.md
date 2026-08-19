@@ -380,7 +380,38 @@ notification and `$BANK_DIR/.relogin.log`. The bank lock is never held across th
 
 Env: `ACCOUNT_BANK_RELOGIN_TIMEOUT` (default 300s), `ACCOUNT_BANK_RELOGIN_DETACH` (0/1
 override), `ACCOUNT_BANK_RELOGIN_TERMINAL_CMD` (replaces the Terminal-open; the test seam),
-`ACCOUNT_BANK_FAKE_PROFILE` (replaces the identity oracle; tests only).
+`ACCOUNT_BANK_OSASCRIPT_BIN` (the window-close binary), `ACCOUNT_BANK_FAKE_PROFILE`
+(replaces the identity oracle; tests only).
+
+Exit codes: 0 done · 4 timed out · 5 wrong account picked / credential rejected · 6
+transient · 7 banked but the first live poll still refuses it · 8 the banked credential is
+not the captured one · 9 a re-login is already pending.
+
+**Two things that only matter when it goes wrong (r2).**
+
+*The banked-credential assertion.* `bank-account.sh` does not take the credential
+from the capture — it re-reads "the live credential" through `cred_read`, whose
+shape gate accepts a config dir's `.credentials.json` only when the raw text
+carries `claudeAiOauth`/`oauth`. A FLAT blob falls through to the BARE default
+slot, i.e. the ACTIVE account, and every downstream check still agrees (the email
+comes from the target's own `.claude.json`). So after banking, the fingerprint of
+the blob that was captured is required to equal the fingerprint of the credential
+now in the record. Mismatch — or a fingerprint that cannot be computed — is a hard
+failure (exit 8), and the pre-bank record is restored, so another account's tokens
+are never left banked under this email. `cred_read` itself is deliberately
+unchanged.
+
+*The pending journal.* The login runs in a Terminal we do not control, waited on
+by a human. If the flow dies first and the OAuth completes afterwards, the CLI
+writes a live credential into the slot for a config dir that no longer exists and
+nothing can ever recompute that service name. `$BANK_DIR/.relogin-journal.json`
+records the config dir BEFORE the Terminal opens and is cleared only after a
+completed cleanup; every abandoning path kills the login (the launcher writes its
+own pid to `<config-dir>/login.pid`) and closes its window BEFORE deleting
+anything; and every entry into the flow first sweeps stale entries (kill, sweep
+slots, delete dir, drop entry). The same journal is the double-invocation guard:
+a second Re-bank while one is pending is refused with exit 9, because QuotaBar's
+per-card busy guard clears the moment the flow detaches.
 
 ## Revocation notifications
 

@@ -27,7 +27,9 @@ import tempfile
 import time
 
 MARKER_NAME = ".relogin-notified.json"
-OSASCRIPT_TIMEOUT_S = 10
+# (r2 nit) Well under the 15s budget usage.py's poll runs on: this fires from inside
+# set_bank_status, and a wedged `display notification` must not be able to eat a poll.
+OSASCRIPT_TIMEOUT_S = 3
 REPEAT_AFTER_S = 7 * 24 * 3600      # backstop only; see the debounce contract above
 
 # argv-based, so no title/message text can ever be parsed as AppleScript. The strings
