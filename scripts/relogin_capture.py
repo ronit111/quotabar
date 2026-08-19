@@ -641,7 +641,11 @@ def _terminate_login(entry):
             time.sleep(0.1)
             if not _alive(pid):
                 break
-        if _alive(pid) and _proc_starttime(pid):
+        # Re-prove before escalating. The pid can exit during the SIGTERM wait and be
+        # handed to something else within it, so "still alive" is not the same claim as
+        # "still the login" — the escalation has to carry the same evidence the first
+        # signal did.
+        if _provable_login_pid(entry)[0] == pid:
             os.kill(pid, signal.SIGKILL)
     except Exception:
         pass
