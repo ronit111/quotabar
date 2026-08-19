@@ -726,9 +726,20 @@ kc_write() {
   # subshell leads its own group so a timeout reaps security itself, not just the
   # shell wrapper. printf is a shell builtin -> the secret is not in any argv.
   # Service/account are double-quoted (service contains a space; security -i
-  # splits its command line on whitespace and honors double-quotes). The blob is
-  # left unquoted: it is compact (validated: no whitespace) and starts with '{',
-  # so security -i takes the whole run as one literal token.
+  # splits its command line on whitespace and honors double-quotes).
+  #
+  # (v112) The BLOB is now double-quoted and escaped too. It used to be passed bare,
+  # relying on "it is compact (validated: no whitespace)" to arrive as one token — an
+  # invariant CLI 2.1.235 ended by moving `mcpOAuth` into this same item, where a
+  # space-delimited OAuth `scope` is legitimate content. Measured against the real
+  # `security -i` before choosing: a bare blob containing a space does not write at all,
+  # and escaping the spaces as \u0020 comes back corrupted (security eats the
+  # backslash). A double-quoted token with backslashes and quotes escaped round-trips
+  # exactly, for blobs with and without spaces alike — the same encoding
+  # seedflow._sh_keychain_write already had to adopt for this reason. Nothing about the
+  # ceremony changes: the epoch gate, schema validation, archive-before-destroy,
+  # snapshot, pre-write recheck and post-write fingerprint verify all run as before, and
+  # that verify is what independently proves each write landed byte-correct.
   # (v108) FILE SEAT: the CLI keeps the active credential in .credentials.json, so the
   # write goes there. atomic_write is mktemp(0600)+rename in the same dir, so a crash
   # mid-write cannot leave a truncated credential. Everything protective above (archive,
@@ -740,8 +751,11 @@ kc_write() {
   local sec; sec="$(security_bin)" || { err "kc_write: could not resolve the 'security' binary"; return 10; }
   local had_m=0; case "$-" in *m*) had_m=1;; esac
   set -m
-  ( printf 'add-generic-password -U -s "%s" -a "%s" -w %s\n' \
-      "$KEYCHAIN_SERVICE" "$KEYCHAIN_ACCOUNT" "$blob" | "$sec" -i ) &
+  local _blob_esc
+  _blob_esc="$(printf '%s' "$blob" | python3 -c 'import sys; s=sys.stdin.read(); sys.stdout.write(s.replace(chr(92), chr(92)*2).replace(chr(34), chr(92)+chr(34)))')"
+  [ -n "$_blob_esc" ] || { err "kc_write: could not encode the blob for the keychain write"; return 10; }
+  ( printf 'add-generic-password -U -s "%s" -a "%s" -w "%s"\n' \
+      "$KEYCHAIN_SERVICE" "$KEYCHAIN_ACCOUNT" "$_blob_esc" | "$sec" -i ) &
   local p=$!
   [ "$had_m" -eq 0 ] && set +m
   ( sleep "$KC_TIMEOUT"
@@ -769,6 +783,32 @@ kc_write() {
     err "kc_write: post-write verify FAILED (security rc=$rc; live item != intended). Concurrent write?"
   fi
   return 1
+}
+
+# blob_reject_reason — WHY a blob we could READ was nevertheless rejected. Reads the
+# candidate on stdin; prints "schema" or "unreadable".
+#
+# (v112) Tonight's outage was diagnosed the slow way because the abort said "transient
+# keychain read failure" when the read had in fact succeeded perfectly — the blob was
+# right there, parsed fine, carried a claudeAiOauth, and was refused on a shape rule that
+# a CLI update had invalidated. Those are opposite problems with opposite fixes (retry vs
+# "the schema moved"), and the message named the wrong one. A readable, JSON-parsing blob
+# WITH a claudeAiOauth key that still fails validation is a SCHEMA drift, and every
+# capture site now says so in those words. This is the second CLI schema change in a
+# month; the next one should be a one-line read, not an evening.
+blob_reject_reason() {
+  # -c, not a heredoc: a heredoc would BE python's stdin, so the piped blob would never
+  # arrive and every blob would read as "unreadable" — precisely the misdiagnosis this
+  # function exists to prevent.
+  python3 -c "
+import json, sys
+raw = sys.stdin.read()
+try:
+    b = json.loads(raw) if raw.strip() else None
+except Exception:
+    b = None
+sys.stdout.write('schema' if isinstance(b, dict) and 'claudeAiOauth' in b else 'unreadable')
+"
 }
 
 # compact_blob — read JSON on stdin, print compact (space-free) JSON on stdout.

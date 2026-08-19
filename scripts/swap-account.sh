@@ -244,6 +244,18 @@ if [ -n "$raw_current" ]; then
 fi
 if [ -n "$current" ]; then
   if [ -z "$precompact" ] || ! printf '%s' "$precompact" | python3 "$HERE/validate_blob.py" >/dev/null 2>&1; then
+    # (v112) Distinguish the two causes, because they have opposite fixes. A blob we
+    # could not read at all is transient — retry. A blob that read fine, parsed as JSON
+    # and carries a claudeAiOauth but still fails validation is the CLI having changed
+    # the credential's shape under us, and no amount of re-running will help.
+    if [ -n "$raw_current" ] \
+       && [ "$(printf '%s' "${precompact:-$raw_current}" | blob_reject_reason)" = "schema" ]; then
+      err "Aborting swap: credential blob shape not recognized (CLI schema may have changed;"
+      err "validate_blob rejected a READABLE credential for '$current'). Nothing was changed."
+      err "This is not a retry: the live blob was read and parsed fine. Diagnose with"
+      err "  kc_read | python3 $HERE/validate_blob.py   (prints the exact rule that refused it)"
+      exit 1
+    fi
     err "Aborting swap: could not capture a valid live credential for the outgoing account"
     err "'$current' (transient keychain read failure). No change made; re-run swap."
     exit 1
@@ -340,6 +352,35 @@ if ! epoch_guard; then
   _restore_trap
   err "Aborting swap: epoch gate refused the mutation (rc 78; no change made). Re-run after the flip/seed settles."
   exit 78
+fi
+
+# --- (v112) MERGE, do not overwrite: install the target's CREDENTIAL, keep this
+#     DEVICE's other state ---
+# CLI 2.1.235 turned the credential item into a shared container: `mcpOAuth` (the OAuth
+# tokens for authorised MCP connectors) now lives beside `claudeAiOauth`. Those belong to
+# this machine and its MCP servers, not to any Claude account, so writing the bank's blob
+# wholesale — which is what this did — would log the owner out of every MCP connector on
+# every single swap. The bank cannot supply them either, by construction:
+# write_bank_record stores `{"claudeAiOauth": oauth}` and nothing else, so no bank record
+# can carry a stale or cross-account mcpOAuth for this to resurrect.
+#
+# Assembly happens HERE, before the ceremony and before the journal, so a failure aborts
+# with nothing mutated and nothing journalled. The credential fingerprint is computed over
+# claudeAiOauth alone, so target_fp is unaffected by the merge.
+if [ -n "$precompact" ]; then
+  _tb="$(umask 077; mktemp "${TMPDIR:-/tmp}/.swapblob.XXXXXX")" || {
+    _restore_trap; err "Aborting swap: could not stage the target blob for merge. No change made."; exit 1; }
+  printf '%s' "$target_blob" > "$_tb"
+  _merged="$(printf '%s' "$precompact" | python3 "$HERE/bank_common.py" --merge-device-state "$_tb")"; _mrc=$?
+  rm -f "$_tb"
+  if [ "$_mrc" -ne 0 ] || [ -z "$_merged" ]; then
+    _restore_trap
+    err "Aborting swap: could not merge the target credential with this device's other"
+    err "keychain state (mcpOAuth etc.). Refusing to write a blob that would silently drop"
+    err "your MCP connector logins. No change made."
+    exit 1
+  fi
+  target_blob="$_merged"
 fi
 
 # --- (finding #9) the phase journal is a MANDATORY precondition for kc_write ---

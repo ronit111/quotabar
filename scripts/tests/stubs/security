@@ -46,6 +46,19 @@ case "$cmd" in
     [ "$mode" = "writeignore" ] && exit 0
     [ "$mode" = "writelate" ] && sleep 30
     blob="${line#*-w }"
+    # (v112) Model `security -i`'s own unquoting. kc_write now passes the blob as a
+    # DOUBLE-QUOTED token with backslashes and quotes escaped, because CLI 2.1.235's
+    # mcpOAuth carries a space-delimited OAuth scope and a bare token containing a space
+    # does not write at all. The real binary strips the quotes and the escapes; a stub
+    # that stored the escaped text would quietly disagree with production and let the
+    # suite pass against an encoding that does not survive a real write. (Verified
+    # against /usr/bin/security on a throwaway item before this was written.)
+    case "$blob" in
+      \"*\") blob="$(printf '%s' "$blob" | python3 -c 'import sys
+s = sys.stdin.read()
+s = s[1:-1] if len(s) >= 2 else s
+sys.stdout.write(s.replace(chr(92)+chr(34), chr(34)).replace(chr(92)*2, chr(92)))')" ;;
+    esac
     printf '%s' "$blob" > "$store"
     exit 0 ;;
   *) exit 0 ;;

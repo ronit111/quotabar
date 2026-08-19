@@ -21,6 +21,37 @@ assert_eq "b@x.com" "$(claude_json_email)" "claude.json now names b@x.com"
 assert_file_present "$BANK_DIR/a@x.com.json" "outgoing a@x.com re-banked"
 assert_file_absent "$BANK_DIR/.swap-journal.json" "journal cleared on clean commit"
 
+# ---- (v112) a 2.1.235-shape live item: swap must pass the capture gate AND keep
+#      this device's mcpOAuth instead of overwriting the item wholesale ----
+new_env swap_235 >/dev/null
+set_active a@x.com A "" "$FUT" max claude_max
+# graft mcpOAuth (with a space-delimited OAuth scope) onto the live stub item, exactly
+# as CLI 2.1.235 does once an MCP server has been authorised
+python3 - "$STUB_KC_FILE" <<'GRAFT'
+import json, sys
+p = sys.argv[1]
+b = json.load(open(p))
+b["claudeAiOauth"]["rateLimitTier"] = "default_claude_max_20x"
+b["mcpOAuth"] = {"example-server|0123456789abcdef": {"scope": "read write offline_access",
+                                               "accessToken": "MCP-AT"}}
+json.dump(b, open(p, "w"), separators=(",", ":"))
+GRAFT
+assert_contains "mcpOAuth" "$(kc_now)" "the live item carries mcpOAuth before the swap"
+bank_record b@x.com B "" "$FUT" pro claude_pro
+/bin/bash "$SWAP" b@x.com >/dev/null 2>&1; rc=$?
+assert_eq 0 "$rc" "(v112) swap succeeds against a 2.1.235-shape live item"
+b_at="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$BANK_DIR/b@x.com.json")"
+assert_contains "\"accessToken\":\"$b_at\"" "$(kc_now)" "(v112) the target's credential was installed"
+assert_eq "read write offline_access" "$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("mcpOAuth") or {}).get("example-server|0123456789abcdef",{}).get("scope",""))' "$STUB_KC_FILE")" \
+  "(v112) mcpOAuth SURVIVED the swap — MCP connector logins intact"
+assert_eq "" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["claudeAiOauth"].get("rateLimitTier",""))' "$STUB_KC_FILE")" \
+  "(v112) the outgoing account's claudeAiOauth was replaced, not blended"
+assert_eq "b@x.com" "$(claude_json_email)" "(v112) claude.json now names b@x.com"
+assert_file_absent "$BANK_DIR/.swap-journal.json" "(v112) journal cleared on clean commit"
+# the bank must NEVER acquire mcpOAuth — that is what stops a stale copy being restored
+assert_eq "" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("mcpOAuth",""))' "$BANK_DIR/a@x.com.json")" \
+  "(v112) the re-banked outgoing record carries NO mcpOAuth"
+
 # ---- finding 8: no valid preimage (keychain unreadable) -> abort, no change ----
 new_env swap_nopre >/dev/null
 set_active a@x.com A "" "$FUT" max claude_max

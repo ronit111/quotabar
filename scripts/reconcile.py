@@ -220,8 +220,14 @@ def _seat_write(compact_blob):
         sec = _security_bin()
         if not sec:
             return False
-        cmd = 'add-generic-password -U -s "%s" -a "%s" -w %s\n' % (
-            KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, compact_blob)
+        # (v112) The blob is a QUOTED, escaped token, matching lib.sh kc_write. It used
+        # to be bare, relying on the blob containing no whitespace — an invariant CLI
+        # 2.1.235 ended by moving mcpOAuth (whose OAuth `scope` is space-delimited) into
+        # this same item. Measured against the real `security -i`: a bare token with a
+        # space does not write at all.
+        _esc = compact_blob.replace("\\", "\\\\").replace('"', '\\"')
+        cmd = 'add-generic-password -U -s "%s" -a "%s" -w "%s"\n' % (
+            KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, _esc)
         try:
             subprocess.run([sec, "-i"], input=cmd, text=True, capture_output=True, timeout=8)
         except Exception:
@@ -274,6 +280,27 @@ def _stable_live_fp(retries=3):
     return f1, False
 
 
+def _formatting_whitespace(text):
+    """True iff `text` has whitespace BETWEEN JSON tokens (i.e. it is pretty-printed).
+    Whitespace inside a string is content — an OAuth `scope` is space-delimited — and
+    must not be mistaken for formatting. Mirrors validate_blob.py exactly."""
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch.isspace():
+            return True
+    return False
+
+
 def _restore_keychain(compact_blob, expected_live_fp):
     """Verification-aware keychain restore (finding #16 + re-review issue 8): before
     overwriting, require the LIVE keychain to STILL equal `expected_live_fp` (a
@@ -284,13 +311,26 @@ def _restore_keychain(compact_blob, expected_live_fp):
     True only on VERIFIED success."""
     if not isinstance(compact_blob, str) or not compact_blob.strip():
         return False
-    if any(ch.isspace() for ch in compact_blob.strip()):
-        return False   # security -i tokenizes on whitespace; compact blob required
+    # (v112) FORMATTING whitespace only. This was a scan over every character, which
+    # under CLI 2.1.235 rejects any journalled blob carrying mcpOAuth — i.e. it would
+    # have refused to restore a torn swap, turning a recoverable interruption into a
+    # permanent one. Mirrors validate_blob.py's string-aware check.
+    if _formatting_whitespace(compact_blob.strip()):
+        return False   # security -i needs one token; a compact blob is required
     want_fp = bank_common.cred_fingerprint(compact_blob)
     try:
         o = json.loads(compact_blob)
         oa = o.get("claudeAiOauth") if isinstance(o, dict) else None
         if not bank_common.valid_oauth(oa):
+            # (v112) Same distinction the swap capture gate now draws: a journalled blob
+            # that parses and HAS a claudeAiOauth but fails validation is a schema change,
+            # not a corrupt journal, and it is worth saying which — a torn swap left
+            # unrestored is the most expensive state this system has.
+            if isinstance(o, dict) and "claudeAiOauth" in o:
+                sys.stderr.write(
+                    "reconcile: credential blob shape not recognized (CLI schema may have "
+                    "changed; validation rejected a READABLE journalled credential). "
+                    "Journal KEPT; the keychain was not touched.\n")
             return False
     except Exception:
         return False

@@ -4,6 +4,36 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **Swap works again on Claude Code 2.1.235 (v112).** The CLI turned the credential
+  keychain item into a shared container: `mcpOAuth` — the OAuth tokens for MCP
+  connectors you have authorised — now sits beside `claudeAiOauth`, which itself
+  gained `rateLimitTier`. An OAuth `scope` is space-delimited by specification, and
+  `validate_blob.py` tested "is this compact JSON?" by scanning every character for
+  whitespace. That was a correct proxy only while no string VALUE contained a space,
+  so the live blob started failing validation outright and every swap aborted at
+  swap-account.sh's capture gate with "could not capture a valid live credential".
+  `compact_blob` could never have fixed it: a space inside a string is content, not
+  formatting. The check is now string-aware, so it still rejects pretty-printed JSON
+  and still enforces every credential field we depend on, while tolerating unknown
+  keys at both levels — this is the second CLI schema change in a month, so the
+  tolerance is the point.
+- **A swap no longer logs you out of your MCP connectors (v112).** Installing a
+  banked blob wholesale would have dropped `mcpOAuth` on every swap. The commit now
+  MERGES: the target's `claudeAiOauth`, this device's other top-level keys. Bank
+  records hold only `claudeAiOauth` (they always have), so no swap can resurrect a
+  stale or cross-account `mcpOAuth`. `kc_write` also passes the blob to `security -i`
+  as a quoted, escaped token — measured against the real binary, a bare token
+  containing a space does not write at all.
+- **A schema change now identifies itself (v112).** The abort that started this
+  said "transient keychain read failure" when the read had in fact succeeded —
+  the blob was present, parsed, and carried a credential; only a shape rule
+  refused it. Retry and "the CLI moved the schema" are opposite problems, and the
+  message named the wrong one. The swap capture gate and reconcile's restore gate
+  now distinguish them: a readable, JSON-parsing blob with a `claudeAiOauth` that
+  still fails validation reports "credential blob shape not recognized (CLI schema
+  may have changed)" and says plainly that re-running will not help. Third CLI
+  schema surprise in a month; the next one should be a one-line read.
+
 ## v1.1.0 — 2026-08-19
 
 The first release since Claude Code moved where it stores your login. **If you are

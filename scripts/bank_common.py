@@ -172,6 +172,50 @@ def canonical_oauth(oauth):
     return json.dumps(d, sort_keys=True, separators=(",", ":"))
 
 
+def merge_device_state(target_blob, live_blob):
+    """The blob to install when switching accounts: the TARGET's credential, keeping the
+    DEVICE's other state.
+
+    (v112) CLI 2.1.235 made the credential item a shared container: alongside
+    `claudeAiOauth` it now carries `mcpOAuth`, the OAuth tokens for MCP connectors the
+    user has authorised. Those are properties of this machine and its MCP servers, not of
+    any Claude account — no account "owns" them and they are not part of an identity. So
+    they must survive a swap: writing the bank's blob wholesale would silently log the
+    owner out of every MCP connector, every single swap.
+
+    Equally they must never be BANKED. write_bank_record stores `{"claudeAiOauth": oauth}`
+    and nothing else (it extracts the one key), so a bank record cannot carry mcpOAuth and
+    a swap can never resurrect a stale or cross-account copy of it. That is a property of
+    construction, not of care, and this function preserves it: the target side
+    contributes ONLY `claudeAiOauth`; every other key comes from the live item.
+
+    Unknown future keys are treated exactly like mcpOAuth — device state, preserved —
+    because that is the safe default for a container the CLI keeps extending: dropping a
+    key we do not recognise is a silent data loss, while keeping it is inert.
+    """
+    target = _as_dict(target_blob)
+    live = _as_dict(live_blob)
+    if target is None:
+        return None
+    merged = {k: v for k, v in live.items() if k != "claudeAiOauth"} if live else {}
+    if "claudeAiOauth" not in target:
+        return None
+    merged["claudeAiOauth"] = target["claudeAiOauth"]
+    return json.dumps(merged, separators=(",", ":"))
+
+
+def _as_dict(blob):
+    if isinstance(blob, dict):
+        return blob
+    if isinstance(blob, str) and blob.strip():
+        try:
+            d = json.loads(blob)
+            return d if isinstance(d, dict) else None
+        except Exception:
+            return None
+    return None
+
+
 def cred_fingerprint(blob_or_oauth):
     """SHA-256 (hex) of the credential-bearing fields, or "" when the input is not
     a VALID credential (re-review issue 6: `{}` / a malformed object must yield an
@@ -565,6 +609,21 @@ def archive_blob(bank_dir, email, blob, keep=10):
 if __name__ == "__main__":
     # tiny self-check used by the test harness
     import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "--merge-device-state":
+        # args: <target-blob-file> ; the LIVE blob on STDIN. Prints the merged blob the
+        # swap should install (target's credential + this device's other keys), or
+        # nothing + exit 1 when the target blob is unusable. Never echoes a secret to
+        # a terminal: output is consumed by kc_write.
+        try:
+            with open(sys.argv[2]) as _f:
+                _target = _f.read()
+        except Exception:
+            sys.exit(1)
+        _merged = merge_device_state(_target, sys.stdin.read())
+        if not _merged:
+            sys.exit(1)
+        sys.stdout.write(_merged)
+        sys.exit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--fingerprint":
         # Read a keychain blob or oauth object on STDIN, print its full-credential
         # fingerprint (findings 11/21). Empty line if it can't be computed. Never

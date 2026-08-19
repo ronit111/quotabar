@@ -471,7 +471,12 @@ python3 "$CAPTURE" journal-claim "$BANK_DIR" "$TARGET" "$$" 900 >/dev/null 2>&1
 claim_rc=$?
 claim_took=$(( $(date +%s) - claim_start ))
 assert_eq "0" "$claim_rc" "a claim taken during a sweep succeeds"
-if [ "$claim_took" -le 2 ]; then quick=1; else quick=0; fi
+# The sweep's slow phase is 2 entries x ~4s of window-closing, so an unlocked claim
+# returns in well under a second and a BLOCKED one waits 5-8s. The threshold sits at 3s
+# rather than 2s because it only has to separate those two populations, and a 2s bound
+# was tight enough to flake once under load from a parallel suite — a timing test that
+# fails when the machine is busy reports load, not behaviour.
+if [ "$claim_took" -le 3 ]; then quick=1; else quick=0; fi
 assert_eq "1" "$quick" "the claim is not blocked behind the sweep's slow work (${claim_took}s)"
 wait "$sweep_pid" 2>/dev/null
 assert_ne "" "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('$TARGET',''))" "$BANK_DIR/.relogin-journal.json")" \
