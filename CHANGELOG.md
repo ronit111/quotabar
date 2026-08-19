@@ -4,6 +4,36 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+## v1.1.0 — 2026-08-19
+
+The first release since Claude Code moved where it stores your login. **If you are
+on v1.0.2, upgrade** — that change broke credential reads outright: a stale card,
+"no credentials found. Are you logged in?" on a fully logged-in machine, and an
+aborting swap were all the same root cause, and v1.0.2 cannot see the credential
+at all on current Claude Code.
+
+**One-click recovery for a revoked account.** When a shared or parked account's
+grant is revoked server-side its card goes `needs-relogin`, and nothing local can
+revive it. Recovery used to be a manual ceremony — an isolated `/login`, a
+hand-materialized credential, then `bank-account.sh` pinned to that directory.
+Now the card's **Re-bank** button does all of it: it opens a login window in an
+isolated profile (your normal login and any running sessions are untouched),
+verifies that the account you pick in the browser is the one it asked for, banks
+it, cleans up after itself, and heals the card. A revocation also now raises a
+**macOS notification** the moment it is detected, rather than waiting to be
+noticed in the menu bar.
+
+**Also:** a swap proves the target account is actually alive before touching
+anything, so a revoked target aborts cleanly instead of killing your running
+session; auto-ping no longer retries a home it cannot fix; a stale card says why
+it is stale; and two health canaries call out the two failures that used to be
+silent.
+
+**Behaviour change:** re-banking a *healthy parked* account now refuses with an
+explanation instead of silently snapshotting whichever account happens to be
+active — which is what it used to do. Re-banking the active account, and the
+automatic session-start banking, are unchanged.
+
 - **v111-r3 — the sweep could kill an innocent process.** The re-login journal's
   reaper signalled whatever pid was recorded in a stale entry, with no proof that
   the pid was still that login. Pids are recycled, most eagerly right after a
