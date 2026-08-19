@@ -47,6 +47,9 @@ if not br.ok:
     sys.exit(2)
 
 rec = br.record
+# (relogin-recovery) Whether THIS stamp is the one that arms needs-relogin — the
+# once-per-arming event the notification below announces. Read before the mutation.
+_was_relogin = rec.get("status") == "needs-relogin"
 if kind == "success":
     rec["last_ping"] = epoch
     rec.pop("last_ping_failed", None)
@@ -77,4 +80,18 @@ except Exception as e:
     except OSError: pass
     sys.stderr.write(f"_ping_marker: write FAILED ({type(e).__name__})\n")
     sys.exit(1)
+
+# (relogin-recovery) Announce a revocation once, after the stamp is durably on disk, so
+# the owner learns about it now instead of the next time they look at the menu bar.
+# Best-effort by design: the stamp is the contract, the notification is a courtesy.
+try:
+    import notify
+    _email = os.path.basename(tf)[:-5]
+    if "@" in _email:
+        if kind == "needs-relogin" and not _was_relogin:
+            notify.relogin_armed(_bank_dir, _email, "parked token confirmed dead")
+        elif kind == "success":
+            notify.clear(_bank_dir, _email)
+except Exception:
+    pass
 sys.exit(0)

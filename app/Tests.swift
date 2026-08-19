@@ -49,6 +49,7 @@ struct QuotaBarTests {
         try testCodexPingLogic()
         try testEpochAndSwitchRouting()
         try testSwapInvocationArguments()
+        try testRebankInvocationArguments()
         try testQueuedSwapRaceGuards()
         try testMonitorOnlyDecodeAndRemoveGuard()
         try testEpochHealthCooldownDecode()
@@ -1238,6 +1239,30 @@ struct QuotaBarTests {
 
     // (rollback-day) The v1 swap argv: --expect-active is appended ONLY when the active account
     // is known (non-empty and not the target itself), so a stale click can't clobber a newer swap.
+    /// Re-bank must name the card it was pressed on. A no-argument invocation is the
+    /// SessionStart auto-bank's form and means "capture the live login"; passing the email is
+    /// what lets the script route a dead card into the guided re-login instead.
+    private static func testRebankInvocationArguments() throws {
+        let bank = "/s/bank-account.sh"
+        try expect(
+            RebankInvocation.arguments(bankScript: bank, target: "b@x.com") == [bank, "b@x.com"],
+            "re-bank passes the card's email to bank-account.sh"
+        )
+        try expect(
+            RebankInvocation.arguments(bankScript: bank, target: "") == [bank],
+            "the unresolved card's Link button keeps the no-argument form"
+        )
+        try expect(
+            RebankSummary.caption(fromStdout: "Banked b@x.com -> /bank/b@x.com.json\n") == "Re-banked",
+            "capturing the live login reports Re-banked"
+        )
+        try expect(
+            RebankSummary.caption(fromStdout: "QUOTABAR_STATUS: relogin-started\nRe-login started for b@x.com\n")
+                == "Login window opened",
+            "a handed-off re-login does NOT claim the account was re-banked"
+        )
+    }
+
     private static func testSwapInvocationArguments() throws {
         let swap = "/x/swap-account.sh"
         try expect(

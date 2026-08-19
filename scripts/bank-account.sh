@@ -1,12 +1,61 @@
 #!/usr/bin/env bash
-# bank-account.sh — snapshot the CURRENTLY logged-in Claude Code account into the
-# bank ($HOME/.claude/accounts/<email>.json). Idempotent. Never touches keychain.
+# bank-account.sh [email] — snapshot the CURRENTLY logged-in Claude Code account into
+# the bank ($HOME/.claude/accounts/<email>.json). Idempotent. Never touches keychain.
+#
+# The optional `email` names the CARD the request came from (QuotaBar's Re-bank button
+# passes it). With no argument the behaviour is exactly what it always was: bank whoever
+# is active — that is the SessionStart auto-bank / "Link account" path and it is
+# unchanged. With an argument it becomes answerable about WHICH account was asked for,
+# which is what lets a dead card recover in one click instead of a manual ceremony.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$HERE/lib.sh"
 
 ensure_bank
+
+# --- Re-bank routing (before the lock: the relogin flow waits on a human) -----
+# When the named account IS the active login there is a live credential to capture and
+# the normal ceremony below does it. When it is NOT, there is nothing capturable for it
+# in any seat, so a "re-bank" that proceeded would silently snapshot a DIFFERENT account
+# — which is what this used to do. A record that is needs-relogin (or missing/malformed)
+# has exactly one real recovery, a fresh browser OAuth, so route there and let
+# relogin-account.sh do the whole thing. Anything else refuses honestly.
+TARGET_EMAIL="${1:-}"
+if [ -n "$TARGET_EMAIL" ]; then
+  bank_file_for "$TARGET_EMAIL" >/dev/null || exit 1
+  _active="$(active_email)"
+  if [ "$TARGET_EMAIL" != "$_active" ]; then
+    _tf="$(bank_file_for "$TARGET_EMAIL")"
+    _status="$(ACCOUNT_BANK_HERE="$HERE" python3 - "$_tf" <<'PY'
+import sys, os
+sys.path.insert(0, os.environ["ACCOUNT_BANK_HERE"])
+import bank_common
+p = sys.argv[1]
+if not os.path.exists(p):
+    print("missing")
+else:
+    br = bank_common.load_bank_record(p)
+    print(br.record.get("status", "ok") if br.ok else "malformed")
+PY
+)"
+    case "$_status" in
+      needs-relogin|missing|malformed)
+        echo "Re-bank: $TARGET_EMAIL is not the active account and its record is $_status —"
+        echo "the only recovery is a fresh login. Handing off to relogin-account.sh."
+        export BANK_DIR          # the child must resolve the SAME bank we just read
+        exec /bin/bash "$HERE/relogin-account.sh" "$TARGET_EMAIL"
+        ;;
+      *)
+        err "Re-bank: $TARGET_EMAIL is not the active account (${_active:-none}) and its record"
+        err "is '$_status' — there is no credential for it to capture, so nothing was written."
+        err "To refresh it anyway: bash $HERE/relogin-account.sh $TARGET_EMAIL"
+        exit 1
+        ;;
+    esac
+  fi
+fi
+
 acquire_lock || { err "bank-account: could not acquire lock; aborting."; exit 1; }
 trap 'release_lock' EXIT
 trap 'release_lock; exit 130' INT TERM HUP PIPE

@@ -1147,6 +1147,39 @@ enum SwapInvocation {
     }
 }
 
+/// Re-bank's invocation. The card's email is an ARGUMENT, and that is the whole feature: with it
+/// `bank-account.sh` can tell "capture the live login" (the card IS the active account) from "this
+/// account's grant is dead" (it is not) and route the second case into the guided re-login. Without
+/// it the script could only ever bank whoever was active, which is why recovering a revoked card
+/// used to be a manual ceremony — and why dropping the argument again would silently restore that
+/// bug rather than break anything visibly. Hence a named type with a test on it.
+enum RebankInvocation {
+    /// `target` is the card's email, or "" for the UNRESOLVED card — whose "Link account"
+    /// button shares this action and whose `email` is the sentinel "(active/unresolved)",
+    /// not an address. That card's whole question is "bank whoever is actually logged in",
+    /// which is precisely the no-argument form; passing the sentinel would just make
+    /// bank_file_for reject it.
+    static func arguments(bankScript: String, target: String) -> [String] {
+        target.isEmpty ? [bankScript] : [bankScript, target]
+    }
+}
+
+/// What the Re-bank button actually did, read off the script's own stdout.
+///
+/// Re-bank now has two outcomes and they are not interchangeable: it either captured the live
+/// login (done, nothing further), or it opened a login window and the work finishes minutes later
+/// once a human has completed a browser OAuth. Reporting the second as "Re-banked" would be the
+/// same class of bug this codebase keeps finding elsewhere — a success caption asserting more than
+/// happened. The scripts emit ONE machine-readable line for the second case rather than having the
+/// app pattern-match prose.
+enum RebankSummary {
+    static let reloginMarker = "QUOTABAR_STATUS: relogin-started"
+
+    static func caption(fromStdout stdout: String) -> String {
+        stdout.contains(reloginMarker) ? "Login window opened" : "Re-banked"
+    }
+}
+
 /// One swap at a time, across every card. A queued swap carries the `--expect-active` snapshot it
 /// was built from, so a second swap enqueued behind it runs against an expectation the first one
 /// has already invalidated and aborts under the lock (rc 3). Per-card disabling doesn't catch that

@@ -767,9 +767,19 @@ final class AppModel: ObservableObject {
 
     var health: Health? { snapshot?.health }
 
+    /// Re-bank the account this card names. The email is an ARGUMENT, not decoration: with
+    /// it `bank-account.sh` can tell "capture the live login" (the card is the active
+    /// account) from "this account's grant is dead" (it is not), and route the second case
+    /// to the guided re-login instead of silently snapshotting whoever happens to be
+    /// active. Without it the script could only ever bank the active login — which is why
+    /// recovering a revoked card used to be a manual ceremony. The no-argument form is
+    /// untouched and is still what the SessionStart auto-bank runs.
     func rebank(_ account: UsageAccount) {
         enqueueAction(.rebank, key: account.email, executable: Paths.bash,
-                      arguments: [Paths.bank], successMessage: "Re-banked")
+                      arguments: RebankInvocation.arguments(
+                          bankScript: Paths.bank,
+                          target: account.isUnresolved ? "" : account.email),
+                      successMessage: nil, capturesSummary: true)
     }
 
     func toggleAutoPing(_ account: UsageAccount) {
@@ -1460,9 +1470,10 @@ final class AppModel: ObservableObject {
                 environment: action.environment
             )
             if action.capturesSummary {
-                summaryCaption = UnseedSummary.caption(
-                    fromStdout: String(data: result.stdout, encoding: .utf8) ?? ""
-                )
+                let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+                summaryCaption = action.kind == .rebank
+                    ? RebankSummary.caption(fromStdout: stdout)
+                    : UnseedSummary.caption(fromStdout: stdout)
             }
         } catch ScriptFailure.timedOut {
             timedOut = true

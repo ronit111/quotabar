@@ -404,6 +404,26 @@ def set_bank_status(bank_path, status):
             json.dump(rec, f, indent=2)
         os.chmod(tmp, 0o600)
         os.replace(tmp, bank_path)
+        _announce_status(bank_path, status)
+    except Exception:
+        pass
+
+
+def _announce_status(bank_path, status):
+    """(relogin-recovery) Tell the owner the moment an account's grant dies. Reaching here
+    with "needs-relogin" is by construction the FIRST poll to arm it — the guard above
+    returns early when the record already says so — which is exactly the once-per-arming
+    event worth a notification. Any return to "ok" clears the debounce so the NEXT
+    revocation announces itself too. Best-effort: a notification must never fail a poll."""
+    try:
+        email = os.path.basename(bank_path)[:-5]     # <email>.json
+        if "@" not in email:
+            return
+        import notify
+        if status == "needs-relogin":
+            notify.relogin_armed(BANK_DIR, email, "grant revoked or expired")
+        elif status == "ok":
+            notify.clear(BANK_DIR, email)
     except Exception:
         pass
 

@@ -29,7 +29,17 @@ this for parked-account refresh (below). *Verified empirically 2026-07-19.*
 <scripts-dir>/                       (default: ~/.local/share/quotabar/account-bank)
   lib.sh              helpers: snapshotted keychain read/write (-U only), mkdir
                       lock, portable run_with_timeout, active-email detection
-  bank-account.sh     snapshot the CURRENT logged-in account into the bank
+  bank-account.sh [e] snapshot the CURRENT logged-in account into the bank; the
+                      optional email names the CARD asking (QuotaBar Re-bank) —
+                      a needs-relogin card routes into relogin-account.sh
+  relogin-account.sh <e>
+                      guided one-click recovery for a needs-relogin account:
+                      isolated login window -> identity-verified capture ->
+                      full bank ceremony -> cleanup -> breaker cleared
+  relogin_capture.py  its credential half (seat watch, G9 identity gate,
+                      materialize, slot sweep, breaker clear)
+  notify.py           the one macOS-notification surface (revocation alerts,
+                      debounced once per arming)
   swap-account.sh <e> re-bank current -> write target creds to keychain ->
                       update ~/.claude.json -> report. Refuses needs-relogin.
   list-accounts.sh    table: email, plan, banked_at, active marker, status
@@ -329,7 +339,58 @@ the next real one is news. The diagnostics log still records every deferral — 
 hides the owner-facing line, never the log — and an unreadable record fails **open** and
 announces, because silence must never be a failure mode.
 
-The Re-bank button in QuotaBar remains only for **needs-relogin** recovery of parked accounts.
+The Re-bank button in QuotaBar remains only for **needs-relogin** recovery of parked accounts
+— and that recovery is now the button's whole job.
+
+## Re-bank routing and guided re-login
+
+QuotaBar's Re-bank button passes the card's email. That argument is what makes
+`bank-account.sh` answerable about *which* account was asked for:
+
+- **the card IS the active login** — unchanged: capture the live credential through the
+  normal ceremony.
+- **the card is parked and `needs-relogin`** (or its record is missing / malformed) —
+  nothing local can revive a revoked grant, so it hands off to `relogin-account.sh`.
+- **the card is parked and healthy** — refuses, loudly. There is no credential for that
+  account in any seat, and the old no-argument behaviour silently banked *the active
+  account* instead.
+
+`relogin-account.sh <email>` is the standing manual ceremony, automated:
+
+1. a throwaway `CLAUDE_CONFIG_DIR` (0700) is created **inside `$BANK_DIR`**, not TMPDIR —
+   an interrupted run can be holding a freshly rotated credential and nothing sweeps the
+   bank;
+2. a Terminal window opens running `CLAUDE_CONFIG_DIR=<dir> claude`, which a virgin config
+   dir turns into the login flow. The **default seat is never touched**, so running
+   sessions never notice;
+3. the dir's seat is watched for the credential the login writes (file *or* per-config-dir
+   keychain slot — `seedflow.seat_read` decides), and the G9 `/api/oauth/profile` oracle
+   must positively name the target. A different account, or a credential the server
+   rejects, aborts and banks nothing; a seat read that ERRORS stays UNKNOWN and keeps
+   waiting, never a verdict;
+4. the credential is materialized as the dir's `.credentials.json` and the **unmodified**
+   `bank-account.sh` runs pinned to that dir;
+5. the dir and every keychain slot its path spellings produced are deleted, the auto-ping
+   breaker (`needs_login_since` / `ping_fail_streak`) is cleared, and a forced fresh poll
+   heals the card.
+
+Invoked without a tty (i.e. from QuotaBar) it **detaches** — the login waits on a human for
+minutes and the app's action queue must not sit behind that. It reports through a
+notification and `$BANK_DIR/.relogin.log`. The bank lock is never held across the wait.
+
+Env: `ACCOUNT_BANK_RELOGIN_TIMEOUT` (default 300s), `ACCOUNT_BANK_RELOGIN_DETACH` (0/1
+override), `ACCOUNT_BANK_RELOGIN_TERMINAL_CMD` (replaces the Terminal-open; the test seam),
+`ACCOUNT_BANK_FAKE_PROFILE` (replaces the identity oracle; tests only).
+
+## Revocation notifications
+
+The moment a record first arms `needs-relogin` — from `usage.py`'s `set_bank_status`, from
+`_ping_marker.py`'s confirmed-dead stamp, or from a v2 home stamping `needs_login_since` —
+`notify.py` posts one macOS notification. Debounced **once per arming** via
+`$BANK_DIR/.relogin-notified.json`: the pollers re-derive the state every cycle, and any
+return to health clears the entry so the *next* revocation announces itself too.
+`ACCOUNT_BANK_NOTIFY=0` silences it; `ACCOUNT_BANK_NOTIFY_BIN` redirects the binary for
+tests.
 
 ## Auto-pick (SessionStart hook — plan-tiered account selection)
 
@@ -431,9 +492,9 @@ makes `ping-account.sh` write `needs-relogin`.
   percentages) and excludes them from the title figures.
 - `swap-account.sh` and `ping-account.sh` refuse them; `account-warn.sh` never
   recommends them.
-- **Recovery is always the same two clicks:** run `/login` in Claude Code, pick
-  that account (the browser session is usually still authorized — no password),
-  then `bash bank-account.sh` to re-bank it fresh (which clears the flag).
+- **Recovery is one click:** hit Re-bank on that card. It opens an isolated login window,
+  verifies the account you pick is the right one, and completes the banking itself (see
+  "Re-bank routing and guided re-login"). By hand: `bash relogin-account.sh <email>`.
 
 Our exposure is smaller than a pure usage-tracker's: a swap makes the parked
 account **live again**, refreshed by Claude Code itself, and we never create

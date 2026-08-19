@@ -4,6 +4,35 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **One-click recovery for a revoked account (v111)**: a `needs-relogin` card
+  used to need a manual ceremony — an isolated `/login`, a hand-materialized
+  credential, then `bank-account.sh` pinned to that dir. Re-bank now does all of
+  it. QuotaBar passes the card's email, so `bank-account.sh` can tell "capture
+  the live login" from "this account's grant is dead" and hand the second case to
+  the new `relogin-account.sh`: throwaway config dir inside the bank (0700), a
+  Terminal window running `CLAUDE_CONFIG_DIR=<dir> claude` (the default seat is
+  never touched, so running sessions never notice), seat watched for the
+  credential the login writes, the G9 profile oracle required to positively name
+  the target, materialize, then the UNMODIFIED bank ceremony, then the config
+  dir and every keychain slot its path spellings produced are deleted, the
+  auto-ping breaker cleared, and a forced poll heals the card. Picking the wrong
+  account in the browser is refused and cleaned up, never banked; a seat read
+  that ERRORS stays UNKNOWN and keeps waiting rather than becoming a verdict; the
+  bank lock is never held across the human wait. Invoked without a tty it
+  detaches so the app's action queue is not blocked behind a login, and the card
+  reads "Login window opened" rather than falsely claiming "Re-banked".
+  Re-banking a healthy PARKED card now refuses instead of silently snapshotting
+  whichever account happened to be active. Success is graded by the first live
+  poll, not by the capture.
+
+- **Revocation notifications (v111)**: the moment a record first arms
+  `needs-relogin` — `usage.py`'s `set_bank_status`, `_ping_marker.py`'s
+  confirmed-dead stamp, or a v2 home stamping `needs_login_since` — a macOS
+  notification fires, so a shared-account revocation is noticed now instead of
+  whenever someone next looks at the menu bar. Debounced once per arming (the
+  pollers re-derive the state every cycle); any return to health re-arms it.
+  `ACCOUNT_BANK_NOTIFY=0` silences it.
+
 - **Swap verifies the target credential live before committing (v110)**: a
   schema-valid bank record is not a live credential — on a shared account a
   co-user's `/login` revokes the banked grant server-side while every offline

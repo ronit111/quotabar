@@ -100,8 +100,12 @@ PY
   #                        fixes that; only an interactive /login does.
   # A success clears both. Recording only — the manual Ping path is unchanged, so Ronit
   # can always retry by hand (that is how he verifies a /login worked).
+  # (relogin-recovery) The helper prints "armed" on the ONE call that first stamps
+  # needs_login_since, and "healed" when a success clears it — so the notification below
+  # fires once per arming rather than once per futile poll.
   _v2_mark() {   # $1 = last_ping | last_ping_failed [$2 = needs_login]
-    python3 - "$V2_MARK" "$1" "${2:-}" <<'PY'
+    local _transition
+    _transition="$(python3 - "$V2_MARK" "$1" "${2:-}" <<'PY'
 import json, os, sys, time
 p, field = sys.argv[1], sys.argv[2]
 flag = sys.argv[3] if len(sys.argv) > 3 else ""
@@ -110,9 +114,11 @@ try:
     if not isinstance(d, dict): d = {}
 except Exception:
     d = {}
+transition = ""
 if field == "last_ping":
     d["ping_fail_streak"] = 0
-    d.pop("needs_login_since", None)
+    if d.pop("needs_login_since", None):
+        transition = "healed"
 else:
     try:
         d["ping_fail_streak"] = int(d.get("ping_fail_streak", 0) or 0) + 1
@@ -120,12 +126,20 @@ else:
         d["ping_fail_streak"] = 1
     if flag == "needs_login" and not d.get("needs_login_since"):
         d["needs_login_since"] = int(time.time())
+        transition = "armed"
 d[field] = int(time.time())
 tmp = p + ".tmp.%d" % os.getpid()
 with open(tmp, "w") as f:
     json.dump(d, f); f.flush(); os.fsync(f.fileno())
 os.replace(tmp, p)
+print(transition)
 PY
+)" || return 1
+    case "$_transition" in
+      armed)  python3 "$HERE/notify.py" relogin "$BANK_DIR" "$v2_target" "home has no credential" >/dev/null 2>&1 || true ;;
+      healed) python3 "$HERE/notify.py" clear   "$BANK_DIR" "$v2_target" >/dev/null 2>&1 || true ;;
+    esac
+    return 0
   }
 
   if ! CLAUDE="$(claude_bin)"; then
