@@ -4,6 +4,16 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+## v1.1.1 — 2026-08-19
+
+**Claude Code CLI 2.1.235 breaks account swapping in QuotaBar 1.1.0 and earlier.**
+The CLI turned the credential keychain item into a shared container — `mcpOAuth`
+(the OAuth tokens for MCP connectors you have authorised) now sits beside
+`claudeAiOauth` — and an OAuth scope is space-delimited, which QuotaBar's
+"is this compact JSON?" check read as malformed. Every swap aborted with "could
+not capture a valid live credential". This release fixes it, and **MCP connector
+logins now survive swaps** instead of being overwritten.
+
 - **Swap works again on Claude Code 2.1.235 (v112).** The CLI turned the credential
   keychain item into a shared container: `mcpOAuth` — the OAuth tokens for MCP
   connectors you have authorised — now sits beside `claudeAiOauth`, which itself
