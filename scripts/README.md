@@ -413,6 +413,22 @@ slots, delete dir, drop entry). The same journal is the double-invocation guard:
 a second Re-bank while one is pending is refused with exit 9, because QuotaBar's
 per-card busy guard clears the moment the flow detaches.
 
+Nothing is ever signalled on a recorded pid alone. Pids are recycled — most
+eagerly right after a reboot, which is exactly when a stale entry gets swept — so
+the launcher records a start-time token (`ps -o stat=,lstart=`, the same primitive
+lib.sh uses to detect a recycled lock holder) beside its pid before it `exec`s;
+`exec` preserves both, so the token still describes `claude`. A kill requires that
+token to match exactly. A missing, unreadable or mismatched token means no kill,
+the same way an "error" seat read means UNKNOWN rather than "absent" — and the
+sweep still reclaims the slots, the dir and the entry, because recoverability must
+never depend on being allowed to kill something.
+
+The `config_dir` stamp is the one journal write that is fatal rather than
+best-effort: without it the sweep has no dir to reclaim and the leak returns for
+that run, so a failed or lock-timed-out stamp aborts the flow before the Terminal
+is ever opened, when nothing sensitive exists yet.
+
+
 ## Revocation notifications
 
 The moment a record first arms `needs-relogin` — from `usage.py`'s `set_bank_status`, from

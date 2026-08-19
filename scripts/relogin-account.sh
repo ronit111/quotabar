@@ -132,10 +132,6 @@ fi
 CFG="$(umask 077; mktemp -d "$BANK_DIR/.relogin.XXXXXXXX")" || {
   err "Re-login aborted: could not create a throwaway config dir under $BANK_DIR."; exit 6; }
 chmod 700 "$CFG"
-# The journal must know the dir BEFORE the login can write anything into it. From here on,
-# however this process dies, the slot spellings stay recomputable.
-python3 "$HERE/relogin_capture.py" journal-update "$BANK_DIR" "$email" config_dir "$CFG" >/dev/null 2>&1 || true
-
 # Order matters: kill the login FIRST, then delete. Deleting the config dir while the
 # login is still in flight is precisely how a credential gets stranded in an
 # unrecomputable slot — the OAuth completes afterwards and the CLI writes to a service
@@ -147,6 +143,17 @@ _finish() {
 }
 trap '_finish' EXIT
 trap '_finish; exit 130' INT TERM HUP PIPE
+
+# The journal must know the dir BEFORE the login can write anything into it, and this is
+# the one journal write that is load-bearing rather than advisory: without it the sweep
+# has no dir to reclaim and the stranded-credential leak comes back for this run. So it
+# is FATAL, not best-effort — and it is cheap to obey, because nothing sensitive exists
+# yet and the trap above tears down the empty dir on the way out.
+if ! python3 "$HERE/relogin_capture.py" journal-update "$BANK_DIR" "$email" config_dir "$CFG"; then
+  err "Re-login aborted: could not record the pending-login journal entry for $email."
+  err "Refusing to open a login window that nothing could clean up after. Nothing changed."
+  exit 6
+fi
 
 # --- the login window --------------------------------------------------------
 LOGIN_SH="$CFG/login-here.sh"
@@ -161,13 +168,17 @@ UARGS="$(_auth_env_u_args)"     # strip inherited alt-auth/proxy vars from the C
   printf 'echo ""\n'
   printf 'echo "  1. Complete the login in the browser window that opens."\n'
   printf 'echo "  2. PICK THE ACCOUNT: %s  (anything else is refused)"\n' "$email"
-  printf 'echo "  3. That is all — banking finishes on its own. You can close"\n'
-  printf 'echo "     this window once the login says it succeeded."\n'
+  printf 'echo "  3. That is all — banking finishes on its own, and this"\n'
+  printf 'echo "     window closes itself when it is done."\n'
   printf 'echo ""\n'
   # $$ before the exec IS the claude process's pid (exec replaces this shell in place),
   # and it lives in the config dir so it survives any crash between here and a journal
-  # write — the journal only has to point at the directory.
+  # write — the journal only has to point at the directory. The start-time token beside
+  # it is what makes the pid PROVABLE later: exec preserves both pid and start time, so
+  # this token still describes `claude`, and a recycled pid cannot match it. Nothing is
+  # ever signalled without that match.
   printf 'echo $$ > %q\n' "$CFG/login.pid"
+  printf 'ps -o stat=,lstart= -p $$ 2>/dev/null | tr -s " " | sed "s/^ *//;s/^[^ ]* //;s/ *$//" > %q\n' "$CFG/login.start"
   printf 'CLAUDE_CONFIG_DIR=%q exec /usr/bin/env%s %q\n' "$CFG" "$UARGS" "$CLAUDE"
 } >"$LOGIN_SH"
 chmod 700 "$LOGIN_SH"

@@ -4,6 +4,24 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
 
 ## Unreleased
 
+- **v111-r3 — the sweep could kill an innocent process.** The re-login journal's
+  reaper signalled whatever pid was recorded in a stale entry, with no proof that
+  the pid was still that login. Pids are recycled, most eagerly right after a
+  reboot — which is precisely when a stale entry gets swept — so an age-expired
+  entry could SIGTERM/SIGKILL an unrelated process. The launcher now records a
+  start-time token beside its pid (`exec` preserves both, so the token still
+  describes `claude`), and nothing is signalled unless that token matches exactly;
+  a missing, unreadable or mismatched token means no kill, while the sweep still
+  reclaims the slots, dir and entry, because recoverability must not depend on the
+  kill. Also: the `config_dir` journal stamp is now fatal rather than best-effort
+  (a lost stamp silently reinstated the stranded-credential leak for that run, so
+  the flow aborts before the Terminal opens); the sweep no longer holds the
+  journal lock across process termination and window closing, which could exceed
+  the stale-lock threshold and let it clobber a concurrent claim; the
+  `.relogin.*` name guard moved onto the shared sweep helper so every caller gets
+  it; and the login window no longer tells the owner to close a window that now
+  closes itself.
+
 - **v111-r2 — two failure-path holes in the re-login flow.** (1) The banked
   credential is now ASSERTED to be the one the login captured.
   `bank-account.sh` re-reads the credential itself through `cred_read`, whose

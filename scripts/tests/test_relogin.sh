@@ -42,16 +42,21 @@ STUB
 
 # A "login" that opens and then just sits there, the way a real one does while the human
 # is in the browser. Records its pid exactly as the generated launcher does.
-_make_hanging_terminal_stub() {  # <path>
-  cat > "$1" <<'STUB'
+_make_hanging_terminal_stub() {  # <path> <witness-pid-file>
+  cat > "$1" <<STUB
 #!/bin/bash
-cfg="$2"
+cfg="\$2"
 # Drop the inherited stdout FIRST. A real Terminal-open returns immediately; this stub
 # lingers, and if it kept the caller's capture pipe open the test would measure pipe
 # closure instead of what it is actually about — whether the login process gets killed.
 exec >/dev/null 2>&1
 sleep 600 &
-echo $! > "$cfg/login.pid"
+lp=\$!
+# BOTH files, exactly as the generated launcher writes them: the pid is not proof on its
+# own, and without the start-time token the flow correctly refuses to signal anything.
+echo "\$lp" > "\$cfg/login.pid"
+ps -o stat=,lstart= -p "\$lp" 2>/dev/null | tr -s " " | sed "s/^ *//;s/^[^ ]* //;s/ *\\\$//" > "\$cfg/login.start"
+echo "\$lp" > "$2"
 wait
 STUB
   chmod +x "$1"
@@ -376,6 +381,105 @@ assert_file_absent "$base/fakekc.svc-${svc##*-}" "the sweep deletes the slot tha
 assert_eq "{}" "$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))" "$BANK_DIR/.relogin-journal.json")" \
   "the sweep drops the reaped entry"
 
+# A RECYCLED pid must never be signalled. This is the sweep's most dangerous moment: an
+# age-expired entry whose recorded pid now belongs to an unrelated process — most likely
+# right after a reboot, when low pids are handed out again. Proof is the start-time token
+# the launcher wrote beside its pid; an innocent process cannot match it, so it must be
+# left strictly alone while the sweep still reclaims everything else.
+new_env relogin-recycled >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+recycled="$BANK_DIR/.relogin.RECYCLED1"; mkdir -p "$recycled"
+svc="$(python3 -c "import sys;sys.path.insert(0,'$AB_DIR');import seedflow;print(seedflow.config_slot_service(sys.argv[1]))" "$recycled")"
+printf '{"claudeAiOauth":{"accessToken":"stranded"}}' > "$base/fakekc.svc-${svc##*-}"
+
+sleep 300 & innocent=$!
+echo "$innocent" > "$recycled/login.pid"
+# the token an EARLIER process wrote — the innocent one cannot have this start time
+printf 'Mon Jan  1 00:00:00 2001' > "$recycled/login.start"
+# age-expired, so the entry is swept rather than treated as pending
+python3 - "$BANK_DIR/.relogin-journal.json" "$TARGET" "$recycled" "$innocent" <<'JRNL'
+import json, sys, time
+p, email, cfg, pid = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+json.dump({email: {"config_dir": cfg, "started_at": int(time.time()) - 99999,
+                   "owner_pid": pid, "term_window": ""}}, open(p, "w"))
+JRNL
+
+python3 "$CAPTURE" journal-sweep "$BANK_DIR" 900 >/dev/null 2>&1
+if kill -0 "$innocent" 2>/dev/null; then alive=1; else alive=0; fi
+assert_eq "1" "$alive" "a recycled pid is NOT killed — no proof, no signal"
+assert_file_absent "$recycled" "the sweep still reclaims the dir when it may not kill"
+assert_file_absent "$base/fakekc.svc-${svc##*-}" "the sweep still reclaims the slot when it may not kill"
+assert_eq "{}" "$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))" "$BANK_DIR/.relogin-journal.json")" \
+  "the sweep still drops the entry when it may not kill"
+kill "$innocent" 2>/dev/null; wait "$innocent" 2>/dev/null
+
+# and the proof works in the other direction: a MATCHING token permits the kill
+new_env relogin-proven >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
+proven="$BANK_DIR/.relogin.PROVEN1"; mkdir -p "$proven"
+sleep 300 & real=$!
+echo "$real" > "$proven/login.pid"
+ps -o stat=,lstart= -p "$real" 2>/dev/null | tr -s " " | sed "s/^ *//;s/^[^ ]* //;s/ *\$//" > "$proven/login.start"
+python3 - "$BANK_DIR/.relogin-journal.json" "$TARGET" "$proven" 99999 <<'JRNL'
+import json, sys, time
+p, email, cfg, pid = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+json.dump({email: {"config_dir": cfg, "started_at": int(time.time()) - 99999,
+                   "owner_pid": pid, "term_window": ""}}, open(p, "w"))
+JRNL
+python3 "$CAPTURE" journal-sweep "$BANK_DIR" 900 >/dev/null 2>&1
+sleep 1
+if kill -0 "$real" 2>/dev/null; then alive=1; else alive=0; fi
+assert_eq "0" "$alive" "a PROVEN login pid is terminated by the sweep"
+kill "$real" 2>/dev/null; wait "$real" 2>/dev/null
+
+# The sweep must not hold the journal lock across its slow work. Closing a Terminal
+# window can take seconds; two such entries under the lock would blow past the
+# stale-lock threshold, and a concurrent claimer that stole the lock would then have its
+# fresh claim clobbered by the sweep's own write. Both halves are checked here: the claim
+# lands promptly WHILE the sweep is in its slow phase, and it survives the sweep's finish.
+new_env relogin-sweeplock >/dev/null
+base="$(dirname "$BANK_DIR")"
+export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
+cat > "$base/slow-osascript" <<'SLOW'
+#!/bin/bash
+cat >/dev/null
+sleep 4
+SLOW
+chmod +x "$base/slow-osascript"
+export ACCOUNT_BANK_OSASCRIPT_BIN="$base/slow-osascript"
+
+for n in 1 2; do mkdir -p "$BANK_DIR/.relogin.SLOW$n"; done
+python3 - "$BANK_DIR/.relogin-journal.json" "$BANK_DIR" <<'JRNL'
+import json, sys, time
+p, bank = sys.argv[1], sys.argv[2]
+old = int(time.time()) - 99999
+json.dump({"a@x.com": {"config_dir": bank + "/.relogin.SLOW1", "started_at": old,
+                       "owner_pid": 99999, "term_window": "101"},
+           "b@x.com": {"config_dir": bank + "/.relogin.SLOW2", "started_at": old,
+                       "owner_pid": 99999, "term_window": "102"}}, open(p, "w"))
+JRNL
+
+python3 "$CAPTURE" journal-sweep "$BANK_DIR" 900 >/dev/null 2>&1 &
+sweep_pid=$!
+sleep 1                                  # the sweep is now inside its slow phase
+claim_start=$(date +%s)
+python3 "$CAPTURE" journal-claim "$BANK_DIR" "$TARGET" "$$" 900 >/dev/null 2>&1
+claim_rc=$?
+claim_took=$(( $(date +%s) - claim_start ))
+assert_eq "0" "$claim_rc" "a claim taken during a sweep succeeds"
+if [ "$claim_took" -le 2 ]; then quick=1; else quick=0; fi
+assert_eq "1" "$quick" "the claim is not blocked behind the sweep's slow work (${claim_took}s)"
+wait "$sweep_pid" 2>/dev/null
+assert_ne "" "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('$TARGET',''))" "$BANK_DIR/.relogin-journal.json")" \
+  "the sweep does not clobber a claim taken while it was running"
+assert_eq "" "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('a@x.com',''))" "$BANK_DIR/.relogin-journal.json")" \
+  "the sweep still reaped the stale entries"
+unset ACCOUNT_BANK_OSASCRIPT_BIN
+
 # a LIVE entry is left alone by the sweep and REFUSES a second invocation
 new_env relogin-double >/dev/null
 base="$(dirname "$BANK_DIR")"
@@ -406,15 +510,17 @@ export ACCOUNT_BANK_FAKE_KEYCHAIN="$base/fakekc"
 export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
 set_active "$OTHER" "at-other"
 bank_record "$TARGET" "old-at" "old-rt" "$PAST" "max" "claude_max" "needs-relogin"
-_make_hanging_terminal_stub "$base/hang.sh"
+_make_hanging_terminal_stub "$base/hang.sh" "$base/hanging.pid"
 out="$(ACCOUNT_BANK_RELOGIN_DETACH=0 ACCOUNT_BANK_RELOGIN_TIMEOUT=4 \
        ACCOUNT_BANK_RELOGIN_TERMINAL_CMD="/bin/bash $base/hang.sh" \
        ACCOUNT_BANK_FAKE_PROFILE="RESOLVED $TARGET" \
        /bin/bash "$RELOGIN" "$TARGET" --sync 2>&1)"; rc=$?
 assert_eq "4" "$rc" "the hanging login times out"
 sleep 1
-survivors="$(pgrep -f 'sleep 600' | wc -l | tr -d ' ')"
+hung="$(cat "$base/hanging.pid" 2>/dev/null || echo 0)"
+if [ "$hung" -gt 0 ] && kill -0 "$hung" 2>/dev/null; then survivors=1; else survivors=0; fi
 assert_eq "0" "$survivors" "the abandoned login process is killed, not left to strand a credential"
+kill "$hung" 2>/dev/null
 assert_eq "{}" "$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1]))))" "$BANK_DIR/.relogin-journal.json")" \
   "an abandoned flow releases its journal entry"
 
@@ -434,7 +540,7 @@ export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
 export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
-cfg="$base/slotseat"; mkdir -p "$cfg"
+cfg="$base/.relogin.slotseat"; mkdir -p "$cfg"
 svc="$(python3 -c "import sys;sys.path.insert(0,'$AB_DIR');import seedflow;print(seedflow.config_slot_service(sys.argv[1]))" "$cfg")"
 printf '{"claudeAiOauth":{"accessToken":"slot-at","refreshToken":"slot-rt","expiresAt":%s}}' "$FUT" \
   > "$base/fakekc.svc-${svc##*-}"
@@ -458,7 +564,7 @@ export ACCOUNT_BANK_CLAUDE_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage"
 export ACCOUNT_BANK_TOTAL_DEADLINE="8"
 export ACCOUNT_BANK_OSASCRIPT_BIN="/usr/bin/true"
-cfg="$base/cfgdir"; mkdir -p "$cfg"
+cfg="$base/.relogin.cfgdir"; mkdir -p "$cfg"
 for spelling in "$cfg" "$cfg/"; do
   svc="$(python3 -c "import sys;sys.path.insert(0,'$AB_DIR');import seedflow;print(seedflow.config_slot_service(sys.argv[1]))" "$spelling")"
   printf '{"claudeAiOauth":{"accessToken":"x"}}' > "$base/fakekc.svc-${svc##*-}"

@@ -272,7 +272,14 @@ def _slot_services(config_dir):
 
 
 def _sweep_config_dir(config_dir):
-    """Delete every per-config-dir slot this path could have produced, then the dir."""
+    """Delete every per-config-dir slot this path could have produced, then the dir.
+
+    The name guard lives here rather than at the sweep's call site so EVERY caller gets
+    it: this function deletes a directory tree and keychain items, and the paths it is
+    handed can come from a journal file on disk. Only dirs this flow creates
+    (`.relogin.XXXXXXXX`) are ever eligible."""
+    if not config_dir or not os.path.basename(config_dir.rstrip("/")).startswith(".relogin."):
+        return 0
     deleted = 0
     for svc in sorted(_slot_services(config_dir)):
         # never let a computed name reach `security delete` unless it is unmistakably a
@@ -452,11 +459,30 @@ def _alive(pid):
         return False
 
 
+def _proc_starttime(pid):
+    """A per-process start-time token, mirroring lib.sh `_proc_starttime` (and
+    banklock/sessions): empty for a gone pid, a ps failure, OR a zombie — a zombie still
+    reports lstart but is dead for every purpose we have. Two processes can share a pid
+    across time; they cannot share a pid AND a start time."""
+    try:
+        r = subprocess.run(["/bin/ps", "-o", "stat=,lstart=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ""
+    if r.returncode != 0:
+        return ""
+    line = r.stdout.strip()
+    if not line:
+        return ""
+    parts = line.split()
+    if not parts or parts[0].startswith("Z"):
+        return ""
+    return " ".join(parts[1:]).strip()
+
+
 def _login_pid(entry):
-    """The pid of the `claude` the login window is running. The launcher records it INSIDE
-    the config dir rather than in the journal, so it survives a crash between opening the
-    window and any journal update — the file is written before the exec, the journal only
-    has to point at the directory."""
+    """The pid of the `claude` the login window is running — WITHOUT any claim that the
+    process still is that login. Use `_provable_login_pid` before signalling anything."""
     cfg = entry.get("config_dir") or ""
     if not cfg:
         return None
@@ -465,6 +491,41 @@ def _login_pid(entry):
             return int(f.read().strip())
     except Exception:
         return None
+
+
+def _provable_login_pid(entry):
+    """(pid, reason) — a pid we can PROVE is still this entry's login, or (None, why not).
+
+    A recorded pid on its own proves nothing: pids are recycled, most eagerly right after
+    a reboot, which is exactly when a stale journal entry gets swept. Signalling on that
+    evidence kills whatever innocent process inherited the number. So the launcher records
+    its own start time next to its pid — `exec` preserves both, so the token it writes
+    before becoming `claude` still describes `claude` — and nothing is signalled unless
+    the live start time for that pid matches it exactly.
+
+    Uncertainty is not permission: a missing token, an unreadable one, or any mismatch
+    yields no pid, the same way an "error" seat read is UNKNOWN rather than "absent".
+    The caller must still sweep the slots, dir and entry — recoverability is what the
+    journal is for, and it must never depend on our being allowed to kill something."""
+    cfg = entry.get("config_dir") or ""
+    if not cfg:
+        return None, "no config dir recorded"
+    pid = _login_pid(entry)
+    if not pid:
+        return None, "no login pid recorded"
+    try:
+        with open(os.path.join(cfg, "login.start")) as f:
+            recorded = f.read().strip()
+    except Exception:
+        return None, "no start-time token recorded"
+    if not recorded:
+        return None, "empty start-time token"
+    live = _proc_starttime(pid)
+    if not live:
+        return None, "process is gone"
+    if live != recorded:
+        return None, "pid %d was recycled (start time differs)" % pid
+    return pid, "proven"
 
 
 def _entry_pending(entry, max_age):
@@ -477,7 +538,9 @@ def _entry_pending(entry, max_age):
         age = max_age + 1
     if age > max_age:
         return False
-    return _alive(entry.get("owner_pid")) or _alive(_login_pid(entry))
+    if _alive(entry.get("owner_pid")):
+        return True
+    return _provable_login_pid(entry)[0] is not None
 
 
 def cmd_journal_claim(bank_dir, email, owner_pid, max_age):
@@ -518,9 +581,16 @@ def cmd_journal_update(bank_dir, email, key, value):
                 d[email] = {"config_dir": "", "started_at": int(time.time()),
                             "owner_pid": 0, "term_window": ""}
             d[email][key] = int(value) if key == "owner_pid" else value
-            _journal_store(bank_dir, d)
+            if not _journal_store(bank_dir, d):
+                sys.stderr.write("journal-update: could not persist %s\n" % key)
+                return 1
     except TimeoutError:
-        return 0
+        # Reported, never swallowed: a lost config_dir stamp leaves the entry pointing at
+        # nothing, the sweep then has no dir to reclaim, and the leak this journal exists
+        # to prevent comes back for that run. The caller decides what that costs — for the
+        # config_dir stamp, the shell aborts before the Terminal is ever opened.
+        sys.stderr.write("journal-update: journal lock busy; %s NOT recorded\n" % key)
+        return 1
     return 0
 
 
@@ -557,25 +627,26 @@ def _close_terminal_window(window_id):
 
 
 def _terminate_login(entry):
-    """Stop the login this entry started: the `claude` process first, then its window.
-    Called on every path that abandons a flow — otherwise a login completed after we
-    gave up writes a live credential into a slot whose config dir we already deleted."""
-    pid = _login_pid(entry)
-    killed = False
-    if pid and _alive(pid):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            killed = True
-            for _ in range(20):
-                time.sleep(0.1)
-                if not _alive(pid):
-                    break
-            if _alive(pid):
-                os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
+    """Stop the login this entry started — but only once we can PROVE the pid is still
+    that login. Called on every path that abandons a flow, because a login completed
+    after we gave up writes a live credential into a slot whose config dir we already
+    deleted. Returns a short, honest description of what happened."""
+    pid, why = _provable_login_pid(entry)
+    if pid is None:
+        _close_terminal_window(entry.get("term_window"))
+        return "no login terminated (%s)" % why
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(20):
+            time.sleep(0.1)
+            if not _alive(pid):
+                break
+        if _alive(pid) and _proc_starttime(pid):
+            os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
     _close_terminal_window(entry.get("term_window"))
-    return killed
+    return "login terminated"
 
 
 def cmd_journal_kill(bank_dir, email):
@@ -583,36 +654,63 @@ def cmd_journal_kill(bank_dir, email):
     if not isinstance(entry, dict):
         print("no pending login")
         return 0
-    print("login terminated" if _terminate_login(entry) else "no live login to terminate")
+    print(_terminate_login(entry))
     return 0
 
 
 def cmd_journal_sweep(bank_dir, max_age):
-    """Reap every entry whose flow is over: kill anything still running, sweep the slot
-    for every spelling of its config dir, delete the dir, drop the entry. This is what
-    makes a reboot or a SIGKILL mid-login recoverable instead of permanent."""
-    reaped = []
+    """Reap every entry whose flow is over: terminate anything still provably running,
+    sweep the slot for every spelling of its config dir, delete the dir, drop the entry.
+    This is what makes a reboot or a SIGKILL mid-login recoverable instead of permanent.
+
+    Three phases, because the slow work must not happen under the lock. Terminating a
+    login can take ~2s and closing its window another ~5s; holding the lock across two
+    such entries would exceed the stale-lock threshold, and a concurrent claimer would
+    then steal the lock and have its fresh claim clobbered by our later write."""
+    # phase 1 (locked): decide, quickly
     try:
         with _JournalLock(bank_dir):
             d = _journal_load(bank_dir)
+            doomed = {}
             for email in list(d.keys()):
                 entry = d.get(email)
                 if not isinstance(entry, dict):
                     d.pop(email, None)
+                    _journal_store(bank_dir, d)
                     continue
-                if _entry_pending(entry, max_age):
+                if not _entry_pending(entry, max_age):
+                    doomed[email] = entry
+    except TimeoutError:
+        print("swept: journal busy, skipped")
+        return 0
+
+    # phase 2 (UNLOCKED): the slow, external work
+    for entry in doomed.values():
+        _terminate_login(entry)
+        cfg = entry.get("config_dir") or ""
+        if cfg:
+            _sweep_config_dir(cfg)
+
+    # phase 3 (locked): drop only the entries that are still the ones we judged. A claim
+    # taken while we were unlocked has a different started_at and must survive.
+    reaped = []
+    try:
+        with _JournalLock(bank_dir):
+            d = _journal_load(bank_dir)
+            for email, entry in doomed.items():
+                cur = d.get(email)
+                if not isinstance(cur, dict):
                     continue
-                _terminate_login(entry)
-                cfg = entry.get("config_dir") or ""
-                if cfg and os.path.basename(cfg).startswith(".relogin."):
-                    _sweep_config_dir(cfg)
+                if cur.get("started_at") != entry.get("started_at"):
+                    continue          # a NEW claim landed; leave it alone
+                if _entry_pending(cur, max_age):
+                    continue
                 d.pop(email, None)
                 reaped.append(email)
             if reaped:
                 _journal_store(bank_dir, d)
     except TimeoutError:
-        print("swept: journal busy, skipped")
-        return 0
+        pass
     print("swept: %s" % (", ".join(reaped) if reaped else "nothing stale"))
     return 0
 
