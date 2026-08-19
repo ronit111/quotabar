@@ -22,8 +22,13 @@ All notable changes to QuotaBar. Full notes on each [GitHub release](https://git
   MERGES: the target's `claudeAiOauth`, this device's other top-level keys. Bank
   records hold only `claudeAiOauth` (they always have), so no swap can resurrect a
   stale or cross-account `mcpOAuth`. `kc_write` also passes the blob to `security -i`
-  as a quoted, escaped token — measured against the real binary, a bare token
-  containing a space does not write at all.
+  as a quoted, escaped token. Measured against the real binary, the old bare form
+  was worse than a clean failure: what it does depends on the blob's CONTENT. If
+  the text after the first space does not parse as arguments, `security` errors
+  (rc 2, nothing written) — but when it does parse, and JSON is full of tokens
+  that can, `security` SILENTLY TRUNCATES the password at that space and returns
+  rc 0. Only kc_write's post-write fingerprint verify stood between that and a
+  corrupted live credential.
 - **A schema change now identifies itself (v112).** The abort that started this
   said "transient keychain read failure" when the read had in fact succeeded —
   the blob was present, parsed, and carried a credential; only a shape rule

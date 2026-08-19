@@ -172,6 +172,34 @@ def canonical_oauth(oauth):
     return json.dumps(d, sort_keys=True, separators=(",", ":"))
 
 
+def formatting_whitespace(text):
+    """True iff `text` carries whitespace BETWEEN JSON tokens — i.e. it is pretty-printed
+    rather than compact. Whitespace INSIDE a string is content, not formatting: an OAuth
+    `scope` is space-delimited by specification, which is exactly what a naive
+    `any(ch.isspace() ...)` scan got wrong in v112 and what made every swap abort.
+
+    This lives here because it had to be true in two places at once — validate_blob's
+    pre-write gate and reconcile's restore gate. Those two had already drifted apart once:
+    reconcile kept its own copy of the old character scan, and that copy is what would
+    have refused to restore a torn swap. A rule enforced in two files is a rule that will
+    disagree with itself eventually, so there is one copy now."""
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch.isspace():
+            return True
+    return False
+
+
 def merge_device_state(target_blob, live_blob):
     """The blob to install when switching accounts: the TARGET's credential, keeping the
     DEVICE's other state.

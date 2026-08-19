@@ -48,8 +48,9 @@ case "$cmd" in
     blob="${line#*-w }"
     # (v112) Model `security -i`'s own unquoting. kc_write now passes the blob as a
     # DOUBLE-QUOTED token with backslashes and quotes escaped, because CLI 2.1.235's
-    # mcpOAuth carries a space-delimited OAuth scope and a bare token containing a space
-    # does not write at all. The real binary strips the quotes and the escapes; a stub
+    # mcpOAuth carries a space-delimited OAuth scope, and a bare token containing a space
+    # either errors or is silently truncated at the space depending on what follows it.
+    # The real binary strips the quotes and the escapes; a stub
     # that stored the escaped text would quietly disagree with production and let the
     # suite pass against an encoding that does not survive a real write. (Verified
     # against /usr/bin/security on a throwaway item before this was written.)

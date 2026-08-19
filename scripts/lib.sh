@@ -732,9 +732,13 @@ kc_write() {
   # relying on "it is compact (validated: no whitespace)" to arrive as one token — an
   # invariant CLI 2.1.235 ended by moving `mcpOAuth` into this same item, where a
   # space-delimited OAuth `scope` is legitimate content. Measured against the real
-  # `security -i` before choosing: a bare blob containing a space does not write at all,
-  # and escaping the spaces as \u0020 comes back corrupted (security eats the
-  # backslash). A double-quoted token with backslashes and quotes escaped round-trips
+  # `security -i` before choosing, and the bare form is worse than it looks: what happens
+  # depends on the blob's CONTENT. When the text after the first space does not parse as
+  # arguments, security errors (rc 2, nothing written). When it does parse — and JSON is
+  # full of tokens that can — security SILENTLY TRUNCATES the password at that space and
+  # returns rc 0. Only kc_write's post-write fingerprint verify stood between that and a
+  # corrupted live credential. Escaping the spaces as \u0020 comes back corrupted too
+  # (security eats the backslash). A double-quoted token with backslashes and quotes escaped round-trips
   # exactly, for blobs with and without spaces alike — the same encoding
   # seedflow._sh_keychain_write already had to adopt for this reason. Nothing about the
   # ceremony changes: the epoch gate, schema validation, archive-before-destroy,

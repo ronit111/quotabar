@@ -224,7 +224,9 @@ def _seat_write(compact_blob):
         # to be bare, relying on the blob containing no whitespace — an invariant CLI
         # 2.1.235 ended by moving mcpOAuth (whose OAuth `scope` is space-delimited) into
         # this same item. Measured against the real `security -i`: a bare token with a
-        # space does not write at all.
+        # space either errors (rc 2) or, when the trailing text parses as arguments, is
+        # SILENTLY TRUNCATED at the space with rc 0 — the caller's verify is the only
+        # thing that would catch the second case.
         _esc = compact_blob.replace("\\", "\\\\").replace('"', '\\"')
         cmd = 'add-generic-password -U -s "%s" -a "%s" -w "%s"\n' % (
             KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, _esc)
@@ -280,27 +282,6 @@ def _stable_live_fp(retries=3):
     return f1, False
 
 
-def _formatting_whitespace(text):
-    """True iff `text` has whitespace BETWEEN JSON tokens (i.e. it is pretty-printed).
-    Whitespace inside a string is content — an OAuth `scope` is space-delimited — and
-    must not be mistaken for formatting. Mirrors validate_blob.py exactly."""
-    in_string = False
-    escaped = False
-    for ch in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        elif ch.isspace():
-            return True
-    return False
-
-
 def _restore_keychain(compact_blob, expected_live_fp):
     """Verification-aware keychain restore (finding #16 + re-review issue 8): before
     overwriting, require the LIVE keychain to STILL equal `expected_live_fp` (a
@@ -315,7 +296,7 @@ def _restore_keychain(compact_blob, expected_live_fp):
     # under CLI 2.1.235 rejects any journalled blob carrying mcpOAuth — i.e. it would
     # have refused to restore a torn swap, turning a recoverable interruption into a
     # permanent one. Mirrors validate_blob.py's string-aware check.
-    if _formatting_whitespace(compact_blob.strip()):
+    if bank_common.formatting_whitespace(compact_blob.strip()):
         return False   # security -i needs one token; a compact blob is required
     want_fp = bank_common.cred_fingerprint(compact_blob)
     try:

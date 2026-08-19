@@ -368,7 +368,10 @@ fi
 # with nothing mutated and nothing journalled. The credential fingerprint is computed over
 # claudeAiOauth alone, so target_fp is unaffected by the merge.
 if [ -n "$precompact" ]; then
-  _tb="$(umask 077; mktemp "${TMPDIR:-/tmp}/.swapblob.XXXXXX")" || {
+  # Inside the BANK, never TMPDIR: this file holds a live credential for the seconds the
+  # merge takes, and this codebase's own rule (relogin-account.sh) is that a credential on
+  # disk lives where nothing external sweeps it. 0600, and removed on every path below.
+  _tb="$(umask 077; mktemp "$BANK_DIR/.swapblob.XXXXXX")" || {
     _restore_trap; err "Aborting swap: could not stage the target blob for merge. No change made."; exit 1; }
   printf '%s' "$target_blob" > "$_tb"
   _merged="$(printf '%s' "$precompact" | python3 "$HERE/bank_common.py" --merge-device-state "$_tb")"; _mrc=$?

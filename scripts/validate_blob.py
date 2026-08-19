@@ -29,8 +29,8 @@ oa = b.get("claudeAiOauth")
 # NOT-boolean expiresAt). A stray `True`/`False` expiresAt is rejected here too.
 if not bank_common.valid_oauth(oa):
     fail("claudeAiOauth missing/invalid (need accessToken+refreshToken+numeric expiresAt)")
-# Reject FORMATTING whitespace — whitespace between JSON tokens, i.e. a
-# pretty-printed blob. kc_write needs the blob compact.
+# Reject FORMATTING whitespace — whitespace between JSON tokens, i.e. a pretty-printed
+# blob. kc_write needs the blob compact.
 #
 # (v112) This used to be `any(ch.isspace() for ch in raw)`, a character scan over the
 # whole document. That was a correct proxy for "compact" only while no string VALUE
@@ -40,28 +40,9 @@ if not bank_common.valid_oauth(oa):
 # swap-account.sh's capture gate. `compact_blob` could never fix it either: spaces inside
 # a string are content, not formatting, and re-serializing preserves them.
 #
-# The check now means exactly what it says, via a scan that knows where strings begin and
-# end. Deliberately NOT implemented as `raw == json.dumps(parsed, separators=...)`:
-# that would also assert an encoding normal form (ensure_ascii, "\/" escapes, key order)
-# that the CLI never promised, so a non-ASCII MCP server name would read as "not compact"
-# and resurrect this same class of bug.
-def _formatting_whitespace(text):
-    in_string = False
-    escaped = False
-    for ch in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        elif ch.isspace():
-            return True
-    return False
-
-if _formatting_whitespace(raw.strip()):
+# The scanner itself lives in bank_common so this gate and reconcile's restore gate
+# cannot drift apart — they already had, once, and that drift is what would have made a
+# torn swap unrecoverable.
+if bank_common.formatting_whitespace(raw.strip()):
     fail("contains formatting whitespace (must be compact JSON before keychain write)")
 sys.exit(0)

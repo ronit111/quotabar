@@ -142,15 +142,24 @@ assert_ne "0" "$?" "a blanked credential is not a valid blob however much else t
 # ---------------------------------------------------------------------------
 verdict="$(python3 -c "
 import sys; sys.path.insert(0, '$AB_DIR')
-import reconcile
-print('reject' if reconcile._formatting_whitespace(sys.argv[1]) else 'accept')" "$B235")"
+import bank_common
+print('reject' if bank_common.formatting_whitespace(sys.argv[1]) else 'accept')" "$B235")"
 assert_eq "accept" "$verdict" "reconcile accepts a journalled 2.1.235 blob (torn swaps stay recoverable)"
 
 verdict="$(python3 -c "
 import sys; sys.path.insert(0, '$AB_DIR')
-import reconcile
-print('reject' if reconcile._formatting_whitespace(sys.argv[1]) else 'accept')" '{"claudeAiOauth": {"accessToken": "A"}}')"
+import bank_common
+print('reject' if bank_common.formatting_whitespace(sys.argv[1]) else 'accept')" '{"claudeAiOauth": {"accessToken": "A"}}')"
 assert_eq "reject" "$verdict" "reconcile still rejects pretty-printed JSON"
+
+# ONE copy of the rule. reconcile keeping its own was the v112 audit's worst finding —
+# a duplicated gate is a gate that drifts, and that drift is what would have made a torn
+# swap unrecoverable. Assert the duplication cannot come back.
+assert_eq "1" "$(grep -c 'def formatting_whitespace' "$AB_DIR/bank_common.py")" "the scanner is defined exactly once"
+assert_eq "0" "$(grep -c 'def _formatting_whitespace' "$AB_DIR/reconcile.py" "$AB_DIR/validate_blob.py" | awk -F: '{t+=$2} END {print t+0}')" \
+  "neither gate keeps a private copy of it"
+assert_eq "2" "$(grep -l 'bank_common\.formatting_whitespace' "$AB_DIR/reconcile.py" "$AB_DIR/validate_blob.py" | wc -l | tr -d ' ')" \
+  "both gates call the shared one"
 
 # and its write encoding matches kc_write's, or a restore would land corrupted
 enc="$(python3 -c "
