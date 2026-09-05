@@ -768,6 +768,60 @@ def write_cache(doc):
         os.replace(tmp, CACHE_FILE)
     except Exception:
         pass
+    append_history(doc)
+
+
+def history_file():
+    """Resolved at call time, not import time: tests reassign usage.BANK_DIR to a
+    temp bank, and a constant bound at import would send their fixture rows into
+    the real history file."""
+    return os.path.join(BANK_DIR, "usage-history.jsonl")
+
+
+def append_history(doc):
+    """(v111, 2026-09-05) Append one compact line per account per poll so
+    utilisation has a time series (the cache is a snapshot only). Only rows
+    with a fresh fetch this run are appended (fetched_at newer than the last
+    line for that account), so cache-served repeats do not duplicate. Fail-soft."""
+    try:
+        HISTORY_FILE = history_file()
+        last = {}
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "rb") as f:
+                try:
+                    f.seek(-65536, 2)
+                except OSError:
+                    f.seek(0)
+                for ln in f.read().decode("utf-8", "replace").splitlines():
+                    try:
+                        r = json.loads(ln)
+                        last[(r.get("provider"), r.get("email"))] = r.get("fetched_at")
+                    except Exception:
+                        continue
+        rows = []
+        now = time.time()
+        for a in doc.get("accounts") or []:
+            fa = a.get("fetched_at")
+            key = (a.get("provider"), a.get("email"))
+            if fa is None or last.get(key) == fa:
+                continue
+            fh = a.get("five_hour") or {}
+            sd = a.get("seven_day") or {}
+            mc = a.get("model_cap") or {}
+            rows.append({"ts": round(now, 1), "fetched_at": fa,
+                         "provider": a.get("provider"), "email": a.get("email"),
+                         "active": bool(a.get("active")), "plan": a.get("plan"),
+                         "status": a.get("status"), "stale_error": a.get("stale_error"),
+                         "fh": fh.get("utilization"), "fh_reset": fh.get("resets_at"),
+                         "wk": sd.get("utilization"), "wk_reset": sd.get("resets_at"),
+                         "cap_kind": mc.get("kind"), "cap": mc.get("percent")})
+        if rows:
+            with open(HISTORY_FILE, "a") as f:
+                for r in rows:
+                    f.write(json.dumps(r, separators=(",", ":")) + "\n")
+            os.chmod(HISTORY_FILE, 0o600)
+    except Exception:
+        pass
 
 
 def prev_good(prev_accounts, provider, email):
