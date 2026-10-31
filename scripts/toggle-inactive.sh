@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# toggle-inactive.sh <email> — flip an account's inactive flag in
+# toggle-inactive.sh <email|codex> — flip an account's inactive flag in
 # $BANK_DIR/.config.json (add if absent, remove if present). An inactive account
 # stays in the bank but is never polled, refreshed or pinged. Runs under
 # the bank lock, writes atomically (0600), fail-soft on a malformed config

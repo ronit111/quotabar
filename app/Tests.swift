@@ -102,9 +102,18 @@ struct QuotaBarTests {
         let main = AccountOrdering.claudeAccountsInSnapshotOrder(rows).map(\.email)
         try expect(main == ["a@example.com", "c@example.com"],
                    "an inactive needs-relogin account must not reach the cards or the icon inputs")
-        try expect(AccountOrdering.inactiveClaudeAccounts(rows).map(\.email) == ["b@example.com"], "it goes to the compact list")
+        try expect(AccountOrdering.inactiveAccounts(rows).map(\.email) == ["b@example.com"], "it goes to the compact list")
         try expect(!InactiveAccountPolicy.canMark(rows[0]), "the live account cannot be marked")
         try expect(InactiveAccountPolicy.canMark(rows[2]), "a parked account can")
+        let codexRows = try JSONDecoder().decode([UsageAccount].self, from: """
+        [{"provider":"codex","email":"a@example.com","active":false},
+         {"provider":"codex","email":"Codex","active":false,"inactive":true}]
+        """.data(using: .utf8)!)
+        try expect(InactiveAccountPolicy.canMark(codexRows[0]), "the Codex card can be marked")
+        try expect(codexRows[0].inactiveKey == "codex", "Codex never uses its email, which can match a Claude account")
+        try expect(rows[2].inactiveKey == "c@example.com", "a Claude account uses its email")
+        try expect(!RemoveAccountPolicy.canRemove(codexRows[1]), "the Codex login is not ours to remove")
+        try expect(AccountOrdering.inactiveAccounts(codexRows).map(\.email) == ["Codex"], "inactive Codex goes to the compact list")
         try expect(
             PopoverLayout.estimatedHeight(claudeAccounts: 1, reloginAccounts: 0, inactiveAccounts: 1, hasCodex: false,
                                           isStale: false, hasHealthBanner: false)
