@@ -128,7 +128,7 @@ private struct InactiveAccountRow: View {
                     title: InactiveAccountPolicy.reactivateTitle,
                     help: "Start checking this account again.",
                     identifier: "quotabar.reactivate.\(safeIdentifier(account.email))",
-                    disabled: model.isBusy(email: account.email),
+                    disabled: model.isBusy(email: account.inactiveKey),
                     action: { model.toggleInactive(account) }
                 )
 
@@ -141,7 +141,7 @@ private struct InactiveAccountRow: View {
                 RemoveConfirmationStrip(account: account, model: model)
             }
 
-            if let error = model.cardError(email: account.email) {
+            if let error = model.cardError(email: account.inactiveKey) {
                 Text(error)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.red)
@@ -951,8 +951,8 @@ private struct CodexAccountCard: View {
                 AccountFreshnessCaption(freshness: freshness, text: caption)
             }
 
-            if model.codexPingAvailable {
-                HStack(alignment: .center, spacing: 7) {
+            HStack(alignment: .center, spacing: 7) {
+                if model.codexPingAvailable {
                     CardActionButton(
                         title: model.codexPingTitle,
                         showSpinner: model.isCodexPingRunning,
@@ -961,16 +961,25 @@ private struct CodexAccountCard: View {
                         identifier: "quotabar.codex.ping",
                         action: { model.codexPing() }
                     )
-                    Spacer(minLength: 2)
                 }
+                Spacer(minLength: 2)
+                QuietTextButton(
+                    title: InactiveAccountPolicy.markTitle,
+                    help: InactiveAccountPolicy.markHelp,
+                    identifier: "quotabar.markInactive.codex",
+                    disabled: model.isCodexBusy,
+                    action: { model.toggleInactive(account) }
+                )
+            }
 
-                if let error = model.codexCardError {
-                    Text(error)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.red)
-                        .lineLimit(2)
-                        .accessibilityIdentifier("quotabar.codex.error")
-                } else if let status = model.codexCardStatus {
+            if let error = model.codexCardError {
+                Text(error)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                    .accessibilityIdentifier("quotabar.codex.error")
+            } else if model.codexPingAvailable {
+                if let status = model.codexCardStatus {
                     Label(status, systemImage: "checkmark.circle.fill")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.green)

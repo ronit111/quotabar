@@ -2050,8 +2050,13 @@ def main():
                 r["plan_name"], r["plan_name_at"] = reuse["plan_name"], reuse.get("plan_name_at")
             results.append(r)
 
-        # --- codex (always polled, unless ONLY / past the deadline / backed off) ---
-        if ONLY or codex_backed_off:
+        # --- codex (always polled, unless inactive / ONLY / past the deadline / backed off) ---
+        # Inactive uses the fixed key "codex", not an email: a Codex login can share its email
+        # with a banked Claude account, and marking one must not mark the other.
+        if "codex" in inactive:
+            results.append({"provider": "codex", "email": "Codex", "active": False,
+                            "inactive": True, "status": "ok", "worst_limit": None})
+        elif ONLY or codex_backed_off:
             good = prev_good(prev.get("accounts", []), "codex", None)
             if good:
                 g = dict(good)

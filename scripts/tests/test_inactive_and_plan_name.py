@@ -62,5 +62,31 @@ doc = {"accounts": [
 d = autopick.decide(doc, {"auto_pick": False}, "a@x")
 ok("b@x" not in json.dumps(d), "the warning does not offer an inactive account")
 
+# Codex: a fixed key, because its email can match a banked Claude account. Real runs of the poller.
+import subprocess
+def poll(home):
+    env = dict(os.environ, HOME=home, ACCOUNT_BANK_DIR=os.path.join(home, "bank"),
+               CLAUDE_JSON=os.path.join(home, ".claude.json"), ACCOUNT_BANK_SECURITY_BIN="/usr/bin/false",
+               ACCOUNT_BANK_CODEX_URL="http://127.0.0.1:9/usage")
+    out = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "usage.py")], env=env,
+                         capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    return [a for a in json.loads(out.stdout).get("accounts", []) if a.get("provider") == "codex"]
+home = tempfile.mkdtemp()
+os.makedirs(os.path.join(home, ".codex")); os.makedirs(os.path.join(home, "bank"))
+json.dump({"tokens": {"access_token": "t", "account_id": "x"}}, open(os.path.join(home, ".codex", "auth.json"), "w"))
+cfg = os.path.join(home, "bank", ".config.json")
+json.dump({"inactive": ["codex"]}, open(cfg, "w"))
+rows = poll(home)
+ok(len(rows) == 1 and rows[0].get("inactive") is True and rows[0].get("email") == "Codex"
+   and rows[0].get("worst_limit") is None and not rows[0].get("error"),
+   "inactive Codex is one quiet row, with no network attempt to fail")
+json.dump({"inactive": ["codex@x"]}, open(cfg, "w"))
+rows = poll(home)
+ok(len(rows) == 1 and not rows[0].get("inactive") and rows[0].get("error"),
+   "an email on the list does not silence Codex; it is polled again")
+json.dump({"inactive": []}, open(cfg, "w"))
+rows = poll(home)
+ok(len(rows) == 1 and not rows[0].get("inactive"), "reactivated Codex is polled")
+
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

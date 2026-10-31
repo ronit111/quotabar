@@ -235,10 +235,11 @@ enum InactiveAccountPolicy {
     static let markHelp = "Keep this account saved but stop checking it. It shrinks to one line and no longer affects the menu bar icon."
     static let reactivateTitle = "Reactivate"
 
-    /// Parked, banked Claude accounts only: the live account cannot go quiet, and a monitored
-    /// home or an unlinked login has no bank record to keep.
+    /// Codex, or a parked, banked Claude account: the live Claude account cannot go quiet, and a
+    /// monitored home or an unlinked login has no bank record to keep.
     static func canMark(_ account: UsageAccount) -> Bool {
-        account.isClaude && !account.active && !account.isUnresolved && !account.isMonitorOnly
+        if account.isCodex { return true }
+        return account.isClaude && !account.active && !account.isUnresolved && !account.isMonitorOnly
     }
 }
 
@@ -562,6 +563,8 @@ struct UsageAccount: Decodable, Identifiable, Sendable {
 
     var id: String { "\(provider):\(email)" }
     var isInactive: Bool { inactive == true }
+    /// Codex uses a fixed key: its email can match a banked Claude account.
+    var inactiveKey: String { isCodex ? "codex" : email }
     var hasNoFiveHourLimit: Bool { noFiveHourLimit == true }
     var chipPlan: String? { planName ?? plan }
     var isClaude: Bool { provider.lowercased() == "claude" }
@@ -648,8 +651,8 @@ enum AccountOrdering {
         accounts.filter { $0.isClaude && !$0.isInactive }
     }
 
-    static func inactiveClaudeAccounts(_ accounts: [UsageAccount]) -> [UsageAccount] {
-        accounts.filter { $0.isClaude && $0.isInactive }
+    static func inactiveAccounts(_ accounts: [UsageAccount]) -> [UsageAccount] {
+        accounts.filter(\.isInactive)
     }
 }
 

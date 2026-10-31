@@ -537,11 +537,11 @@ final class AppModel: ObservableObject {
     }
 
     var codexAccount: UsageAccount? {
-        snapshot?.accounts.first(where: \UsageAccount.isCodex)
+        snapshot?.accounts.first { $0.isCodex && !$0.isInactive }
     }
 
     var inactiveAccounts: [UsageAccount] {
-        AccountOrdering.inactiveClaudeAccounts(snapshot?.accounts ?? [])
+        AccountOrdering.inactiveAccounts(snapshot?.accounts ?? [])
     }
 
     var activeAccountInitial: String {
@@ -797,8 +797,8 @@ final class AppModel: ObservableObject {
 
     func toggleInactive(_ account: UsageAccount) {
         guard account.isInactive || InactiveAccountPolicy.canMark(account) else { return }
-        enqueueAction(.toggleInactive, key: account.email, executable: Paths.bash,
-                      arguments: [Paths.toggleInactive, account.email], successMessage: nil)
+        enqueueAction(.toggleInactive, key: account.inactiveKey, executable: Paths.bash,
+                      arguments: [Paths.toggleInactive, account.inactiveKey], successMessage: nil)
     }
 
     /// Forget a PARKED Claude account: deletes its bank record and drops it from auto-ping via
