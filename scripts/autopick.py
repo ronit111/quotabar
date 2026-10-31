@@ -116,7 +116,8 @@ def _pct(elig, email):
 
 
 def decide(doc, config, active_email):
-    accounts = [a for a in doc.get("accounts", []) if a.get("provider") == "claude"]
+    accounts = [a for a in doc.get("accounts", [])
+                if a.get("provider") == "claude" and not a.get("inactive")]
     active = next((a for a in accounts if a.get("email") == active_email), None)
     active_pct = worst_of(active) if active else None
 

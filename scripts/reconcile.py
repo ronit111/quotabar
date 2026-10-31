@@ -263,6 +263,21 @@ def _live_keychain_blob():
     return None
 
 
+def _live_login_is(email):
+    """Does the profile endpoint name the live credential as `email`? Any doubt is False. A
+    redirected keychain means a test sandbox: never send its token over the network."""
+    if os.environ.get("ACCOUNT_BANK_SECURITY_BIN") or os.environ.get("ACCOUNT_BANK_FAKE_KEYCHAIN") \
+            or os.environ.get("STUB_KC_FILE"):
+        return False
+    try:
+        import identity
+        blob = _live_keychain_blob()
+        token = json.loads(blob)["claudeAiOauth"]["accessToken"]
+        return identity.verify_owner(token, email, timeout=5)[0] is True
+    except Exception:
+        return False
+
+
 def _live_fp():
     # (v108) the fingerprint of the live SEAT — the same thing _seat_write just wrote,
     # so the post-write verify below actually proves the write landed where the CLI reads.
@@ -511,7 +526,16 @@ def reconcile_swap_journal():
                          "banked credential for the active account; keeping journal (unresolved).\n")
         return unresolved("third-account keychain unverified against its banked credential")
 
-    # Anything else (keychain unreadable, or diverged while active still == source)
+    # Case E — diverged while active still == source, and the profile endpoint names the live
+    # credential as that same account. A /login back onto the source (or a token refresh) did
+    # this; both stores agree and there is nothing to roll back. Without this the journal blocks
+    # every cache write until someone clears it by hand (hit 29 and 31 Oct 2026).
+    if live_fp and live_fp != pre_fp and live_fp != target_fp \
+            and current and active == current and _live_login_is(active):
+        sys.stderr.write("reconcile: live login verified as the swap source; dropping stale journal.\n")
+        return resolved()
+
+    # Anything else (keychain unreadable, or diverged and unverified)
     # is ambiguous. Keep the journal and report unresolved so mutators block.
     sys.stderr.write("reconcile: swap journal ambiguous (live_fp/active unrecognized); keeping journal.\n")
     return unresolved("ambiguous live_fp/active")

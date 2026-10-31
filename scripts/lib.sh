@@ -921,10 +921,14 @@ except Exception:
     c = {}
 ap = c.get("auto_ping")
 ap = [e for e in ap if isinstance(e, str)] if isinstance(ap, list) else []
-if email not in ap:
+ia = c.get("inactive")
+ia = [e for e in ia if isinstance(e, str)] if isinstance(ia, list) else []
+if email not in ap and email not in ia:
     print("0")
     sys.exit(0)
 c["auto_ping"] = [e for e in ap if e != email]
+if ia:
+    c["inactive"] = [e for e in ia if e != email]
 dirn = os.path.dirname(config) or "."
 fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".config.")
 with os.fdopen(fd, "w") as f:
