@@ -25,14 +25,15 @@ PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 OAUTH_BETA = "oauth-2025-04-20"
 TIMEOUT_S = 15
 
-IdentityResult = namedtuple("IdentityResult", "verdict uuid email plan detail")
+IdentityResult = namedtuple("IdentityResult", "verdict uuid email plan detail organization_type rate_limit_tier",
+                            defaults=("", ""))
 # verdict: "RESOLVED" | "INVALID" | "INDETERMINATE"
 # plan: "max" | "pro" | "free" | "" (advisory only — never an identity input)
 # detail: short reason string, guaranteed token-free
 
 
 def _plan_of(account):
-    if account.get("has_claude_max"):
+    if account.get("has_claude_max") or account.get("has_claude_ultra"):
         return "max"
     if account.get("has_claude_pro"):
         return "pro"
@@ -111,7 +112,9 @@ def resolve(access_token, timeout=None):
     except Exception as e:
         # A 200 we cannot parse identifies nothing — INDETERMINATE, never a guess.
         return IdentityResult("INDETERMINATE", "", "", "", f"unparseable profile: {type(e).__name__}")
-    return IdentityResult("RESOLVED", uuid, email, _plan_of(acct), "ok")
+    org = d.get("organization") if isinstance(d.get("organization"), dict) else {}
+    return IdentityResult("RESOLVED", uuid, email, _plan_of(acct), "ok",
+                          org.get("organization_type") or "", org.get("rate_limit_tier") or "")
 
 
 def verify_owner(access_token, expected_email, timeout=None):

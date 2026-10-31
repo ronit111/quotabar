@@ -25,6 +25,7 @@ struct PopoverView: View {
             if PopoverLayout.needsScroll(
                 claudeAccounts: model.claudeAccounts.count,
                 reloginAccounts: reloginCount,
+                inactiveAccounts: model.inactiveAccounts.count,
                 hasCodex: model.codexAccount != nil,
                 isStale: model.isStale,
                 hasHealthBanner: model.hasHealthAnomaly
@@ -35,6 +36,7 @@ struct PopoverView: View {
                 .frame(height: PopoverLayout.regionHeight(
                     claudeAccounts: model.claudeAccounts.count,
                     reloginAccounts: reloginCount,
+                    inactiveAccounts: model.inactiveAccounts.count,
                     hasCodex: model.codexAccount != nil,
                     isStale: model.isStale,
                     hasHealthBanner: model.hasHealthAnomaly
@@ -82,7 +84,11 @@ struct PopoverView: View {
                 CodexAccountCard(account: codex, model: model)
             }
 
-            if model.claudeAccounts.isEmpty && model.codexAccount == nil {
+            ForEach(model.inactiveAccounts) { account in
+                InactiveAccountRow(account: account, model: model)
+            }
+
+            if model.claudeAccounts.isEmpty && model.inactiveAccounts.isEmpty && model.codexAccount == nil {
                 EmptyStateView(model: model)
             }
         }
@@ -97,6 +103,58 @@ struct PopoverView: View {
     }
 }
 
+
+/// An account kept in the bank but not checked: one line, no gauges, one way back.
+private struct InactiveAccountRow: View {
+    let account: UsageAccount
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Text(account.displayName)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer(minLength: 2)
+
+                Text("Inactive")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+
+                QuietTextButton(
+                    title: InactiveAccountPolicy.reactivateTitle,
+                    help: "Start checking this account again.",
+                    identifier: "quotabar.reactivate.\(safeIdentifier(account.email))",
+                    disabled: model.isBusy(email: account.email),
+                    action: { model.toggleInactive(account) }
+                )
+
+                if RemoveAccountPolicy.canRemove(account) {
+                    RemoveAccountControl(account: account, model: model)
+                }
+            }
+
+            if model.isArmedForRemoval(account) {
+                RemoveConfirmationStrip(account: account, model: model)
+            }
+
+            if let error = model.cardError(email: account.email) {
+                Text(error)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.thinMaterial.opacity(0.6), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("quotabar.inactive.\(safeIdentifier(account.email))")
+    }
+}
 
 private struct EmptyStateView: View {
     @ObservedObject var model: AppModel
@@ -274,7 +332,9 @@ private struct ClaudeAccountCard: View {
 
                     Spacer(minLength: 2)
 
-                    AutoPingToggle(account: account, model: model)
+                    if !account.hasNoFiveHourLimit {
+                        AutoPingToggle(account: account, model: model)
+                    }
                 }
 
                 CardSecondaryActions(account: account, model: model)
@@ -337,6 +397,8 @@ private struct ClaudeAccountCard: View {
                 identifier: "quotabar.rebank.\(safeIdentifier(account.email))",
                 action: { model.rebank(account) }
             )
+
+            CardSecondaryActions(account: account, model: model)
 
             if let error = model.cardError(email: account.email) {
                 Text(error)
@@ -465,7 +527,7 @@ private struct AccountHeader: View {
 
             Spacer(minLength: 2)
 
-            if let plan = PlanCapsulePresentation.text(for: account.plan) {
+            if let plan = PlanCapsulePresentation.text(for: account.chipPlan) {
                 Chip(text: plan, tint: .secondary)
             }
 
@@ -623,9 +685,10 @@ private struct CardSecondaryActions: View {
         PinnedSessionPolicy.canOpen(account, epoch: model.currentEpoch)
     }
     private var showsUnseed: Bool { UnseedPolicy.canUnseed(account) }
+    private var showsMarkInactive: Bool { InactiveAccountPolicy.canMark(account) }
 
     var body: some View {
-        if showsPinned || showsUnseed {
+        if showsPinned || showsUnseed || showsMarkInactive {
             HStack(spacing: 7) {
                 if showsPinned {
                     QuietTextButton(
@@ -653,6 +716,21 @@ private struct CardSecondaryActions: View {
                         identifier: "quotabar.unseed.\(safeIdentifier(account.email))",
                         disabled: model.isBusy(email: account.email),
                         action: { model.toggleUnseedConfirmation(account) }
+                    )
+                }
+                if showsMarkInactive {
+                    if showsPinned || showsUnseed {
+                        Text("·")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                    }
+                    QuietTextButton(
+                        title: InactiveAccountPolicy.markTitle,
+                        help: InactiveAccountPolicy.markHelp,
+                        identifier: "quotabar.markInactive.\(safeIdentifier(account.email))",
+                        disabled: model.isBusy(email: account.email),
+                        action: { model.toggleInactive(account) }
                     )
                 }
                 Spacer(minLength: 2)
@@ -1118,6 +1196,11 @@ private struct HealthSection: View {
                 HealthRow(symbol: "key.slash.fill", tint: .red,
                           text: substrate, emphasized: true,
                           identifier: "quotabar.health.credentialSubstrate")
+            }
+            if let swap = model.swapUnresolvedLine {
+                HealthRow(symbol: "clock.badge.exclamationmark.fill", tint: .orange,
+                          text: swap, emphasized: true,
+                          identifier: "quotabar.health.swapUnresolved")
             }
             if let drift = model.scriptsDriftLine {
                 HealthRow(symbol: "doc.badge.gearshape.fill", tint: .orange,

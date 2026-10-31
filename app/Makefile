@@ -9,7 +9,10 @@ CONTENTS := $(APP_BUNDLE)/Contents
 EXECUTABLE := $(CONTENTS)/MacOS/$(APP_NAME)
 INSTALL_BUNDLE := /Applications/$(APP_NAME).app
 SWIFTC := /usr/bin/swiftc
-SDK := $(shell /usr/bin/xcrun --sdk macosx --show-sdk-path)
+# Command Line Tools 27 ships an SDK whose @State is a macro, without the macro plugin to expand it
+# (Xcode has the plugin). Build against the CLT's macOS 26 SDK when it is there; SDK= overrides.
+CLT_SDK26 := /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk
+SDK ?= $(if $(wildcard $(CLT_SDK26)),$(CLT_SDK26),$(shell /usr/bin/xcrun --sdk macosx --show-sdk-path))
 TARGET := arm64-apple-macosx14.0
 SOURCES := App.swift Models.swift Services.swift Views.swift
 SCRIPTS_SRC := ../scripts
@@ -84,6 +87,7 @@ audit:
 	@/usr/bin/grep -F 'swap-account.sh' Services.swift >/dev/null
 	@/usr/bin/grep -F 'bank-account.sh' Services.swift >/dev/null
 	@/usr/bin/grep -F 'toggle-autoping.sh' Services.swift >/dev/null
+	@/usr/bin/grep -F 'toggle-inactive.sh' Services.swift >/dev/null
 	@/usr/bin/grep -F 'remove-account.sh' Services.swift >/dev/null
 	@/usr/bin/grep -F 'last_ping' Services.swift >/dev/null
 	@/usr/bin/grep -F 'auto_ping' Services.swift >/dev/null

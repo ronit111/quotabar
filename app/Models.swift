@@ -197,12 +197,14 @@ struct UsageSnapshot: Decodable, Sendable {
 /// The key is normalised first (case, whitespace, `-` vs `_`, a `claude_` prefix) so a tier variant
 /// reaching the app in any of its spellings still lands on the friendly name.
 enum PlanCapsulePresentation {
-    /// Ordered so the chip stays short enough for the 320-wide card header. The × is a real
-    /// multiplication sign — "MAX 5x" reads as a typo at 9pt.
+    /// Short enough for the 320-wide card header.
+    /// (30 Oct 2026) Anthropic renamed Max 5x to Max and Max 20x to Ultra, but the backend still
+    /// sends the old strings, so the old strings map to the new names here.
     static let friendlyNames: [String: String] = [
         "max": "MAX",
-        "max_5x": "MAX 5×",
-        "max_20x": "MAX 20×",
+        "max_5x": "MAX",
+        "max_20x": "ULTRA",
+        "ultra": "ULTRA",
         "pro": "PRO",
         "free": "FREE",
     ]
@@ -228,6 +230,18 @@ enum PlanCapsulePresentation {
 /// swap away first) and never Codex (its token is owned by the Codex CLI, not our bank). A
 /// needs-relogin Claude account is still parked, so it remains removable. Side-effect-free so
 /// visibility and the confirmation copy can be unit-tested without a view.
+enum InactiveAccountPolicy {
+    static let markTitle = "Mark inactive"
+    static let markHelp = "Keep this account saved but stop checking it. It shrinks to one line and no longer affects the menu bar icon."
+    static let reactivateTitle = "Reactivate"
+
+    /// Parked, banked Claude accounts only: the live account cannot go quiet, and a monitored
+    /// home or an unlinked login has no bank record to keep.
+    static func canMark(_ account: UsageAccount) -> Bool {
+        account.isClaude && !account.active && !account.isUnresolved && !account.isMonitorOnly
+    }
+}
+
 enum RemoveAccountPolicy {
     static func canRemove(_ account: UsageAccount) -> Bool {
         // An unresolved entry has no bank record to remove; showing Remove would also
@@ -539,8 +553,17 @@ struct UsageAccount: Decodable, Identifiable, Sendable {
     /// (r12 #13) Absolute epoch seconds until this v2 home's Ping is eligible again, from
     /// <home>/.ping-marker.json via usage.py. The app never reads that file itself.
     let cooldownUntil: Double?
+    /// The plan as the backend names it, for the chip only. `plan` stays the max|pro|free tier.
+    var planName: String? = nil
+    /// The response lists no 5-hour limit for this account, so auto-ping has nothing to do.
+    var noFiveHourLimit: Bool? = nil
+    /// Kept in the bank but not polled. usage.py never sets this on the live account.
+    var inactive: Bool? = nil
 
     var id: String { "\(provider):\(email)" }
+    var isInactive: Bool { inactive == true }
+    var hasNoFiveHourLimit: Bool { noFiveHourLimit == true }
+    var chipPlan: String? { planName ?? plan }
     var isClaude: Bool { provider.lowercased() == "claude" }
     var isCodex: Bool { provider.lowercased() == "codex" }
     var isMonitorOnly: Bool { monitorOnly == true }
@@ -593,7 +616,10 @@ struct UsageAccount: Decodable, Identifiable, Sendable {
             unresolved: unresolved,
             metadataEmail: metadataEmail,
             monitorOnly: monitorOnly,
-            cooldownUntil: cooldownUntil
+            cooldownUntil: cooldownUntil,
+            planName: planName,
+            noFiveHourLimit: noFiveHourLimit,
+            inactive: inactive
         )
     }
 
@@ -608,14 +634,22 @@ struct UsageAccount: Decodable, Identifiable, Sendable {
         case metadataEmail = "metadata_email"
         case monitorOnly = "monitor_only"
         case cooldownUntil = "cooldown_until"
+        case planName = "plan_name"
+        case noFiveHourLimit = "no_five_hour_limit"
+        case inactive
     }
 }
 
 enum AccountOrdering {
     /// Preserve the backend's bank order exactly. Active state is presentation metadata and
-    /// must never influence card position.
+    /// must never influence card position. Inactive accounts are left out, so they cannot reach
+    /// the menu bar icon, the corner dot or the full-size cards.
     static func claudeAccountsInSnapshotOrder(_ accounts: [UsageAccount]) -> [UsageAccount] {
-        accounts.filter(\.isClaude)
+        accounts.filter { $0.isClaude && !$0.isInactive }
+    }
+
+    static func inactiveClaudeAccounts(_ accounts: [UsageAccount]) -> [UsageAccount] {
+        accounts.filter { $0.isClaude && $0.isInactive }
     }
 }
 
@@ -980,6 +1014,7 @@ struct ActionScheduler<Payload> {
 enum PopoverLayout {
     static let claudeCardEstimate: CGFloat = 168
     static let reloginCardEstimate: CGFloat = 108
+    static let inactiveRowEstimate: CGFloat = 32
     static let codexCardEstimate: CGFloat = 150
     static let cardSpacing: CGFloat = 10
     static let maxAccountRegionHeight: CGFloat = 560
@@ -998,6 +1033,7 @@ enum PopoverLayout {
     static func estimatedHeight(
         claudeAccounts: Int,
         reloginAccounts: Int,
+        inactiveAccounts: Int = 0,
         hasCodex: Bool,
         isStale: Bool,
         hasHealthBanner: Bool
@@ -1005,7 +1041,8 @@ enum PopoverLayout {
         let normal = max(0, claudeAccounts - reloginAccounts)
         var total = CGFloat(normal) * claudeCardEstimate
             + CGFloat(reloginAccounts) * reloginCardEstimate
-        var items = claudeAccounts
+            + CGFloat(inactiveAccounts) * inactiveRowEstimate
+        var items = claudeAccounts + inactiveAccounts
         if hasCodex {
             total += codexCardEstimate
             items += 1
@@ -1019,12 +1056,14 @@ enum PopoverLayout {
     static func needsScroll(
         claudeAccounts: Int,
         reloginAccounts: Int,
+        inactiveAccounts: Int = 0,
         hasCodex: Bool,
         isStale: Bool,
         hasHealthBanner: Bool
     ) -> Bool {
         estimatedHeight(
             claudeAccounts: claudeAccounts, reloginAccounts: reloginAccounts,
+            inactiveAccounts: inactiveAccounts,
             hasCodex: hasCodex, isStale: isStale, hasHealthBanner: hasHealthBanner
         ) > maxAccountRegionHeight
     }
@@ -1032,6 +1071,7 @@ enum PopoverLayout {
     static func regionHeight(
         claudeAccounts: Int,
         reloginAccounts: Int,
+        inactiveAccounts: Int = 0,
         hasCodex: Bool,
         isStale: Bool,
         hasHealthBanner: Bool
@@ -1039,6 +1079,7 @@ enum PopoverLayout {
         min(
             estimatedHeight(
                 claudeAccounts: claudeAccounts, reloginAccounts: reloginAccounts,
+                inactiveAccounts: inactiveAccounts,
                 hasCodex: hasCodex, isStale: isStale, hasHealthBanner: hasHealthBanner
             ),
             maxAccountRegionHeight
@@ -1319,6 +1360,10 @@ struct Health: Decodable, Sendable {
     let healedPlanChange: HealedPlanChange?
     let credentialSubstrate: CredentialSubstrate?
     let scriptsDrift: ScriptsDrift?
+    var swapUnresolved: SwapUnresolved? = nil
+    struct SwapUnresolved: Decodable, Sendable {
+        let since: Double?
+    }
     enum CodingKeys: String, CodingKey {
         case archiver
         case forkDrift = "fork_drift"
@@ -1326,6 +1371,7 @@ struct Health: Decodable, Sendable {
         case healedPlanChange = "healed_plan_change"
         case credentialSubstrate = "credential_substrate"
         case scriptsDrift = "scripts_drift"
+        case swapUnresolved = "swap_unresolved"
     }
 }
 
@@ -1409,6 +1455,11 @@ enum HealthPresentation {
 
     /// (v110) Scripts-drift alert. Not epoch-gated either: stale bundle scripts break every
     /// epoch equally. Names the count, not the paths — the popover is 320pt wide.
+    static func swapUnresolvedLine(_ health: Health?) -> String? {
+        guard health?.swapUnresolved != nil else { return nil }
+        return "A swap did not finish cleanly, so these numbers may be old. Run /login to settle it."
+    }
+
     static func scriptsDriftLine(_ health: Health?) -> String? {
         guard let sd = health?.scriptsDrift, let files = sd.files, !files.isEmpty else { return nil }
         return "App is running \(files.count) stale bundled script\(plural(files.count)) — re-link the bundle"
@@ -1428,6 +1479,7 @@ enum HealthPresentation {
             && healedPlanChange(health, ackedTs: healNoticeAckTs) == nil
             && credentialSubstrateLine(health) == nil
             && scriptsDriftLine(health) == nil
+            && swapUnresolvedLine(health) == nil
     }
 
     private static func plural(_ n: Int) -> String { n == 1 ? "" : "s" }

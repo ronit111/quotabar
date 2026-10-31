@@ -172,6 +172,7 @@ REFRESH_ENABLED = os.environ.get("ACCOUNT_BANK_REFRESH", "1") == "1"
 # Parked refresh then happens only from QuotaBar's poll (no short timeout) or an
 # explicit ping.
 NO_PARKED_REFRESH = os.environ.get("ACCOUNT_BANK_NO_PARKED_REFRESH", "0") == "1"
+PLAN_NAME_MAX_AGE = 3600.0
 PARKED_MAX_AGE = float(os.environ.get("ACCOUNT_BANK_PARKED_MAX_AGE", "1800"))   # 30 min
 CODEX_PING_ON_401 = os.environ.get("ACCOUNT_BANK_CODEX_PING", "0") == "1"        # gated, off
 BACKOFF_FAILS = 3
@@ -370,6 +371,16 @@ def summarize_claude(raw):
     return five_hour, seven_day, worst, model_cap
 
 
+def _reports_no_session_limit(raw):
+    """True when the response lists its limits and none is a 5-hour one. A null five_hour alone
+    does not say this: an idle account also has no window running."""
+    limits = raw.get("limits")
+    if raw.get("five_hour") or not isinstance(limits, list) or not limits:
+        return False
+    return not any(isinstance(l, dict) and (l.get("kind") in ("session", "five_hour")
+                                            or l.get("group") == "session") for l in limits)
+
+
 def poll_claude(token):
     return http_json_retry(USAGE_URL, {"Authorization": f"Bearer {token}", "anthropic-beta": OAUTH_BETA})
 
@@ -434,6 +445,28 @@ def _norm_plan(raw):
     matches EXACTLY, else None. (v101-confirm) The rule itself now lives in bank_common so the
     hook's re-bank gate reads tiers identically; this stays as the name the poll already uses."""
     return bank_common.plan_tier(raw)
+
+
+def plan_name_for(email, oauth, oauth_account, reuse):
+    """(name, checked_at) for the plan chip. The profile endpoint is the live source, read once
+    an hour per account: the credential's fields are stamped at /login and a banked record's go
+    stale on a plan change, which is why they are only the fallback here."""
+    prior = reuse or {}
+    if prior.get("plan_name") and now() - float(prior.get("plan_name_at", 0) or 0) < PLAN_NAME_MAX_AGE:
+        return prior["plan_name"], prior.get("plan_name_at")
+    offline = bank_common.plan_name((oauth_account or {}).get("organizationType"),
+                                    (oauth or {}).get("rateLimitTier"),
+                                    (oauth or {}).get("subscriptionType"))
+    # Hermetic runs (stubbed usage URL) and the hook's short budget stay offline.
+    if (_identity is not None and (oauth or {}).get("accessToken")
+            and not os.environ.get("ACCOUNT_BANK_CLAUDE_URL")
+            and not os.environ.get("ACCOUNT_BANK_NO_PARKED_REFRESH")):
+        r = _identity.resolve(oauth["accessToken"], timeout=min(3.0, max(0.5, DEADLINE - now())))
+        if r.verdict == "RESOLVED" and r.email.lower() == email.lower():
+            live = bank_common.plan_name(r.organization_type, r.rate_limit_tier, r.plan)
+            if live:
+                return live, now()
+    return prior.get("plan_name") or offline, prior.get("plan_name_at")
 
 
 def process_claude(email, oauth, is_active, bank_path, status, oauth_account=None):
@@ -607,6 +640,7 @@ def process_claude(email, oauth, is_active, bank_path, status, oauth_account=Non
     fh, sd, worst, model_cap = summarize_claude(raw)
     res["five_hour"], res["seven_day"], res["worst_limit"] = fh, sd, worst
     res["model_cap"] = model_cap
+    res["_no_session_limit"] = _reports_no_session_limit(raw)
     set_bank_status(bank_path, "ok")
     return res, False
 
@@ -860,6 +894,18 @@ def load_autoping():
     return set()
 
 
+def load_inactive():
+    """Emails the owner parked as inactive: kept in the bank, never polled. Missing or malformed
+    config means none."""
+    try:
+        v = json.load(open(CONFIG_FILE)).get("inactive")
+        if isinstance(v, list):
+            return {e for e in v if isinstance(e, str)}
+    except Exception:
+        pass
+    return set()
+
+
 def _resets_in_future(iso):
     if not iso:
         return False
@@ -874,6 +920,8 @@ def five_hour_lapsed(res):
     future. A just-started window reports low utilization but a FUTURE resets_at,
     so we key off resets_at, not utilization — this both avoids re-firing right
     after a ping and keeps the cost at ~1 ping per 5h window (~5/day/account)."""
+    if res.get("no_five_hour_limit"):
+        return False    # no window to start, so a ping would only spend a turn
     fh = res.get("five_hour")
     if not isinstance(fh, dict):
         return True
@@ -1038,7 +1086,7 @@ def maybe_autoping(results, bank_paths):
         return []
     candidates = []
     for r in results:
-        if r.get("provider") != "claude":
+        if r.get("provider") != "claude" or r.get("inactive"):
             continue
         email = r.get("email")
         if email not in enabled:
@@ -1627,6 +1675,12 @@ def _health_surface():
     # for ordinary staleness. See main() where it is armed.
     if _SUBSTRATE_ALERT:
         health["credential_substrate"] = _SUBSTRATE_ALERT
+    # A swap journal reconcile could not settle: every run stays read-only and the cache stops
+    # moving, which looks exactly like healthy old numbers unless it is said out loud.
+    try:
+        health["swap_unresolved"] = {"since": os.path.getmtime(os.path.join(BANK_DIR, ".swap-unresolved"))}
+    except OSError:
+        pass
     # (v110) SCRIPTS-DRIFT canary. The app executes the copy inside its bundle
     # (pickScriptsDir: bundle outranks everything but the env var), which is kept a
     # SYMLINK to the maintained scripts so divergence is structurally impossible —
@@ -1887,12 +1941,27 @@ def main():
         results = []
         claude_attempts = claude_real_fails = 0
         codex_attempts = codex_real_fails = 0
+        inactive = load_inactive()
 
         # --- claude accounts, tiered polling ---
         for email, (oauth, bank_path, status, oauth_account) in claude_accts.items():
             is_active = (identity_resolved and email == act) or email == "(active/unresolved)"
             key = f"claude|{email}"
             reuse = prev_by_key.get(key)
+            # Inactive: no network, no refresh, no status change. The live account is never
+            # inactive, whatever the config says: a /swap or /login onto it must show real data.
+            if email in inactive and not is_active:
+                results.append({"provider": "claude", "email": email, "active": False,
+                                "inactive": True, "status": status,
+                                "plan": bank_common.effective_tier(oauth_account, oauth),
+                                "plan_name": (reuse or {}).get("plan_name") or bank_common.plan_name(
+                                    (oauth_account or {}).get("organizationType"),
+                                    (oauth or {}).get("rateLimitTier"),
+                                    (oauth or {}).get("subscriptionType")),
+                                "worst_limit": None})
+                continue
+            if reuse and reuse.get("inactive"):
+                reuse = None    # just reactivated: the placeholder holds no figures to serve
             # (#33) ONLY mode: fresh-poll ONLY the target; EVERY other account is
             # served from cache or an explicit placeholder — never polled/refreshed
             # (so a one-account confirmation can't launch a 60-120s parked refresh).
@@ -1970,6 +2039,15 @@ def main():
                     results.append(good); continue
                 # (r5 #3) no healthy cache to fall back on: surface THIS run's real
                 # result (carrying any quarantine/error), never drop it silently.
+            no_session_limit = r.pop("_no_session_limit", False)
+            if not r.get("error"):
+                r["plan_name"], r["plan_name_at"] = plan_name_for(email, oauth, oauth_account, reuse)
+                # Read from the response, never the plan name: an unverified Ultra account still
+                # has this limit, and any plan that drops it later is covered with no code change.
+                if no_session_limit:
+                    r["no_five_hour_limit"] = True
+            elif reuse and reuse.get("plan_name"):
+                r["plan_name"], r["plan_name_at"] = reuse["plan_name"], reuse.get("plan_name_at")
             results.append(r)
 
         # --- codex (always polled, unless ONLY / past the deadline / backed off) ---

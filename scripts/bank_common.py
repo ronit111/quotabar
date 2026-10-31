@@ -283,9 +283,34 @@ def plan_tier(raw):
     r = raw.lower()
     if r.startswith("claude_"):
         r = r[len("claude_"):]
+    # Ultra (the renamed Max 20x, 30 Oct 2026) is the top of the same ladder rung. Today the
+    # backend still says claude_max for it; this keeps autopick and the drift checks working the
+    # day the string moves, instead of the account falling out of every tier.
+    if r.startswith("ultra"):
+        return "max"
     for tier in ("max", "pro", "free"):
         if r.startswith(tier):
             return tier
+    return None
+
+
+def plan_name(organization_type=None, rate_limit_tier=None, subscription_type=None):
+    """The plan as the backend names it, for DISPLAY ONLY (lowercase, no claude_ prefix). The
+    max|pro|free policy tier stays plan_tier's job. organization_type is "claude_max" for both
+    Max sizes, so the rate-limit tier is read first: it is the one field that tells them apart
+    ("default_claude_max_20x"). A generic value ("default_claude_ai") says nothing and is skipped.
+    A name nobody has seen yet passes through, so a backend rename shows up without a code change.
+    Returns None when no field carries a name."""
+    if isinstance(rate_limit_tier, str):
+        r = rate_limit_tier.lower()
+        if r.startswith("default_"):
+            r = r[len("default_"):]
+        if r.startswith("claude_") and r != "claude_ai":
+            return r[len("claude_"):]
+    for raw in (organization_type, subscription_type):
+        if isinstance(raw, str) and raw:
+            r = raw.lower()
+            return r[len("claude_"):] if r.startswith("claude_") else r
     return None
 
 

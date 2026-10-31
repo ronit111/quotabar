@@ -345,6 +345,7 @@ final class AppModel: ObservableObject {
         case switchAccount = "switch"
         case rebank
         case toggleAutoPing = "autoping"
+        case toggleInactive = "inactive"
         case removeAccount = "remove"
         case unseedAccount = "unseed"
         case codexPing = "codexping"
@@ -398,6 +399,7 @@ final class AppModel: ObservableObject {
         static let swap = "\(scripts)/swap-account.sh"
         static let bank = "\(scripts)/bank-account.sh"
         static let toggleAutoPing = "\(scripts)/toggle-autoping.sh"
+        static let toggleInactive = "\(scripts)/toggle-inactive.sh"
         static let removeAccount = "\(scripts)/remove-account.sh"
         static let claudeAcct = "\(scripts)/claude-acct"
         static let sessions = "\(scripts)/sessions.py"
@@ -536,6 +538,10 @@ final class AppModel: ObservableObject {
 
     var codexAccount: UsageAccount? {
         snapshot?.accounts.first(where: \UsageAccount.isCodex)
+    }
+
+    var inactiveAccounts: [UsageAccount] {
+        AccountOrdering.inactiveClaudeAccounts(snapshot?.accounts ?? [])
     }
 
     var activeAccountInitial: String {
@@ -787,6 +793,12 @@ final class AppModel: ObservableObject {
         // No success caption: the badge itself reflects the new state after the re-poll.
         enqueueAction(.toggleAutoPing, key: account.email, executable: Paths.bash,
                       arguments: [Paths.toggleAutoPing, account.email], successMessage: nil)
+    }
+
+    func toggleInactive(_ account: UsageAccount) {
+        guard account.isInactive || InactiveAccountPolicy.canMark(account) else { return }
+        enqueueAction(.toggleInactive, key: account.email, executable: Paths.bash,
+                      arguments: [Paths.toggleInactive, account.email], successMessage: nil)
     }
 
     /// Forget a PARKED Claude account: deletes its bank record and drops it from auto-ping via
@@ -1263,6 +1275,7 @@ final class AppModel: ObservableObject {
     var forkDriftLine: String? { HealthPresentation.forkDriftLine(health, epoch: currentEpoch) }
     var credentialSubstrateLine: String? { HealthPresentation.credentialSubstrateLine(health) }
     var scriptsDriftLine: String? { HealthPresentation.scriptsDriftLine(health) }
+    var swapUnresolvedLine: String? { HealthPresentation.swapUnresolvedLine(health) }
 
     /// True when ANY health anomaly is worth showing — otherwise the popover renders no health
     /// chrome at all (zero noise in the healthy state).
@@ -1270,6 +1283,7 @@ final class AppModel: ObservableObject {
         archiverWarning != nil || forkDriftLine != nil || seedAuditReview != nil
             || healedPlanChange != nil || credentialSubstrateLine != nil
             || scriptsDriftLine != nil
+            || swapUnresolvedLine != nil
     }
 
     /// True while a restart offer is pending or per-session restart outcomes are still showing.

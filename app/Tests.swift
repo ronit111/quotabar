@@ -14,6 +14,7 @@ private enum TestFailure: Error, CustomStringConvertible {
 struct QuotaBarTests {
     static func main() async throws {
         try testDecodingOptionalFields()
+        try testInactiveAndPlanName()
         try testUnresolvedLoginPresentation()
         try testSampleFixtureShape()
         try testMicrosecondTimestamp()
@@ -82,6 +83,36 @@ struct QuotaBarTests {
         try await testCancellation()
         try await testStubbornProcessTreeTimeout()
         print("QuotaBar tests passed")
+    }
+
+    private static func testInactiveAndPlanName() throws {
+        let json = """
+        [{"provider":"claude","email":"a@example.com","active":true,"plan":"max",
+          "plan_name":"max_20x","no_five_hour_limit":true,"status":"ok"},
+         {"provider":"claude","email":"b@example.com","active":false,"plan":"pro",
+          "inactive":true,"status":"needs-relogin"},
+         {"provider":"claude","email":"c@example.com","active":false,"plan":"pro",
+          "plan_name":"some_new_plan"}]
+        """.data(using: .utf8)!
+        let rows = try JSONDecoder().decode([UsageAccount].self, from: json)
+        try expect(PlanCapsulePresentation.text(for: rows[0].chipPlan) == "ULTRA", "max_20x shows as ULTRA")
+        try expect(rows[0].hasNoFiveHourLimit, "the no-5h flag decodes")
+        try expect(PlanCapsulePresentation.text(for: rows[1].chipPlan) == "PRO", "no name falls back to the tier")
+        try expect(PlanCapsulePresentation.text(for: rows[2].chipPlan) == "SOME_NEW_PLAN", "an unseen name passes through")
+        let main = AccountOrdering.claudeAccountsInSnapshotOrder(rows).map(\.email)
+        try expect(main == ["a@example.com", "c@example.com"],
+                   "an inactive needs-relogin account must not reach the cards or the icon inputs")
+        try expect(AccountOrdering.inactiveClaudeAccounts(rows).map(\.email) == ["b@example.com"], "it goes to the compact list")
+        try expect(!InactiveAccountPolicy.canMark(rows[0]), "the live account cannot be marked")
+        try expect(InactiveAccountPolicy.canMark(rows[2]), "a parked account can")
+        try expect(
+            PopoverLayout.estimatedHeight(claudeAccounts: 1, reloginAccounts: 0, inactiveAccounts: 1, hasCodex: false,
+                                          isStale: false, hasHealthBanner: false)
+                - PopoverLayout.estimatedHeight(claudeAccounts: 1, reloginAccounts: 0, hasCodex: false,
+                                                isStale: false, hasHealthBanner: false)
+                == PopoverLayout.inactiveRowEstimate + PopoverLayout.cardSpacing,
+            "the estimator counts the compact row and its gap"
+        )
     }
 
     private static func testDecodingOptionalFields() throws {
@@ -868,20 +899,20 @@ struct QuotaBarTests {
         try expect(PlanCapsulePresentation.text(for: "pro") == "PRO", "pro maps to PRO")
         try expect(PlanCapsulePresentation.text(for: "free") == "FREE", "free maps to FREE")
         try expect(
-            PlanCapsulePresentation.text(for: "max_5x") == "MAX 5×",
-            "the 5x tier reads as MAX 5× (a real multiplication sign, not the letter x)"
+            PlanCapsulePresentation.text(for: "max_5x") == "MAX",
+            "the 5x tier reads as MAX since the 30 Oct 2026 rename"
         )
         try expect(
-            PlanCapsulePresentation.text(for: "max_20x") == "MAX 20×",
-            "the 20x tier reads as MAX 20×"
+            PlanCapsulePresentation.text(for: "max_20x") == "ULTRA",
+            "the 20x tier reads as ULTRA since the 30 Oct 2026 rename"
         )
         // The key is normalised, so a variant reaching the app in any spelling still lands.
         try expect(
-            PlanCapsulePresentation.text(for: "MAX-20X") == "MAX 20×",
+            PlanCapsulePresentation.text(for: "MAX-20X") == "ULTRA",
             "case and hyphen-vs-underscore must not defeat the mapping"
         )
         try expect(
-            PlanCapsulePresentation.text(for: "claude_max_20x") == "MAX 20×",
+            PlanCapsulePresentation.text(for: "claude_max_20x") == "ULTRA",
             "the raw organizationType spelling maps too"
         )
         try expect(
@@ -1888,7 +1919,7 @@ struct QuotaBarTests {
             throw TestFailure.failed("a pending plan-change notice must surface")
         }
         try expect(
-            notice.text == "person PRO → MAX 20× · re-banked",
+            notice.text == "person PRO → ULTRA · re-banked",
             "the notice uses the friendly plan names and says no action is needed (got: \(notice.text))"
         )
         try expect(notice.ts == 500, "the notice carries its timestamp for the ack")
